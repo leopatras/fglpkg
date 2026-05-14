@@ -2,6 +2,7 @@ package registry
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,6 +13,11 @@ import (
 	"github.com/4js-mikefolcher/fglpkg/internal/manifest"
 	"github.com/4js-mikefolcher/fglpkg/internal/semver"
 )
+
+// ErrNotFound is returned (via %w wrapping) when the registry responds
+// 404 to a GET. Callers can detect first-publish or missing-package
+// conditions with `errors.Is(err, registry.ErrNotFound)`.
+var ErrNotFound = errors.New("package not found in registry")
 
 // Default registry base URL. Override with FGLPKG_REGISTRY env var.
 const defaultRegistry = "https://fglpkg-registry.fly.dev"
@@ -211,7 +217,7 @@ func httpGet(url string) ([]byte, error) {
 	}
 
 	if resp.StatusCode == http.StatusNotFound {
-		return nil, fmt.Errorf("package not found in registry")
+		return nil, ErrNotFound
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("registry returned HTTP %d: %s", resp.StatusCode, string(body))

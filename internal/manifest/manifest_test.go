@@ -596,3 +596,89 @@ func containsHelper(s, substr string) bool {
 	}
 	return false
 }
+
+// ─── ValidateForPublish ───────────────────────────────────────────────────────
+
+// newPublishableManifest returns a minimal manifest that satisfies
+// ValidateForPublish. Individual tests strip fields to test rejection.
+func newPublishableManifest() *manifest.Manifest {
+	m := manifest.New("demo", "1.0.0", "A demo package", "Jane Dev")
+	m.License = "MIT"
+	m.Repository = "https://github.com/example/demo"
+	return m
+}
+
+func TestValidateForPublishOK(t *testing.T) {
+	m := newPublishableManifest()
+	if err := m.ValidateForPublish(); err != nil {
+		t.Errorf("ValidateForPublish on populated manifest returned: %v", err)
+	}
+}
+
+func TestValidateForPublishMissingFields(t *testing.T) {
+	cases := []struct {
+		name  string
+		strip func(*manifest.Manifest)
+		want  string
+	}{
+		{"description", func(m *manifest.Manifest) { m.Description = "" }, "description is required"},
+		{"license", func(m *manifest.Manifest) { m.License = "" }, "license is required"},
+		{"repository", func(m *manifest.Manifest) { m.Repository = "" }, "repository is required"},
+		{"author", func(m *manifest.Manifest) { m.Author = "" }, "author is required"},
+		{"description_whitespace", func(m *manifest.Manifest) { m.Description = "   " }, "description is required"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newPublishableManifest()
+			tc.strip(m)
+			err := m.ValidateForPublish()
+			if err == nil {
+				t.Fatalf("expected error when %s is missing", tc.name)
+			}
+			if !containsHelper(err.Error(), tc.want) {
+				t.Errorf("err = %q, want one containing %q", err.Error(), tc.want)
+			}
+		})
+	}
+}
+
+// TestValidateForPublishCollectsAllMissing verifies that strip-everything
+// produces a single error listing every missing field — developers fix
+// them all in one pass rather than rediscovering them one at a time.
+func TestValidateForPublishCollectsAllMissing(t *testing.T) {
+	m := newPublishableManifest()
+	m.Description = ""
+	m.License = ""
+	m.Repository = ""
+	m.Author = ""
+
+	err := m.ValidateForPublish()
+	if err == nil {
+		t.Fatal("expected error when all fields stripped")
+	}
+	for _, want := range []string{
+		"description is required",
+		"license is required",
+		"repository is required",
+		"author is required",
+	} {
+		if !containsHelper(err.Error(), want) {
+			t.Errorf("err = %q, want one containing %q", err.Error(), want)
+		}
+	}
+}
+
+// TestValidateForPublishDelegatesToValidate verifies that structural
+// errors (no version) surface through ValidateForPublish, not just the
+// publish-required ones.
+func TestValidateForPublishDelegatesToValidate(t *testing.T) {
+	m := newPublishableManifest()
+	m.Version = ""
+	err := m.ValidateForPublish()
+	if err == nil {
+		t.Fatal("expected error when version is missing")
+	}
+	if !containsHelper(err.Error(), "version") {
+		t.Errorf("err = %q, want one mentioning version", err.Error())
+	}
+}

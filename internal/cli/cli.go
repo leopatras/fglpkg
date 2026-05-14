@@ -529,8 +529,11 @@ func cmdPublish(args []string) error {
 	if err != nil {
 		return fmt.Errorf("failed to load %s: %w", manifest.Filename, err)
 	}
-	if err := m.Validate(); err != nil {
-		return fmt.Errorf("manifest is invalid: %w", err)
+	if err := m.ValidateForPublish(); err != nil {
+		return err
+	}
+	if err := checkVersionNotPublished(m); err != nil {
+		return err
 	}
 	registryURL := defaultRegistry()
 	token := credentials.TokenFor(home, registryURL)

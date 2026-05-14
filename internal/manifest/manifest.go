@@ -581,6 +581,48 @@ func (m *Manifest) Validate() error {
 	return nil
 }
 
+// publishRequiredFields lists manifest fields that must be populated
+// before a package can be published. These are layered on top of the
+// structural checks in Validate(); see ValidateForPublish.
+type publishField struct {
+	name    string
+	getter  func(*Manifest) string
+	hintMsg string
+}
+
+var publishRequiredFields = []publishField{
+	{"description", func(m *Manifest) string { return m.Description }, ""},
+	{"license", func(m *Manifest) string { return m.License }, `e.g. "MIT", "Apache-2.0"`},
+	{"repository", func(m *Manifest) string { return m.Repository }, `e.g. "https://github.com/owner/repo"`},
+	{"author", func(m *Manifest) string { return m.Author }, ""},
+}
+
+// ValidateForPublish performs the structural sanity checks (delegates
+// to Validate) plus the extra required-field checks for publishing:
+// description, license, repository, author. Returns a single error
+// whose message lists every missing field, so developers can fix them
+// all in one pass instead of discovering them one by one.
+func (m *Manifest) ValidateForPublish() error {
+	if err := m.Validate(); err != nil {
+		return err
+	}
+	var missing []string
+	for _, f := range publishRequiredFields {
+		if strings.TrimSpace(f.getter(m)) == "" {
+			line := "  - " + f.name + " is required"
+			if f.hintMsg != "" {
+				line += " (" + f.hintMsg + ")"
+			}
+			missing = append(missing, line)
+		}
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	return fmt.Errorf("manifest is not ready to publish:\n%s",
+		strings.Join(missing, "\n"))
+}
+
 // validateHookOp enforces per-operation required fields and the shared
 // path-safety rules: no absolute paths, no ".." traversal.
 func validateHookOp(op HookOperation) error {
