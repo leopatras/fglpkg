@@ -399,7 +399,14 @@ func (h *handler) handlePackageInfo(w http.ResponseWriter, r *http.Request, name
 		ver.Checksum = v.Checksum
 	}
 
-	writeJSON(w, http.StatusOK, ver)
+	// Include the package name in the payload. The stored versionRecord has
+	// no name field (the name lives on packageMeta / the URL path), but
+	// clients unmarshal into a PackageInfo struct that does, and would
+	// otherwise see an empty name.
+	writeJSON(w, http.StatusOK, struct {
+		Name string `json:"name"`
+		*versionRecord
+	}{Name: name, versionRecord: ver})
 }
 
 // handleDownload streams the zip (local store) or redirects to the CDN (R2).

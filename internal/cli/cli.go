@@ -196,6 +196,12 @@ func cmdInstall(args []string) error {
 		if err != nil {
 			return fmt.Errorf("failed to resolve %s@%s: %w", name, version, err)
 		}
+		// Older registry server versions omit `name` from the version-info
+		// response; fall back to the user-supplied name so we never write an
+		// empty key into fglpkg.json.
+		if info.Name == "" {
+			info.Name = name
+		}
 		m.AddFGLDependencyScoped(info.Name, info.Version, flags.scope)
 		fmt.Printf("✓ Added %s@%s to %s [%s]\n", info.Name, info.Version, manifest.Filename, scopeLabel)
 	}

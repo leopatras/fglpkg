@@ -262,6 +262,9 @@ func TestPackageInfo(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
+	if result["name"] != "myutils" {
+		t.Errorf("name = %q, want %q", result["name"], "myutils")
+	}
 	if result["description"] != "Utility library" {
 		t.Errorf("description = %q", result["description"])
 	}
