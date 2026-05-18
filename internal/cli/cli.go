@@ -70,6 +70,8 @@ func Execute() error {
 		return cmdOutdated(args)
 	case "audit":
 		return cmdAudit(args)
+	case "sbom":
+		return cmdSbom(args)
 	case "completion":
 		return cmdCompletion(args)
 	case "publish":
@@ -1940,6 +1942,8 @@ COMMANDS:
   outdated          Show FGL deps with newer versions available (--json for JSON)
   audit             Check installed Java JARs for known vulnerabilities
                     (--json, --severity=<level>, --production)
+  sbom              Emit a CycloneDX SBOM for the project from fglpkg.lock
+                    (-o file, --pretty, --production)
   completion <sh>   Print shell completion script (bash|zsh|fish|powershell)
   bdl <pkg> <mod>   Run a BDL program from an installed package
   publish [--dry-run] Publish current package to registry

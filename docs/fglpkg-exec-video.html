@@ -100,22 +100,29 @@
   }
   .scene.on { opacity: 1; }
 
-  .caption {
+  /* Subtitles: full narration text, broken into phrases that follow
+     the voice. Sits at the very bottom of the stage, just above the
+     progress bar. */
+  .subtitle {
     position: absolute;
-    left: 8%; right: 8%; bottom: 7%;
-    z-index: 22;
-    font-size: clamp(16px, 1.9vw, 26px);
-    line-height: 1.35;
+    left: 6%; right: 6%; bottom: 4%;
+    z-index: 23;
+    font-size: clamp(15px, 1.7vw, 22px);
+    line-height: 1.4;
     color: var(--ink);
     font-weight: 500;
     text-align: center;
-    text-shadow: 0 2px 18px rgba(0,0,0,0.7);
+    text-shadow:
+      0 2px 6px rgba(0,0,0,0.9),
+      0 0 22px rgba(0,0,0,0.65);
     opacity: 0;
-    transform: translateY(8px);
-    transition: opacity 0.35s ease, transform 0.35s ease;
+    transform: translateY(6px);
+    transition: opacity 0.25s ease, transform 0.25s ease;
+    pointer-events: none;
+    max-width: 88%;
+    margin-left: auto; margin-right: auto;
   }
-  .caption.on { opacity: 1; transform: translateY(0); }
-  .caption .accent { color: var(--accent); }
+  .subtitle.on { opacity: 1; transform: translateY(0); }
 
   /* ---------- Scene 1: Hook + PM intro ---------- */
   .s1 { background: radial-gradient(1200px 700px at 50% 38%, #11183a 0%, transparent 60%); }
@@ -647,6 +654,9 @@
       </div>
     </section>
 
+    <!-- Subtitle layer (above scenes, below controls) -->
+    <div class="subtitle" id="subtitle"></div>
+
     <div class="progress"><span id="progressBar"></span></div>
   </div>
 </div>
@@ -662,7 +672,10 @@
   <span class="time" id="timeLabel">0.0s / 98.0s</span>
 </div>
 
-<div class="hint" id="hint">Press <strong>Space</strong> to play · <strong>R</strong> restart · <strong>V</strong> voice · <strong>F</strong> fullscreen</div>
+<div class="hint" id="hint">
+  <div><strong>Space</strong> play · <strong>R</strong> restart · <strong>V</strong> voice · <strong>F</strong> fullscreen</div>
+  <div style="margin-top:6px; color:#8de4ff; font-size:11px;">For better audio: pick a voice marked <strong>★</strong>, or install a macOS Premium voice (System Settings → Accessibility → Spoken Content → System Voice).</div>
+</div>
 
 <script>
 (() => {
@@ -679,21 +692,38 @@
     let enabled = true;
     const listeners = new Set();
 
+    // Voice preference order — most natural first. "Premium" / "Enhanced"
+    // on macOS and "Neural" / "Natural" / "Studio" / "Wavenet" on
+    // Microsoft/Google sound dramatically more human than the default
+    // local synthesizers. The user can still pick any voice manually.
     const PREFER = [
-      /^Samantha.*(Premium|Enhanced)/i,
-      /^Ava.*(Premium|Enhanced)/i,
-      /^Allison.*(Premium|Enhanced)/i,
-      /^Evan.*(Premium|Enhanced)/i,
-      /^Tom.*(Premium|Enhanced)/i,
-      /^Samantha$/i,
-      /^Daniel/i,
-      /^Karen/i,
+      /\bPremium\b/i,
+      /\bEnhanced\b/i,
+      /\bNeural\b/i,
+      /\bNatural\b/i,
+      /\bStudio\b/i,
+      /\bWavenet\b/i,
+      /\bSiri\b/i,
+      /^Ava\b/i,
+      /^Allison\b/i,
+      /^Samantha\b/i,
+      /^Tom\b/i,
+      /^Evan\b/i,
+      /^Joelle\b/i,
+      /^Daniel\b/i,
+      /^Karen\b/i,
       /^Google US English/i,
       /^Microsoft (Aria|Jenny|Guy|Davis|Tony)/i,
       /en[_-]US/i,
       /en[_-]GB/i,
       /^en/i,
     ];
+
+    // Returns true when a voice name looks like a natural / neural voice
+    // (vs. the older, choppier compact synthesizers).
+    function isNaturalVoice(name) {
+      return /\b(Premium|Enhanced|Neural|Natural|Studio|Wavenet|Siri)\b/i.test(name);
+    }
 
     function pickVoice() {
       if (!voices.length) return null;
@@ -723,8 +753,11 @@
       try { speechSynthesis.cancel(); } catch {}
       const u = new SpeechSynthesisUtterance(text);
       if (chosenVoice) u.voice = chosenVoice;
-      u.rate = 1.0;
-      u.pitch = 1.0;
+      // Default Web Speech rate (1.0) is too fast for narration and
+      // collapses natural pause boundaries. 0.92 reads like a person.
+      u.rate = 0.92;
+      // Slightly lower pitch warms the voice without sounding fake.
+      u.pitch = 0.98;
       u.volume = 1.0;
       try { speechSynthesis.speak(u); } catch {}
     }
@@ -756,6 +789,7 @@
   const scenes = $$('.scene');
   const sceneByNum = (n) => scenes.find(s => +s.dataset.scene === n);
   const brand = $('#brand');
+  const subtitle = $('#subtitle');
 
   const events = [];
   const at = (t, fn) => events.push({ t, fn });
@@ -764,19 +798,25 @@
     scenes.forEach(s => s.classList.toggle('on', +s.dataset.scene === n));
   };
 
-  const addCaption = (sceneNum, text, accentText = '') => {
-    const scene = sceneByNum(sceneNum);
-    const node = document.createElement('div');
-    node.className = 'caption';
-    if (accentText) {
-      const safe = text.replace('{a}', `<span class="accent">${accentText}</span>`);
-      node.innerHTML = safe;
-    } else {
-      node.textContent = text;
-    }
-    scene.appendChild(node);
-    return node;
+  // Subtitle helpers. showSub() updates the text in place; the element
+  // stays on screen, so consecutive subtitle phrases flow smoothly
+  // without a flicker. hideSub() fades the whole thing out — call it
+  // at the end of each scene's narration to give silence its own visual.
+  const showSub = (text) => {
+    subtitle.textContent = text;
+    subtitle.classList.add('on');
   };
+  const hideSub = () => {
+    subtitle.classList.remove('on');
+  };
+  // schedSubs schedules a list of [time, text] entries on the global
+  // timeline. An empty text (or null) is a "hide" event.
+  const schedSubs = (entries) => {
+    for (const [t, text] of entries) {
+      at(t, () => (text ? showSub(text) : hideSub()));
+    }
+  };
+
   const on = (el) => el && el.classList.add('on');
   const off = (el) => el && el.classList.remove('on');
 
@@ -792,10 +832,14 @@
   at(0.9, () => on(sceneByNum(1).querySelector('[data-anim="headline"]')));
   at(2.4, () => on(sceneByNum(1).querySelector('[data-anim="sub"]')));
   at(3.4, () => on(sceneByNum(1).querySelector('[data-anim="pmrow"]')));
-  at(2.0, () => narrator.speak("Every modern language has a package manager — npm, Maven, pip. Each became near-universal because the productivity gain is obvious. Genero BDL has lived without one for its entire history."));
-  const c1 = addCaption(1, 'Genero has had none — {a}.', 'until now');
-  at(12.0, () => on(c1));
-  at(15.0, () => off(c1));
+  at(2.0, () => narrator.speak("Every modern language — has a package manager. npm. Maven. pip. Each one became near-universal — because the productivity gain is obvious. Genero BDL has had none — for its entire history."));
+  schedSubs([
+    [2.0,  "Every modern language has a package manager."],
+    [4.5,  "npm. Maven. pip."],
+    [6.5,  "Each became near-universal — the productivity gain is obvious."],
+    [10.0, "Genero BDL has had none — for its entire history."],
+    [15.0, ''],
+  ]);
 
   // ---- Scene 2: Problem (0:16 - 0:32) ----
   at(16.0, () => { showScene(2); brand.classList.add('on'); });
@@ -806,10 +850,14 @@
   at(19.6, () => on(sceneByNum(2).querySelector('[data-tl="5"]')));
   at(20.6, () => on(sceneByNum(2).querySelector('[data-tl="6"]')));
   at(21.8, () => on(sceneByNum(2).querySelector('[data-tl="7"]')));
-  at(17.5, () => narrator.speak("Today, BDL teams copy 42m files between projects, ship Java JARs by hand, and cannot answer whether any of these are vulnerable. Every engagement re-solves the same problems from scratch."));
-  const c2 = addCaption(2, 'Every engagement re-solves the {a}.', 'same problems');
-  at(26.5, () => on(c2));
-  at(30.5, () => off(c2));
+  at(17.5, () => narrator.speak("Today — BDL teams copy forty-two M files between projects. They ship Java JARs by hand. And they can't answer: are any of these vulnerable? Every engagement, re-solves the same problems, from scratch."));
+  schedSubs([
+    [17.5, "BDL teams copy .42m files between projects."],
+    [21.0, "They ship Java JARs by hand."],
+    [23.5, "Are any of these vulnerable? No one knows."],
+    [27.0, "Every engagement re-solves the same problems."],
+    [31.5, ''],
+  ]);
 
   // ---- Scene 3: Insight (0:32 - 0:49) ----
   at(32.0, () => { showScene(3); });
@@ -820,11 +868,15 @@
   at(34.7, () => on(sceneByNum(3).querySelector('[data-il="4"]')));
   at(35.6, () => on(sceneByNum(3).querySelector('[data-il="5"]')));
   at(36.4, () => on(sceneByNum(3).querySelector('[data-il="6"]')));
-  at(33.5, () => narrator.speak("We built fglpkg. The same problem npm and Maven solved fifteen years ago — solved for Genero. And with one thing only Genero has: first-class version variants. Install, audit, lockfile — validated end to end."));
+  at(33.5, () => narrator.speak("We built fglpkg. The same problem — that npm and Maven solved fifteen years ago — now solved for Genero. And with one thing — only Genero has. First-class version variants. Install. Audit. Lockfile. Validated end to end."));
   at(40.0, () => on(sceneByNum(3).querySelector('[data-anim="stack"]')));
-  const c3 = addCaption(3, 'Same problem npm solved. {a}.', 'Now solved for Genero');
-  at(44.0, () => on(c3));
-  at(47.5, () => off(c3));
+  schedSubs([
+    [33.5, "We built fglpkg."],
+    [35.0, "The same problem npm and Maven solved 15 years ago — now solved for Genero."],
+    [40.5, "With the one thing only Genero has: first-class version variants."],
+    [45.0, "Install. Audit. Lockfile. Validated end to end."],
+    [48.5, ''],
+  ]);
 
   // ---- Scene 4: MCP / Agentic AI (0:49 - 1:08) ----
   at(49.0, () => { showScene(4); });
@@ -835,10 +887,15 @@
   at(53.4, () => on(sceneByNum(4).querySelector('[data-tool="3"]')));
   at(54.4, () => on(sceneByNum(4).querySelector('[data-tool="4"]')));
   at(55.8, () => on(sceneByNum(4).querySelector('[data-snippet]')));
-  at(50.5, () => narrator.speak("And here is what npm and Maven were never built for: AI-native discovery. fglpkg is MCP-aware from day one. AI agents search the registry, audit dependencies, and install packages on the developer's behalf — turning a question into a working project."));
-  const c4 = addCaption(4, 'MCP-aware. Agents work {a}.', 'without human glue');
-  at(63.0, () => on(c4));
-  at(67.0, () => off(c4));
+  at(50.5, () => narrator.speak("And here — is what npm and Maven were never built for. AI-native discovery. fglpkg is MCP-aware from day one. AI agents search the registry, audit, and install packages on the developer's behalf — turning a question, into a working project."));
+  schedSubs([
+    [50.5, "Here's what npm and Maven were never built for:"],
+    [53.0, "AI-native discovery."],
+    [55.0, "fglpkg is MCP-aware from day one."],
+    [57.5, "AI agents search, audit, and install packages on the developer's behalf."],
+    [62.0, "Turning a question into a working project."],
+    [67.5, ''],
+  ]);
 
   // ---- Scene 5: Value (1:08 - 1:24) ----
   at(68.0, () => { showScene(5); });
@@ -846,10 +903,14 @@
   at(69.0, () => on(sceneByNum(5).querySelector('[data-vc="1"]')));
   at(70.0, () => on(sceneByNum(5).querySelector('[data-vc="2"]')));
   at(71.0, () => on(sceneByNum(5).querySelector('[data-vc="3"]')));
-  at(69.5, () => narrator.speak("Value lands in three places. Professional Services gets hours back every engagement. End-user customers get dependency hygiene they could never assemble alone. And every developer — junior, senior, or AI agent — works at the modern baseline."));
-  const c5 = addCaption(5, 'PS · end-user customers · {a}.', 'AI agents');
-  at(79.0, () => on(c5));
-  at(83.0, () => off(c5));
+  at(69.5, () => narrator.speak("Value lands in three places. Professional Services — hours back, every engagement. End-user customers — dependency hygiene they couldn't assemble alone. And every developer — junior, senior, or AI agent — works at the modern baseline."));
+  schedSubs([
+    [69.5, "Value lands in three places."],
+    [71.5, "Professional Services — hours back, every engagement."],
+    [75.0, "End-user customers — dependency hygiene they couldn't assemble alone."],
+    [79.0, "Every developer — junior, senior, or AI agent — works at the modern baseline."],
+    [83.5, ''],
+  ]);
 
   // ---- Scene 6: Status & Ask (1:24 - 1:36) ----
   at(84.0, () => { showScene(6); });
@@ -858,7 +919,13 @@
   at(86.2, () => on(sceneByNum(6).querySelector('[data-line="2"]')));
   at(87.4, () => on(sceneByNum(6).querySelector('[data-line="3"]')));
   at(89.4, () => on(sceneByNum(6).querySelector('[data-meta]')));
-  at(85.5, () => narrator.speak("v2.0.1 ships today. MCP integration in flight. Available to Professional Services now; rolls out to end-user customers next. PS validates demand and de-risks the broader investment — without committing the roadmap up front."));
+  at(85.5, () => narrator.speak("v2.0.1 ships today. MCP integration in flight. Available to PS now — end-user customers next. Validate demand. Build the case. De-risk the broader investment."));
+  schedSubs([
+    [85.5, "v2.0.1 ships today. MCP integration in flight."],
+    [88.5, "Available to PS now. End-user customers next."],
+    [91.5, "Validate demand. Build the case. De-risk the broader investment."],
+    [95.3, ''],
+  ]);
 
   // ---- Scene 7: End card (1:36 - 1:38) ----
   at(95.5, () => { showScene(7); off(brand); });
@@ -888,13 +955,14 @@
 
   function rewindTo(t) {
     scenes.forEach(s => s.classList.remove('on'));
-    $$('.caption').forEach(c => c.classList.remove('on'));
     $$('[data-anim]').forEach(el => el.classList.remove('on'));
     $$('[data-tl], [data-il]').forEach(el => el.classList.remove('on'));
     $$('[data-tool], [data-snippet]').forEach(el => el.classList.remove('on'));
     $$('[data-bubble]').forEach(el => el.classList.remove('on'));
     $$('[data-vc], [data-line], [data-meta], [data-end]').forEach(el => el.classList.remove('on'));
     brand.classList.remove('on');
+    subtitle.classList.remove('on');
+    subtitle.textContent = '';
     firedIdx = 0;
     fireEventsUpTo(t);
   }
@@ -972,10 +1040,16 @@
     if (!narrator.supported) return;
     const current = narrator.currentVoiceName;
     voiceSelect.innerHTML = '';
+    // Show ★ next to voices that look natural/neural so the user can
+    // quickly find the good ones. On macOS, Premium/Enhanced voices
+    // must be downloaded once in System Settings → Accessibility →
+    // Spoken Content → System Voice.
     for (const v of narrator.voices) {
       const opt = document.createElement('option');
       opt.value = v.name;
-      opt.textContent = v.name.replace(/\s*\(.*?\)\s*$/, '') + (v.lang ? ` · ${v.lang}` : '');
+      const cleanName = v.name.replace(/\s*\(.*?\)\s*$/, '');
+      const star = /\b(Premium|Enhanced|Neural|Natural|Studio|Wavenet|Siri)\b/i.test(v.name) ? ' ★' : '';
+      opt.textContent = cleanName + star + (v.lang ? ` · ${v.lang}` : '');
       if (v.name === current) opt.selected = true;
       voiceSelect.appendChild(opt);
     }
