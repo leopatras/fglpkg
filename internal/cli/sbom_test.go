@@ -84,7 +84,7 @@ func TestSbomFlagParsing(t *testing.T) {
 
 func TestCmdSbomMissingLockfile(t *testing.T) {
 	dir := t.TempDir()
-	t.Chdir(dir)
+	chdirTest(t, dir)
 	err := cmdSbom(nil)
 	if err == nil {
 		t.Fatal("expected error when no lockfile present")
@@ -96,7 +96,7 @@ func TestCmdSbomMissingLockfile(t *testing.T) {
 
 func TestCmdSbomFormatSpdxRejected(t *testing.T) {
 	dir := t.TempDir()
-	t.Chdir(dir)
+	chdirTest(t, dir)
 	writeLockfileForSbom(t, dir, nil, nil)
 	err := cmdSbom([]string{"--format=spdx"})
 	if err == nil {
@@ -109,7 +109,7 @@ func TestCmdSbomFormatSpdxRejected(t *testing.T) {
 
 func TestCmdSbomToFile(t *testing.T) {
 	dir := t.TempDir()
-	t.Chdir(dir)
+	chdirTest(t, dir)
 	writeLockfileForSbom(t, dir,
 		[]lockfile.LockedPackage{{Name: "poiapi", Version: "1.0.0", RequiredBy: []string{"<root>"}}},
 		nil,
@@ -137,7 +137,7 @@ func TestCmdSbomToFile(t *testing.T) {
 
 func TestCmdSbomProductionFilter(t *testing.T) {
 	dir := t.TempDir()
-	t.Chdir(dir)
+	chdirTest(t, dir)
 	writeLockfileForSbom(t, dir, nil, []lockfile.LockedJAR{
 		{Key: "g:prod", GroupID: "g", ArtifactID: "prod", Version: "1.0.0"},
 		{Key: "g:dev", GroupID: "g", ArtifactID: "dev", Version: "1.0.0", Scope: "dev"},
@@ -156,7 +156,7 @@ func TestCmdSbomProductionFilter(t *testing.T) {
 
 func TestCmdSbomCompactByDefault(t *testing.T) {
 	dir := t.TempDir()
-	t.Chdir(dir)
+	chdirTest(t, dir)
 	writeLockfileForSbom(t, dir, []lockfile.LockedPackage{{Name: "a", Version: "1.0.0"}}, nil)
 	outPath := filepath.Join(dir, "sbom.json")
 	if err := cmdSbom([]string{"-o", outPath}); err != nil {
@@ -173,7 +173,7 @@ func TestCmdSbomCompactByDefault(t *testing.T) {
 
 func TestCmdSbomPrettyHasIndentation(t *testing.T) {
 	dir := t.TempDir()
-	t.Chdir(dir)
+	chdirTest(t, dir)
 	writeLockfileForSbom(t, dir, []lockfile.LockedPackage{{Name: "a", Version: "1.0.0"}}, nil)
 	outPath := filepath.Join(dir, "sbom.json")
 	if err := cmdSbom([]string{"--pretty", "-o", outPath}); err != nil {

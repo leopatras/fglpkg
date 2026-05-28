@@ -128,7 +128,7 @@ func TestAuditFlagParsing(t *testing.T) {
 
 func TestCmdAuditMissingLockfile(t *testing.T) {
 	dir := t.TempDir()
-	t.Chdir(dir)
+	chdirTest(t, dir)
 	err := cmdAudit(nil)
 	if got := exitCode(err); got != 2 {
 		t.Fatalf("exit code = %d, want 2 (missing lockfile)", got)
@@ -140,7 +140,7 @@ func TestCmdAuditMissingLockfile(t *testing.T) {
 
 func TestCmdAuditOffline(t *testing.T) {
 	dir := t.TempDir()
-	t.Chdir(dir)
+	chdirTest(t, dir)
 	writeLockfileForAudit(t, dir, nil)
 	err := cmdAudit([]string{"--offline"})
 	if got := exitCode(err); got != 2 {
@@ -150,7 +150,7 @@ func TestCmdAuditOffline(t *testing.T) {
 
 func TestCmdAuditCleanTreeExit0(t *testing.T) {
 	dir := t.TempDir()
-	t.Chdir(dir)
+	chdirTest(t, dir)
 	writeLockfileForAudit(t, dir, []lockfile.LockedJAR{
 		{Key: "com.example:foo", GroupID: "com.example", ArtifactID: "foo", Version: "1.0.0"},
 	})
@@ -166,7 +166,7 @@ func TestCmdAuditCleanTreeExit0(t *testing.T) {
 
 func TestCmdAuditFindingsExit1(t *testing.T) {
 	dir := t.TempDir()
-	t.Chdir(dir)
+	chdirTest(t, dir)
 	writeLockfileForAudit(t, dir, []lockfile.LockedJAR{
 		{Key: "com.example:foo", GroupID: "com.example", ArtifactID: "foo", Version: "1.0.0"},
 	})
@@ -192,7 +192,7 @@ func TestCmdAuditFindingsExit1(t *testing.T) {
 // fail when --severity=high.
 func TestCmdAuditSeverityFloor(t *testing.T) {
 	dir := t.TempDir()
-	t.Chdir(dir)
+	chdirTest(t, dir)
 	writeLockfileForAudit(t, dir, []lockfile.LockedJAR{
 		{Key: "com.example:foo", GroupID: "com.example", ArtifactID: "foo", Version: "1.0.0"},
 	})
@@ -216,7 +216,7 @@ func TestCmdAuditSeverityFloor(t *testing.T) {
 
 func TestCmdAuditUpstreamError(t *testing.T) {
 	dir := t.TempDir()
-	t.Chdir(dir)
+	chdirTest(t, dir)
 	writeLockfileForAudit(t, dir, []lockfile.LockedJAR{
 		{Key: "com.example:foo", GroupID: "com.example", ArtifactID: "foo", Version: "1.0.0"},
 	})
@@ -235,7 +235,7 @@ func TestCmdAuditUpstreamError(t *testing.T) {
 
 func TestCmdAuditProductionFilter(t *testing.T) {
 	dir := t.TempDir()
-	t.Chdir(dir)
+	chdirTest(t, dir)
 	writeLockfileForAudit(t, dir, []lockfile.LockedJAR{
 		{Key: "com.example:prod", GroupID: "com.example", ArtifactID: "prod", Version: "1.0.0"},
 		{Key: "com.example:dev", GroupID: "com.example", ArtifactID: "dev", Version: "1.0.0", Scope: "dev"},
