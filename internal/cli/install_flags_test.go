@@ -7,6 +7,32 @@ import (
 	"github.com/4js-mikefolcher/fglpkg/internal/manifest"
 )
 
+// TestInstallImpliesNewProject covers the SUPNA-10506 Bug 1 decision:
+// `fglpkg install <pkg>` in an empty (non-project) directory should be
+// treated as local, because the add-package branch is about to write
+// fglpkg.json there.
+func TestInstallImpliesNewProject(t *testing.T) {
+	cases := []struct {
+		name string
+		f    installFlags
+		isPj bool
+		want bool
+	}{
+		{"empty dir, add package", installFlags{pkgs: []string{"foo"}}, false, true},
+		{"in project, add package", installFlags{pkgs: []string{"foo"}}, true, false},
+		{"empty dir, no packages", installFlags{}, false, false},
+		{"--local forced", installFlags{pkgs: []string{"foo"}, local: true}, false, false},
+		{"--global forced", installFlags{pkgs: []string{"foo"}, global: true}, false, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := installImpliesNewProject(c.f, c.isPj); got != c.want {
+				t.Errorf("got %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
 func TestParseInstallFlagsDefaults(t *testing.T) {
 	f, err := parseInstallFlags([]string{"pkg1", "pkg2"})
 	if err != nil {

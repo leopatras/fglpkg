@@ -136,7 +136,16 @@ func cmdInstall(args []string) error {
 		return err
 	}
 
-	home, isLocal, err := resolveHome(flags.local, flags.global)
+	// `fglpkg install <pkg>` in a directory that isn't yet a project (no
+	// .fglpkg/, no fglpkg.json) is treated as local: the add-package branch
+	// will call manifest.LoadOrNew(".") which writes fglpkg.json HERE, so
+	// the directory IS becoming a project. Without this, the package would
+	// install globally while the manifest landed locally — silent
+	// inconsistency that bit Laurent in SUPNA-10506.
+	addingToNewProject := installImpliesNewProject(flags, isProjectDir())
+	forceLocal := flags.local || addingToNewProject
+
+	home, isLocal, err := resolveHome(forceLocal, flags.global)
 	if err != nil {
 		return err
 	}
@@ -146,6 +155,9 @@ func cmdInstall(args []string) error {
 	if isLocal {
 		fmt.Println("Installing to local project directory (.fglpkg/)")
 		fmt.Println("  Tip: add .fglpkg/ to your .gitignore file")
+		if addingToNewProject {
+			fmt.Println("  Note: no fglpkg.json found — initialising the current directory as a new project.")
+		}
 	}
 
 	if flags.force {
@@ -271,6 +283,15 @@ func resolveHome(forceLocal, forceGlobal bool) (home string, isLocal bool, err e
 	}
 	h, err := fglpkgHome()
 	return h, false, err
+}
+
+// installImpliesNewProject reports whether the install invocation should be
+// treated as "create a new project in the current directory" — true when
+// the user passed at least one package name, didn't force either scope, and
+// the current directory isn't already a project. Pulled out of cmdInstall
+// for direct unit testing.
+func installImpliesNewProject(f installFlags, currentDirIsProject bool) bool {
+	return len(f.pkgs) > 0 && !f.local && !f.global && !currentDirIsProject
 }
 
 // isProjectDir returns true if the current directory looks like a project
