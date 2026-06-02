@@ -11,7 +11,7 @@
 
 Bring fglpkg's **consumer-facing** behaviour into line with the TypeScript fglpkg-cli a co-worker has been shipping, so a developer who knows one CLI knows the other. Three areas change:
 
-1. **Registry URL** — consumer commands default to `https://registry.generointelligence.ai` (the cli's registry); **publisher commands keep defaulting to `https://fglpkg-registry.fly.dev`** until that endpoint set is confirmed on the new server. Two distinct defaults, two distinct env overrides.
+1. **Registry URL** — consumer commands default to `https://service.generointelligence.ai` (the cli's registry); **publisher commands keep defaulting to `https://fglpkg-registry.fly.dev`** until that endpoint set is confirmed on the new server. Two distinct defaults, two distinct env overrides.
 2. **Authentication** — add OAuth (auth code + PKCE + DCR) as the default `fglpkg login` flow against the consumer registry; add `--token <PAT>` for non-interactive. Introduce `FGLPKG_TOKEN` as the consumer bearer env var (with `FGLPKG_PUBLISH_TOKEN` accepted as a back-compat fallback on the consumer side). `FGLPKG_PUBLISH_TOKEN` stays as the canonical publisher bearer.
 3. **whoami** — call `/registry/whoami` (with `/auth/whoami` fallback), render the four-line cli-style output.
 
@@ -19,7 +19,7 @@ Nothing fglpkg can do today is removed. All publisher/owner/workspace/sbom/audit
 
 ## Motivation
 
-A co-worker built [fglpkg-cli](https://github.com/4js-ai/fglpkg-cli) — a Node consumer CLI talking to a Cloudflare-backed registry at `registry.generointelligence.ai`. The server already supports the OAuth code+PKCE flow with dynamic client registration (`/register`, `/authorize`, `/token`) and a richer whoami (`/registry/whoami`). Our Go CLI talks to a different default registry, uses a different env var name, prompts interactively for everything, and renders whoami in its own format. Two CLIs against the same backend should agree on these basics or users get confused which token works where.
+A co-worker built [fglpkg-cli](https://github.com/4js-ai/fglpkg-cli) — a Node consumer CLI talking to a Cloudflare-backed registry at `service.generointelligence.ai`. The server already supports the OAuth code+PKCE flow with dynamic client registration (`/register`, `/authorize`, `/token`) and a richer whoami (`/registry/whoami`). Our Go CLI talks to a different default registry, uses a different env var name, prompts interactively for everything, and renders whoami in its own format. Two CLIs against the same backend should agree on these basics or users get confused which token works where.
 
 ## Goals
 
@@ -36,7 +36,7 @@ A co-worker built [fglpkg-cli](https://github.com/4js-ai/fglpkg-cli) — a Node 
 
 - **Removing functionality.** GitHub-token storage (`githubToken` field), `FGLPKG_PUBLISH_TOKEN`, `FGLPKG_GITHUB_TOKEN`, `FGLPKG_GITHUB_REPO`, `publish`, `pack`, `owner`, `token`, `config`, `workspace`/`ws`, `run`, `bdl`, `docs`, `outdated`, `info`/`view`, `sbom`, `init` — all stay.
 - **Renaming or repackaging the CLI.** Still `fglpkg`, still distributed as a Go binary.
-- **Server-side work.** This spec covers the client only. The OAuth endpoints, the `/registry/whoami` endpoint, and the `gpr_` PAT prefix are assumed to exist on `registry.generointelligence.ai`.
+- **Server-side work.** This spec covers the client only. The OAuth endpoints, the `/registry/whoami` endpoint, and the `gpr_` PAT prefix are assumed to exist on `service.generointelligence.ai`.
 - **Device-code OAuth flow** (for headless / SSH boxes). On fglpkg-cli's v1.1 roadmap; not implemented here.
 - **Hidden-input prompt** when typing a PAT. fglpkg-cli has the same gap; future ticket.
 
@@ -53,7 +53,7 @@ func defaultRegistry() string {
     if r := os.Getenv("FGLPKG_REGISTRY"); r != "" {
         return strings.TrimRight(r, "/")
     }
-    return "https://registry.generointelligence.ai" // was fglpkg-registry.fly.dev
+    return "https://service.generointelligence.ai" // was fglpkg-registry.fly.dev
 }
 
 // Publisher (publish, unpublish, owner, token, config).
@@ -245,7 +245,7 @@ func whoamiRequest(ctx context.Context, registryURL, bearer string) (WhoAmI, err
 Output (new endpoint available):
 
 ```
-Registry: https://registry.generointelligence.ai
+Registry: https://service.generointelligence.ai
 User:     Jane Developer <jane@acme.com>
 Partner:  ACME
 Scopes:   registry:read
@@ -272,7 +272,7 @@ The existing `GitHub token: configured` / `GitHub token: not configured` line is
 // consumerBase returns the URL for /registry/packages, /registry/whoami, etc.
 func consumerBase() string {
     if r := os.Getenv("FGLPKG_REGISTRY"); r != "" { return strings.TrimRight(r, "/") }
-    return "https://registry.generointelligence.ai"
+    return "https://service.generointelligence.ai"
 }
 
 // publisherBase mirrors defaultPublishRegistry() in cli.go.
@@ -397,7 +397,7 @@ This covers clock skew and server-side revocation without forcing the user to re
 
 | Var                       | Before                       | After                                                                 |
 |---------------------------|------------------------------|-----------------------------------------------------------------------|
-| consumer default URL      | `https://fglpkg-registry.fly.dev` | `https://registry.generointelligence.ai`                        |
+| consumer default URL      | `https://fglpkg-registry.fly.dev` | `https://service.generointelligence.ai`                        |
 | publisher default URL     | `https://fglpkg-registry.fly.dev` | unchanged — `https://fglpkg-registry.fly.dev`                   |
 | consumer URL env override | `FGLPKG_REGISTRY`            | unchanged                                                             |
 | publisher URL env override| (none)                       | `FGLPKG_PUBLISH_REGISTRY` (new); falls back to `FGLPKG_REGISTRY`      |

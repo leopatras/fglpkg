@@ -43,6 +43,11 @@
       "type": "string",
       "description": "Primary .42m entry point for this package."
     },
+    "visibility": {
+      "type": "string",
+      "enum": ["public", "private"],
+      "description": "Who can see this package on the registry. Defaults to public. Set when the package is first created; ignored on subsequent publishes."
+    },
     "genero": {
       "type": "string",
       "description": "Semver constraint for Genero BDL runtime compatibility (e.g. \"^6.0.0\", \">=4.01 <7\"). Omit or use \"*\" to indicate any Genero version."

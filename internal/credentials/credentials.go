@@ -14,7 +14,7 @@
 //
 //	{
 //	  "registries": {
-//	    "https://registry.generointelligence.ai": {
+//	    "https://service.generointelligence.ai": {
 //	      "oauth": {
 //	        "access_token":  "…",
 //	        "refresh_token": "…",

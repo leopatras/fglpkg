@@ -214,12 +214,12 @@ eval "$(fglpkg env --global)"
 | Variable | Purpose |
 |---|---|
 | `FGLPKG_HOME` | Override default `~/.fglpkg` home |
-| `FGLPKG_REGISTRY` | Consumer registry URL — used by `install`, `search`, `audit`, `info`, `outdated`, `whoami`, `login`. Default: `https://registry.generointelligence.ai` |
-| `FGLPKG_PUBLISH_REGISTRY` | Publisher registry URL — used by `publish`, `unpublish`, `owner`, `token`, `config`. Falls back to `FGLPKG_REGISTRY` if unset, then to `https://fglpkg-registry.fly.dev` |
-| `FGLPKG_TOKEN` | Bearer token for consumer commands (canonical). Wins over stored credentials when set |
-| `FGLPKG_PUBLISH_TOKEN` | Bearer token for publisher commands. Also accepted as a back-compat fallback by consumer commands when `FGLPKG_TOKEN` is unset |
-| `FGLPKG_GITHUB_TOKEN` | GitHub PAT for package uploads/downloads (private GitHub Releases — only used by the legacy `fglpkg-registry.fly.dev` flow) |
-| `FGLPKG_GITHUB_REPO` | GitHub `owner/repo` for package storage (e.g., `4js-mikefolcher/fglpkg-packages`) |
+| `FGLPKG_REGISTRY` | Registry URL — used by `install`, `search`, `audit`, `info`, `outdated`, `whoami`, `login`, `publish`. Default: `https://service.generointelligence.ai` |
+| `FGLPKG_PUBLISH_REGISTRY` | Overrides `FGLPKG_REGISTRY` for the `publish` command only |
+| `FGLPKG_TOKEN` | Bearer token for the registry. Overrides stored OAuth/PAT credentials |
+| `FGLPKG_PUBLISH_TOKEN` | Bearer for the **legacy** `fglpkg-registry.fly.dev` commands only (`unpublish`, `owner`, `token`, `config`) |
+| `FGLPKG_GITHUB_TOKEN` | GitHub PAT — only used by legacy `unpublish` and downloads from private GitHub Releases |
+| `FGLPKG_GITHUB_REPO` | GitHub `owner/repo` — only used by legacy commands |
 | `FGLPKG_GENERO_VERSION` | Override Genero version detection |
 | `FGLPKG_INSTALL_CONCURRENCY` | Cap parallel downloads during install (default 4) |
 | `FGLLDPATH` | Auto-managed by `fglpkg env` (prepends, preserves existing value) |
@@ -235,7 +235,7 @@ For non-interactive use (CI, SSH boxes, scripts), pass a Personal Access Token:
 fglpkg login --token gpr_…       # or: export FGLPKG_TOKEN=gpr_…
 ```
 
-Publisher commands authenticate against the publisher registry separately — set `FGLPKG_PUBLISH_TOKEN` for those.
+The `publish` command uses the same OAuth/PAT credentials as the other consumer commands. The legacy `unpublish`/`owner`/`token`/`config` commands talk only to `https://fglpkg-registry.fly.dev` and require `FGLPKG_PUBLISH_TOKEN` to authenticate.
 
 ## Usage
 

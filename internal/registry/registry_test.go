@@ -205,7 +205,11 @@ func TestTryRefreshTriggeredOn401(t *testing.T) {
 	}
 }
 
-func TestPublisherVersionListHonoursOldEndpoint(t *testing.T) {
+// PublisherVersionList now talks to the LEGACY (fly.dev) base unconditionally
+// — env override was dropped because the legacy URL is the only place the old
+// /packages/<name>/versions endpoint exists. Tests swap registry.LegacyBase to
+// a httptest URL.
+func TestPublisherVersionListUsesLegacyBase(t *testing.T) {
 	gotPath := ""
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotPath = r.URL.Path
@@ -215,7 +219,9 @@ func TestPublisherVersionListHonoursOldEndpoint(t *testing.T) {
 		})
 	}))
 	defer ts.Close()
-	t.Setenv("FGLPKG_PUBLISH_REGISTRY", ts.URL)
+	prev := registry.LegacyBase
+	registry.LegacyBase = ts.URL
+	t.Cleanup(func() { registry.LegacyBase = prev })
 
 	vl, err := registry.PublisherVersionList("demo")
 	if err != nil {
@@ -226,21 +232,5 @@ func TestPublisherVersionListHonoursOldEndpoint(t *testing.T) {
 	}
 	if len(vl.Versions) != 1 || vl.Versions[0] != "1.0.0" {
 		t.Errorf("Versions = %v, want [1.0.0]", vl.Versions)
-	}
-}
-
-func TestPublisherBaseFallsBackToFglpkgRegistry(t *testing.T) {
-	// Only FGLPKG_REGISTRY is set (e.g. self-hosted single-registry user).
-	// publisherBase() should fall back to it.
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewEncoder(w).Encode(map[string]any{"name": "demo", "versions": []string{}})
-	}))
-	defer ts.Close()
-	t.Setenv("FGLPKG_REGISTRY", ts.URL)
-	// Ensure no publish-specific override interferes.
-	t.Setenv("FGLPKG_PUBLISH_REGISTRY", "")
-
-	if _, err := registry.PublisherVersionList("demo"); err != nil {
-		t.Fatalf("PublisherVersionList: %v", err)
 	}
 }

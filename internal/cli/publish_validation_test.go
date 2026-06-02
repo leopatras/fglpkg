@@ -12,63 +12,54 @@ import (
 	"github.com/4js-mikefolcher/fglpkg/internal/registry"
 )
 
-// versionStubServer responds to /packages/:name/versions with the
-// supplied per-package versions map. Returns the legacy flat shape
-// (no VersionEntries) so existing tests exercise the back-compat
-// branch of checkVariantNotPublished. Unknown names produce a 404.
-func versionStubServer(t *testing.T, versionsByName map[string][]string) *httptest.Server {
+// detailStubServer responds to GET /registry/packages/:slug with the
+// supplied per-slug version-and-variant map. Unknown slugs produce a 404.
+//
+// versions map: slug → version → []variants.
+func detailStubServer(t *testing.T, versions map[string]map[string][]string) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// expecting: /packages/<name>/versions
-		parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/packages/"), "/")
-		if len(parts) != 2 || parts[1] != "versions" {
+		// Expect: /registry/packages/<slug>
+		const prefix = "/registry/packages/"
+		if !strings.HasPrefix(r.URL.Path, prefix) {
 			http.NotFound(w, r)
 			return
 		}
-		name := parts[0]
-		versions, ok := versionsByName[name]
+		slug := strings.TrimPrefix(r.URL.Path, prefix)
+		// Reject the empty trailing path (browse endpoint, not detail).
+		if slug == "" || strings.Contains(slug, "/") {
+			http.NotFound(w, r)
+			return
+		}
+		byVersion, ok := versions[slug]
 		if !ok {
 			http.NotFound(w, r)
 			return
 		}
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"name":     name,
-			"versions": versions,
-		})
-	}))
-}
-
-// variantStubServer responds with the modern shape including
-// versionEntries[].variants so checkVariantNotPublished can use the
-// variant-aware path. Unknown names produce a 404.
-func variantStubServer(t *testing.T, byName map[string][]registry.VersionEntry) *httptest.Server {
-	t.Helper()
-	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/packages/"), "/")
-		if len(parts) != 2 || parts[1] != "versions" {
-			http.NotFound(w, r)
-			return
-		}
-		name := parts[0]
-		entries, ok := byName[name]
-		if !ok {
-			http.NotFound(w, r)
-			return
-		}
-		flat := make([]string, 0, len(entries))
-		for _, e := range entries {
-			flat = append(flat, e.Version)
+		var versionsArr []map[string]any
+		for version, variants := range byVersion {
+			arts := make([]map[string]any, 0, len(variants))
+			for _, v := range variants {
+				arts = append(arts, map[string]any{
+					"variant":      v,
+					"sha256":       "abc",
+					"download_url": "/dl/" + slug + "/" + version + "/" + v,
+				})
+			}
+			versionsArr = append(versionsArr, map[string]any{
+				"version":   version,
+				"artifacts": arts,
+			})
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"name":           name,
-			"versions":       flat,
-			"versionEntries": entries,
+			"slug":     slug,
+			"versions": versionsArr,
 		})
 	}))
 }
 
 func TestCheckVariantNotPublishedFirstPublish(t *testing.T) {
-	ts := versionStubServer(t, nil) // empty map → every package is 404
+	ts := detailStubServer(t, nil) // every slug → 404
 	defer ts.Close()
 	t.Setenv("FGLPKG_REGISTRY", ts.URL)
 
@@ -78,44 +69,9 @@ func TestCheckVariantNotPublishedFirstPublish(t *testing.T) {
 	}
 }
 
-// Legacy server (only flat Versions): same version always blocks.
-func TestCheckVariantNotPublishedLegacyServerBlocks(t *testing.T) {
-	ts := versionStubServer(t, map[string][]string{
-		"demo": {"1.0.0", "1.1.0", "1.2.0"},
-	})
-	defer ts.Close()
-	t.Setenv("FGLPKG_REGISTRY", ts.URL)
-
-	m := manifest.New("demo", "1.1.0", "", "")
-	err := checkVariantNotPublished(m, "6")
-	if err == nil {
-		t.Fatal("expected error when version already published on legacy server")
-	}
-	if !strings.Contains(err.Error(), "already published") {
-		t.Errorf("err = %v, want one mentioning 'already published'", err)
-	}
-	if !strings.Contains(err.Error(), "fglpkg version") {
-		t.Errorf("err = %v, want guidance pointing at `fglpkg version`", err)
-	}
-}
-
-func TestCheckVariantNotPublishedDifferentVersion(t *testing.T) {
-	ts := versionStubServer(t, map[string][]string{
-		"demo": {"1.0.0", "1.1.0"},
-	})
-	defer ts.Close()
-	t.Setenv("FGLPKG_REGISTRY", ts.URL)
-
-	m := manifest.New("demo", "2.0.0", "", "")
-	if err := checkVariantNotPublished(m, "6"); err != nil {
-		t.Errorf("expected nil when bumping past existing versions, got %v", err)
-	}
-}
-
-// New server shape: same version + same variant blocks.
 func TestCheckVariantNotPublishedSameVariantBlocks(t *testing.T) {
-	ts := variantStubServer(t, map[string][]registry.VersionEntry{
-		"demo": {{Version: "1.0.2", Variants: []string{"6"}}},
+	ts := detailStubServer(t, map[string]map[string][]string{
+		"demo": {"1.0.2": {"genero6"}},
 	})
 	defer ts.Close()
 	t.Setenv("FGLPKG_REGISTRY", ts.URL)
@@ -128,13 +84,17 @@ func TestCheckVariantNotPublishedSameVariantBlocks(t *testing.T) {
 	if !strings.Contains(err.Error(), "Genero 6") {
 		t.Errorf("err = %v, want one mentioning 'Genero 6'", err)
 	}
+	if !strings.Contains(err.Error(), "fglpkg version") {
+		t.Errorf("err = %v, want guidance pointing at `fglpkg version`", err)
+	}
 }
 
-// New server shape: same version, different variant ALLOWED — this is the
-// regression Laurent hit when publishing the GBL5 variant after GBL6.
+// The regression Laurent hit in SUPNA-10506: publishing a Genero 5 variant
+// of an existing-on-Genero-6 version used to be blocked. With the new check
+// (and the new registry's variants-per-version view), it succeeds.
 func TestCheckVariantNotPublishedNewVariantAllowed(t *testing.T) {
-	ts := variantStubServer(t, map[string][]registry.VersionEntry{
-		"genero-crypto-api": {{Version: "1.0.2", Variants: []string{"6"}}},
+	ts := detailStubServer(t, map[string]map[string][]string{
+		"genero-crypto-api": {"1.0.2": {"genero6"}},
 	})
 	defer ts.Close()
 	t.Setenv("FGLPKG_REGISTRY", ts.URL)
@@ -142,6 +102,19 @@ func TestCheckVariantNotPublishedNewVariantAllowed(t *testing.T) {
 	m := manifest.New("genero-crypto-api", "1.0.2", "", "")
 	if err := checkVariantNotPublished(m, "5"); err != nil {
 		t.Errorf("expected nil when adding new variant to existing version, got %v", err)
+	}
+}
+
+func TestCheckVariantNotPublishedDifferentVersion(t *testing.T) {
+	ts := detailStubServer(t, map[string]map[string][]string{
+		"demo": {"1.0.0": {"genero6"}, "1.1.0": {"genero6"}},
+	})
+	defer ts.Close()
+	t.Setenv("FGLPKG_REGISTRY", ts.URL)
+
+	m := manifest.New("demo", "2.0.0", "", "")
+	if err := checkVariantNotPublished(m, "6"); err != nil {
+		t.Errorf("expected nil when bumping past existing versions, got %v", err)
 	}
 }
 

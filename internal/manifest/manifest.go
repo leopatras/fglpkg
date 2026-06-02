@@ -28,6 +28,11 @@ type Manifest struct {
 	License          string            `json:"license,omitempty"`
 	Repository       string            `json:"repository,omitempty"`
 	Main             string            `json:"main,omitempty"` // primary .42m entry point
+	// Visibility controls who can read this package on the registry.
+	// "public" (default) — anyone can browse and install.
+	// "private" — only members of the owning partner can see it.
+	// Set when creating a new package; ignored on subsequent publishes.
+	Visibility string `json:"visibility,omitempty"`
 	// GeneroConstraint declares which Genero BDL runtime versions this package
 	// is compatible with, using standard semver constraint syntax.
 	// Examples: "^4.0.0", ">=3.20.0 <5.0.0", "^3.20.0 || ^4.0.0"

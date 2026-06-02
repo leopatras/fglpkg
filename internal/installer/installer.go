@@ -39,7 +39,7 @@ type Installer struct {
 //   - githubToken: authenticates downloads from private GitHub Releases
 //     (used by the legacy fglpkg-registry.fly.dev flow). Pass "" if not needed.
 //   - registryToken: bearer for non-GitHub download URLs (the new
-//     registry.generointelligence.ai flow serves zips itself, possibly
+//     service.generointelligence.ai flow serves zips itself, possibly
 //     behind auth). Pass "" for anonymous fetches.
 func New(home, githubToken, registryToken string) *Installer {
 	return &Installer{
@@ -371,7 +371,7 @@ func (i *Installer) JarsDir() string { return i.jarsDir }
 //   - GitHub URL + githubToken non-empty → send githubToken (legacy private
 //     GitHub Releases path used by fglpkg-registry.fly.dev).
 //   - Non-GitHub URL + registryToken non-empty → send registryToken (new
-//     registry.generointelligence.ai path where the registry serves zips).
+//     service.generointelligence.ai path where the registry serves zips).
 //   - Otherwise → no auth (anonymous public download).
 func downloadAndVerify(url, expectedChecksum, name string, w io.Writer, githubToken, registryToken string) error {
 	req, err := http.NewRequest(http.MethodGet, url, nil)

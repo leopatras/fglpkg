@@ -47,12 +47,9 @@ func TestPublishPackageDryRunNoNetwork(t *testing.T) {
 
 	err = publishPackage(
 		m,
-		"fake-registry-token",   // token
-		"http://127.0.0.1:1",    // registryURL — unreachable; if dry-run violates the contract the test will hang or error
-		"fake-github-token",     // githubToken
-		"testowner", "testrepo", // GitHub repo
-		"6",  // generoMajor
-		true, // dryRun
+		"http://127.0.0.1:1", // registryURL — unreachable; if dry-run violates the contract the test will fail
+		"6",                  // generoMajor
+		true,                 // dryRun
 	)
 	if err != nil {
 		t.Fatalf("dry-run publishPackage returned error: %v", err)

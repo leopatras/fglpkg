@@ -1,7 +1,7 @@
 // Package registry is the HTTP client for the Genero Package Registry.
 //
 // The consumer side talks the v1 "registry" protocol (paths under
-// /registry/...) used by fglpkg-cli's backend at registry.generointelligence.ai.
+// /registry/...) used by fglpkg-cli's backend at service.generointelligence.ai.
 // The publisher side talks the older /packages/... protocol used by the
 // fglpkg-registry.fly.dev server, where fglpkg's `publish`, `unpublish`,
 // `owner`, `token` and `config` commands continue to operate.
@@ -13,6 +13,7 @@
 package registry
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -32,9 +33,17 @@ import (
 var ErrNotFound = errors.New("package not found in registry")
 
 const (
-	defaultConsumerBase  = "https://registry.generointelligence.ai"
-	defaultPublisherBase = "https://fglpkg-registry.fly.dev"
+	defaultConsumerBase  = "https://service.generointelligence.ai"
+	defaultPublisherBase = "https://service.generointelligence.ai"
 )
+
+// LegacyBase is the old fglpkg-registry.fly.dev server used by
+// cmdUnpublish/cmdOwner/cmdToken/cmdConfig — operations that have no
+// equivalent on the new /registry/* protocol today. These commands are
+// expected to disappear once the new registry exposes the admin surface
+// over its own API. Declared as a var (not const) so tests can point it at
+// httptest.Server URLs.
+var LegacyBase = "https://fglpkg-registry.fly.dev"
 
 // Bearer is the function the registry HTTP client calls to obtain the
 // current bearer token for consumer-side authenticated requests. CLI swaps
@@ -233,14 +242,130 @@ func Search(term string) ([]SearchResult, error) {
 	return results, nil
 }
 
-// ─── Publisher API (old /packages/... + /config + /auth/... protocol) ────────
+// ─── Publisher API (new /registry/... protocol) ──────────────────────────────
 
-// FetchConfig returns the publisher registry's configuration, including the
-// list of GitHub repos configured for package storage. This endpoint exists
-// only on the publisher registry.
+// PublishCreatePackage creates the slug on the registry if it doesn't exist.
+// Returns nil on both 201 (created) and 409 (already exists) — callers don't
+// need to differentiate, they only care that the slug is now claimable.
+func PublishCreatePackage(slug, name, description, visibility string) error {
+	if visibility == "" {
+		visibility = "public"
+	}
+	body, _ := json.Marshal(map[string]string{
+		"slug":        slug,
+		"name":        name,
+		"description": description,
+		"visibility":  visibility,
+	})
+	status, respBody, err := publishJSON(http.MethodPost, publisherBase()+"/registry/packages", body)
+	if err != nil {
+		return fmt.Errorf("create package %q: %w", slug, err)
+	}
+	if status == http.StatusCreated || status == http.StatusConflict {
+		return nil
+	}
+	return fmt.Errorf("create package %q: HTTP %d: %s", slug, status, string(respBody))
+}
+
+// PublishCreateVersion adds version under slug. Returns nil on 201; returns
+// ErrVersionExists (still wrapped) on 409 so callers can choose to upload a
+// new variant against an existing version.
+var ErrVersionExists = errors.New("version already exists")
+
+func PublishCreateVersion(slug, version, changelog string, tags map[string][]string) error {
+	payload := map[string]any{
+		"version":   version,
+		"changelog": changelog,
+	}
+	if len(tags) > 0 {
+		payload["tags"] = tags
+	}
+	body, _ := json.Marshal(payload)
+	status, respBody, err := publishJSON(http.MethodPost,
+		fmt.Sprintf("%s/registry/packages/%s/versions",
+			publisherBase(), url.PathEscape(slug)), body)
+	if err != nil {
+		return fmt.Errorf("create version %s@%s: %w", slug, version, err)
+	}
+	if status == http.StatusCreated {
+		return nil
+	}
+	if status == http.StatusConflict {
+		return fmt.Errorf("create version %s@%s: %w", slug, version, ErrVersionExists)
+	}
+	return fmt.Errorf("create version %s@%s: HTTP %d: %s", slug, version, status, string(respBody))
+}
+
+// PublishUploadArtifact streams the zip body for (slug, version, variant)
+// to the registry. The server computes size_bytes + sha256 and stores the
+// blob in R2. Allowed only while the version is pending or rejected; on an
+// approved version the server returns 409. filename is what the registry
+// records for download Content-Disposition.
+func PublishUploadArtifact(slug, version, variant, filename string, zip io.Reader) error {
+	u := fmt.Sprintf("%s/registry/packages/%s/versions/%s/artifacts/%s?filename=%s",
+		publisherBase(),
+		url.PathEscape(slug), url.PathEscape(version), url.PathEscape(variant),
+		url.QueryEscape(filename))
+	bearer := Bearer()
+	status, respBody, err := putBytes(u, "application/zip", bearer, zip)
+	if err != nil {
+		return fmt.Errorf("upload artifact %s@%s/%s: %w", slug, version, variant, err)
+	}
+	if status >= 200 && status < 300 {
+		return nil
+	}
+	return fmt.Errorf("upload artifact %s@%s/%s: HTTP %d: %s",
+		slug, version, variant, status, string(respBody))
+}
+
+// PublishSubmit marks a pending version for admin review. Idempotent — a
+// no-op response on 200 if the version is already pending.
+func PublishSubmit(slug, version string) error {
+	u := fmt.Sprintf("%s/registry/packages/%s/versions/%s/submit",
+		publisherBase(), url.PathEscape(slug), url.PathEscape(version))
+	status, respBody, err := publishJSON(http.MethodPost, u, nil)
+	if err != nil {
+		return fmt.Errorf("submit %s@%s: %w", slug, version, err)
+	}
+	if status >= 200 && status < 300 {
+		return nil
+	}
+	return fmt.Errorf("submit %s@%s: HTTP %d: %s", slug, version, status, string(respBody))
+}
+
+// VariantsFor reports which variants are already published for (slug, version).
+// Returns ErrNotFound wrapped if the package or version doesn't exist yet,
+// which the publish flow treats as "nothing to clobber". On the new protocol
+// this uses the same package detail endpoint the consumer side does, so the
+// caller doesn't need a separate auth path.
+func VariantsFor(slug, version string) ([]string, error) {
+	d, err := fetchPackageDetail(slug)
+	if err != nil {
+		return nil, err
+	}
+	for _, v := range d.Versions {
+		if v.Version != version {
+			continue
+		}
+		out := make([]string, 0, len(v.Artifacts))
+		for _, a := range v.Artifacts {
+			out = append(out, a.Variant)
+		}
+		return out, nil
+	}
+	return nil, fmt.Errorf("version %s of %s not found on registry: %w",
+		version, slug, ErrNotFound)
+}
+
+// ─── Publisher API (LEGACY /packages/... protocol) ───────────────────────────
+// Only used by cmdUnpublish, cmdOwner, cmdToken, cmdConfig — operations that
+// have no equivalent on the new /registry/* protocol. Hardcoded against the
+// fly.dev URL via the helpers below.
+
+// FetchConfig returns the legacy publisher registry's configuration. The new
+// registry does not expose this endpoint; only the legacy fly.dev server does.
 func FetchConfig() (*RegistryConfig, error) {
-	base := publisherBase()
-	data, err := httpGetPublisher(base + "/config")
+	data, err := httpGetPublisher(LegacyBase + "/config")
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch registry config: %w", err)
 	}
@@ -251,11 +376,10 @@ func FetchConfig() (*RegistryConfig, error) {
 	return &cfg, nil
 }
 
-// PublisherVersionList lists published versions via the OLD endpoint, used
-// by publish-time validation (so the publisher can check "does this version
-// already exist on the registry I'm about to publish to?").
+// PublisherVersionList lists published versions via the LEGACY endpoint.
+// Used by the legacy commands; the new publish flow uses VariantsFor.
 func PublisherVersionList(name string) (*VersionList, error) {
-	u := fmt.Sprintf("%s/packages/%s/versions", publisherBase(), url.PathEscape(name))
+	u := fmt.Sprintf("%s/packages/%s/versions", LegacyBase, url.PathEscape(name))
 	data, err := httpGetPublisher(u)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch publisher version list for %q: %w", name, err)
@@ -409,6 +533,68 @@ func httpGetPublisher(u string) ([]byte, error) {
 		return nil, fmt.Errorf("failed to read registry response: %w", err)
 	}
 	return finalise(body, resp.StatusCode)
+}
+
+// publishJSON does method u with optional JSON body, authenticated via
+// Bearer(). One-shot 401-retry via TryRefresh, same pattern as httpGetAuthed.
+// Returns (status, body, err); the caller inspects status because publish
+// endpoints use 201/200/409 to mean distinct things.
+func publishJSON(method, u string, body []byte) (int, []byte, error) {
+	doOnce := func() (int, []byte, error) {
+		var reader io.Reader
+		if body != nil {
+			reader = bytes.NewReader(body)
+		}
+		req, err := http.NewRequest(method, u, reader)
+		if err != nil {
+			return 0, nil, err
+		}
+		req.Header.Set("Accept", "application/json")
+		if body != nil {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		if b := Bearer(); b != "" {
+			req.Header.Set("Authorization", "Bearer "+b)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return 0, nil, fmt.Errorf("registry request failed: %w", err)
+		}
+		defer resp.Body.Close()
+		buf, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, buf, nil
+	}
+	status, respBody, err := doOnce()
+	if err != nil {
+		return 0, nil, err
+	}
+	if status == http.StatusUnauthorized && TryRefresh() {
+		return doOnce()
+	}
+	return status, respBody, nil
+}
+
+// putBytes streams body to u with the given content type. Used for the zip
+// upload step of publish. No 401 retry on streaming PUT — the body has been
+// consumed, so retry would require buffering. Caller can retry at the
+// fglpkg-publish level if a 401 surfaces.
+func putBytes(u, contentType, bearer string, body io.Reader) (int, []byte, error) {
+	req, err := http.NewRequest(http.MethodPut, u, body)
+	if err != nil {
+		return 0, nil, err
+	}
+	req.Header.Set("Content-Type", contentType)
+	req.Header.Set("Accept", "application/json")
+	if bearer != "" {
+		req.Header.Set("Authorization", "Bearer "+bearer)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return 0, nil, fmt.Errorf("registry upload failed: %w", err)
+	}
+	defer resp.Body.Close()
+	buf, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, buf, nil
 }
 
 func authedGet(u, bearer string) ([]byte, int, error) {

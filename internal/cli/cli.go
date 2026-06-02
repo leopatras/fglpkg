@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -632,17 +633,12 @@ func cmdPublish(args []string) error {
 		return err
 	}
 	registryURL := defaultPublishRegistry()
-	token := credentials.ActivePublishBearer(home, registryURL)
-	if token == "" {
-		return fmt.Errorf("not logged in to publish registry %s\nSet FGLPKG_PUBLISH_TOKEN or store a token via 'fglpkg login' against that registry", registryURL)
-	}
-	githubToken := credentials.GitHubTokenFor(home, registryURL)
-	if githubToken == "" {
-		return fmt.Errorf("GitHub token required for publishing\nSet FGLPKG_GITHUB_TOKEN")
-	}
-	owner, repo, err := resolveGitHubRepo()
+	token, err := credentials.ActiveBearer(context.Background(), home, registryURL, oauth.Refresh)
 	if err != nil {
 		return err
+	}
+	if token == "" {
+		return fmt.Errorf("not logged in to %s\nRun 'fglpkg login' (or set FGLPKG_TOKEN) first", registryURL)
 	}
 
 	if dryRun {
@@ -653,18 +649,33 @@ func cmdPublish(args []string) error {
 	if err := runHook(m, manifest.HookPrePublish, projectDir); err != nil {
 		return err
 	}
-	if err := publishPackage(m, token, registryURL, githubToken, owner, repo, generoMajor, dryRun); err != nil {
+	if err := publishPackage(m, registryURL, generoMajor, dryRun); err != nil {
 		return fmt.Errorf("publish failed: %w", err)
 	}
 	if dryRun {
 		fmt.Printf("✓ Dry run complete for %s@%s — no changes made\n", m.Name, m.Version)
 	} else {
-		fmt.Printf("✓ Published %s@%s\n", m.Name, m.Version)
+		fmt.Printf("✓ Published %s@%s — pending admin review\n", m.Name, m.Version)
 	}
 	return runHook(m, manifest.HookPostPublish, projectDir)
 }
 
-func publishPackage(m *manifest.Manifest, token, registryURL, githubToken, owner, repo, generoMajor string, dryRun bool) error {
+// publishPackage drives the new /registry/* publish flow against the registry
+// at registryURL using the bearer wired into registry.Bearer (typically the
+// OAuth access token from `fglpkg login`).
+//
+// Steps:
+//  1. Build the zip locally and SHA256 it (for the dry-run preview).
+//  2. POST /registry/packages — creates the slug; 409 means "already exists"
+//     which is fine.
+//  3. POST /registry/packages/:slug/versions — creates the version. 409 means
+//     the version already exists but a different variant. The publish proceeds
+//     to step 4 to add this variant.
+//  4. PUT /registry/packages/:slug/versions/:version/artifacts/:variant —
+//     streams the zip body. Server computes size + sha256 and stores in R2.
+//  5. POST /registry/packages/:slug/versions/:version/submit — marks the
+//     version pending so an admin reviews and approves.
+func publishPackage(m *manifest.Manifest, registryURL, generoMajor string, dryRun bool) error {
 	// 1. Build the zip.
 	zipData, checksum, err := buildPackageZip(m)
 	if err != nil {
@@ -672,90 +683,54 @@ func publishPackage(m *manifest.Manifest, token, registryURL, githubToken, owner
 	}
 	fmt.Printf("  Package zip: %d bytes (SHA256: %s)\n", len(zipData), checksum)
 
-	// 2. Upload to GitHub Releases (or preview target in dry-run).
-	tag := gh.ReleaseTag(m.Name, m.Version)
-	assetName := gh.VariantAssetName(m.Name, m.Version, generoMajor)
-	title := fmt.Sprintf("%s v%s", m.Name, m.Version)
-
-	var downloadURL string
-	if dryRun {
-		downloadURL = fmt.Sprintf("https://github.com/%s/%s/releases/download/%s/%s",
-			owner, repo, tag, assetName)
-		fmt.Printf("  [dry-run] would upload to GitHub %s/%s\n", owner, repo)
-		fmt.Printf("            release tag:  %s\n", tag)
-		fmt.Printf("            release name: %s\n", title)
-		fmt.Printf("            asset name:   %s\n", assetName)
-		fmt.Printf("            download URL: %s\n", downloadURL)
-	} else {
-		fmt.Printf("  Uploading to GitHub (%s/%s)...\n", owner, repo)
-		releaseID, err := gh.GetOrCreateRelease(githubToken, owner, repo, tag, title)
-		if err != nil {
-			return fmt.Errorf("GitHub release failed: %w", err)
-		}
-		downloadURL, err = gh.UploadAsset(githubToken, owner, repo, releaseID, assetName, zipData)
-		if err != nil {
-			return fmt.Errorf("GitHub upload failed: %w", err)
-		}
-		fmt.Printf("  Uploaded to GitHub: %s\n", downloadURL)
+	variant := "genero" + generoMajor
+	filename := gh.VariantAssetName(m.Name, m.Version, generoMajor)
+	slug := m.Name
+	visibility := m.Visibility
+	if visibility == "" {
+		visibility = "public"
 	}
-
-	// 3. Register metadata with the registry (JSON-only, no zip).
-	meta := map[string]any{
-		"description": m.Description,
-		"author":      m.Author,
-		"license":     m.License,
-		"genero":      m.GeneroConstraint,
-		"fglDeps":     m.Dependencies.FGL,
-		"checksum":    checksum,
-		"downloadUrl": downloadURL,
-		"generoMajor": generoMajor,
-	}
-	if len(m.Dependencies.Java) > 0 {
-		meta["javaDeps"] = m.Dependencies.Java
-	}
-	// Capture the top-level README so downstream consumers (MCP
-	// service, web UI) can display it without downloading the zip.
-	// Missing README is not an error.
-	readme, err := collectReadme(m.Root)
-	if err != nil {
-		return fmt.Errorf("cannot collect README: %w", err)
-	}
-	if readme != "" {
-		meta["readme"] = readme
-	}
-
-	url := fmt.Sprintf("%s/packages/%s/%s/publish",
-		strings.TrimRight(registryURL, "/"), m.Name, m.Version)
 
 	if dryRun {
-		prettyMeta, _ := json.MarshalIndent(meta, "            ", "  ")
-		fmt.Printf("  [dry-run] would POST to %s\n", url)
-		fmt.Printf("            body:\n            %s\n", prettyMeta)
+		fmt.Printf("  [dry-run] would POST   %s/registry/packages\n", registryURL)
+		fmt.Printf("            body: {slug:%q, name:%q, description:%q, visibility:%q}\n",
+			slug, m.Name, m.Description, visibility)
+		fmt.Printf("  [dry-run] would POST   %s/registry/packages/%s/versions\n", registryURL, slug)
+		fmt.Printf("            body: {version:%q, changelog:\"\"}\n", m.Version)
+		fmt.Printf("  [dry-run] would PUT    %s/registry/packages/%s/versions/%s/artifacts/%s?filename=%s\n",
+			registryURL, slug, m.Version, variant, filename)
+		fmt.Printf("            body: <%d bytes zip>\n", len(zipData))
+		fmt.Printf("  [dry-run] would POST   %s/registry/packages/%s/versions/%s/submit\n",
+			registryURL, slug, m.Version)
 		return nil
 	}
 
-	metaJSON, err := json.Marshal(meta)
-	if err != nil {
+	// 2. Create package (or no-op if already exists).
+	fmt.Println("  → POST   /registry/packages")
+	if err := registry.PublishCreatePackage(slug, m.Name, m.Description, visibility); err != nil {
 		return err
 	}
-	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(metaJSON))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+token)
 
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("registry request failed: %w", err)
+	// 3. Create version. 409 (already exists) is fine — caller is adding
+	//    a new variant to an existing version.
+	fmt.Println("  → POST   /registry/packages/" + slug + "/versions")
+	if err := registry.PublishCreateVersion(slug, m.Version, "", nil); err != nil {
+		if !errors.Is(err, registry.ErrVersionExists) {
+			return err
+		}
+		fmt.Println("    (version exists; adding variant)")
 	}
-	defer resp.Body.Close()
-	respBody, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusCreated {
-		return fmt.Errorf("package uploaded to GitHub but registry metadata update failed (%d: %s)\nRe-run 'fglpkg publish' to retry",
-			resp.StatusCode, string(respBody))
+
+	// 4. Upload zip.
+	fmt.Printf("  → PUT    /registry/packages/%s/versions/%s/artifacts/%s\n",
+		slug, m.Version, variant)
+	if err := registry.PublishUploadArtifact(slug, m.Version, variant, filename, bytes.NewReader(zipData)); err != nil {
+		return err
 	}
-	return nil
+
+	// 5. Submit for review.
+	fmt.Println("  → POST   /registry/packages/" + slug + "/versions/" + m.Version + "/submit")
+	return registry.PublishSubmit(slug, m.Version)
 }
 
 func buildPackageZip(m *manifest.Manifest) ([]byte, string, error) {
@@ -1125,10 +1100,10 @@ func cmdUnpublish(args []string) error {
 	if err != nil {
 		return err
 	}
-	registryURL := defaultPublishRegistry()
+	registryURL := registry.LegacyBase
 	token := credentials.ActivePublishBearer(home, registryURL)
 	if token == "" {
-		return fmt.Errorf("not logged in to publish registry %s\nSet FGLPKG_PUBLISH_TOKEN", registryURL)
+		return fmt.Errorf("not logged in to legacy publish registry %s\nSet FGLPKG_PUBLISH_TOKEN to use this command (legacy fly.dev only)", registryURL)
 	}
 
 	fmt.Printf("Unpublishing %s@%s...\n", name, version)
@@ -1378,7 +1353,7 @@ func cmdOwner(args []string) error {
 
 func cmdOwnerList(pkg string) error {
 	home, _ := fglpkgHome()
-	reg := defaultPublishRegistry()
+	reg := registry.LegacyBase
 	token := credentials.ActivePublishBearer(home, reg)
 	resp, err := authGet(reg+"/packages/"+pkg+"/owners", token)
 	if err != nil {
@@ -1401,7 +1376,7 @@ func cmdOwnerList(pkg string) error {
 
 func cmdOwnerAdd(pkg, username string) error {
 	home, _ := fglpkgHome()
-	reg := defaultPublishRegistry()
+	reg := registry.LegacyBase
 	token := credentials.ActivePublishBearer(home, reg)
 	if token == "" {
 		return fmt.Errorf("not logged in — run 'fglpkg login'")
@@ -1421,7 +1396,7 @@ func cmdOwnerAdd(pkg, username string) error {
 
 func cmdOwnerRemove(pkg, username string) error {
 	home, _ := fglpkgHome()
-	reg := defaultPublishRegistry()
+	reg := registry.LegacyBase
 	token := credentials.ActivePublishBearer(home, reg)
 	if token == "" {
 		return fmt.Errorf("not logged in — run 'fglpkg login'")
@@ -1449,7 +1424,7 @@ func cmdToken(args []string) error {
 	}
 	sub, rest := args[0], args[1:]
 	home, _ := fglpkgHome()
-	reg := defaultPublishRegistry()
+	reg := registry.LegacyBase
 	token := credentials.ActivePublishBearer(home, reg)
 	if token == "" {
 		return fmt.Errorf("not logged in — run 'fglpkg login'")
@@ -1579,7 +1554,7 @@ func cmdConfigGitHubReposAdd(ownerRepo string) error {
 		return err
 	}
 	home, _ := fglpkgHome()
-	reg := defaultPublishRegistry()
+	reg := registry.LegacyBase
 	token := credentials.ActivePublishBearer(home, reg)
 	if token == "" {
 		return fmt.Errorf("not logged in — run 'fglpkg login'")
@@ -1603,7 +1578,7 @@ func cmdConfigGitHubReposRemove(ownerRepo string) error {
 		return err
 	}
 	home, _ := fglpkgHome()
-	reg := defaultPublishRegistry()
+	reg := registry.LegacyBase
 	token := credentials.ActivePublishBearer(home, reg)
 	if token == "" {
 		return fmt.Errorf("not logged in — run 'fglpkg login'")
@@ -2170,17 +2145,17 @@ COMMANDS:
                     (-o file, --pretty, --production)
   completion <sh>   Print shell completion script (bash|zsh|fish|powershell)
   bdl <pkg> <mod>   Run a BDL program from an installed package
-  publish [--dry-run] Publish current package to registry
+  publish [--dry-run] Publish current package to the registry; submits for admin review
                     (--dry-run prints what would happen without calling out)
   pack [-o file]    Build the publishable zip locally without uploading
                     (--list prints contents without writing a file)
-  unpublish <p>@<v> Remove a published version from registry + GitHub
-  login             Save registry credentials
+  unpublish <p>@<v> Remove a published version (LEGACY fly.dev registry only)
+  login             Sign in to the registry (OAuth browser flow, or --token <PAT>)
   logout            Remove saved credentials
   whoami            Show current authenticated user
-  owner             Manage package ownership
-  token             Manage user tokens (admin)
-  config            Manage registry configuration (GitHub repos)
+  owner             Manage package ownership (LEGACY fly.dev registry only)
+  token             Manage user tokens (LEGACY fly.dev registry only)
+  config            Manage registry configuration (LEGACY fly.dev registry only)
   workspace         Manage monorepo workspaces
   run <command>     Run a script from an installed package
   docs <package>    List or view package documentation
@@ -2207,13 +2182,14 @@ FLAGS (for env only):
 
 ENVIRONMENT:
   FGLPKG_HOME              Override ~/.fglpkg
-  FGLPKG_REGISTRY          Consumer registry URL (install/search/audit/whoami)
-  FGLPKG_PUBLISH_REGISTRY  Publisher registry URL (publish/unpublish/owner/token/config)
-  FGLPKG_TOKEN             Bearer for consumer commands (canonical)
-  FGLPKG_PUBLISH_TOKEN     Bearer for publisher commands; also accepted by
-                           consumer commands as a back-compat fallback
-  FGLPKG_GITHUB_TOKEN      GitHub PAT for package uploads/downloads (private repo)
-  FGLPKG_GITHUB_REPO       GitHub owner/repo for package storage
+  FGLPKG_REGISTRY          Registry URL for install/search/audit/whoami/publish.
+                           Default: https://service.generointelligence.ai
+  FGLPKG_PUBLISH_REGISTRY  Overrides FGLPKG_REGISTRY for the publish command only
+  FGLPKG_TOKEN             Bearer token for the registry (overrides stored OAuth)
+  FGLPKG_PUBLISH_TOKEN     Bearer for the LEGACY fly.dev commands
+                           (unpublish/owner/token/config)
+  FGLPKG_GITHUB_TOKEN      GitHub PAT — only used by LEGACY downloads/unpublish
+  FGLPKG_GITHUB_REPO       GitHub owner/repo — only used by LEGACY commands
   FGLPKG_GENERO_VERSION    Override Genero version detection
   FGLPKG_INSTALL_CONCURRENCY  Cap parallel downloads during install (default 4)
 
@@ -2292,7 +2268,7 @@ func defaultRegistry() string {
 	if r := os.Getenv("FGLPKG_REGISTRY"); r != "" {
 		return strings.TrimRight(r, "/")
 	}
-	return "https://registry.generointelligence.ai"
+	return "https://service.generointelligence.ai"
 }
 
 // defaultPublishRegistry returns the publisher registry URL — publish,
