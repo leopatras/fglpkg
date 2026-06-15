@@ -20,14 +20,17 @@ type Manifest struct {
 	// (`"$schema": "https://.../fglpkg.schema.json"`). It is not validated
 	// or used by fglpkg itself; the field exists only so DisallowUnknownFields
 	// does not reject manifests that opt into editor tooling.
-	Schema           string            `json:"$schema,omitempty"`
-	Name             string            `json:"name"`
-	Version          string            `json:"version"`
-	Description      string            `json:"description,omitempty"`
-	Author           string            `json:"author,omitempty"`
-	License          string            `json:"license,omitempty"`
-	Repository       string            `json:"repository,omitempty"`
-	Main             string            `json:"main,omitempty"` // primary .42m entry point
+	Schema      string `json:"$schema,omitempty"`
+	Name        string `json:"name"`
+	Version     string `json:"version"`
+	Description string `json:"description,omitempty"`
+	Author      string `json:"author,omitempty"`
+	License     string `json:"license,omitempty"`
+	Repository  string `json:"repository,omitempty"`
+	// Keywords are free-form tags that aid registry search and discovery.
+	// They are advisory metadata only; fglpkg does not interpret them.
+	Keywords []string `json:"keywords,omitempty"`
+	Main     string   `json:"main,omitempty"` // primary .42m entry point
 	// Visibility controls who can read this package on the registry.
 	// "public" (default) — anyone can browse and install.
 	// "private" — only members of the owning partner can see it.
@@ -64,7 +67,7 @@ type Manifest struct {
 // run for that event. Events:
 //   - preinstall    runs before a package's files are extracted
 //   - postinstall   runs after a package's files are extracted and bin
-//                   scripts are made executable
+//     scripts are made executable
 //   - prepublish    runs before the publishable zip is built
 //   - postpublish   runs after the registry has accepted the upload
 //   - preuninstall  runs before a package's directory is removed
@@ -122,8 +125,8 @@ type HookOperation struct {
 
 // Dependencies holds both FGL and Java dependency declarations.
 type Dependencies struct {
-	FGL  map[string]string    `json:"fgl,omitempty"`  // name -> version constraint
-	Java []JavaDependency      `json:"java,omitempty"` // Maven coordinates
+	FGL  map[string]string `json:"fgl,omitempty"`  // name -> version constraint
+	Java []JavaDependency  `json:"java,omitempty"` // Maven coordinates
 }
 
 // UnmarshalJSON rejects unknown keys under `dependencies` with a hint,
@@ -214,11 +217,11 @@ type JavaDependency struct {
 	// Checksum is the expected SHA256 hex digest of the JAR file.
 	// If provided, the downloaded JAR is verified before use.
 	// If omitted, the integrity check is skipped (Maven Central is trusted).
-	Checksum   string `json:"checksum,omitempty"`
+	Checksum string `json:"checksum,omitempty"`
 	// Optional: if omitted, derived from groupId/artifactId/version automatically.
-	JarFile    string `json:"jar,omitempty"`
+	JarFile string `json:"jar,omitempty"`
 	// Optional: override the download URL entirely.
-	URL        string `json:"url,omitempty"`
+	URL string `json:"url,omitempty"`
 }
 
 // MavenURL returns the Maven Central download URL for this JAR.

@@ -196,6 +196,7 @@ eval "$(fglpkg env --global)"
 | `author` | No | Author name |
 | `license` | No | License identifier (e.g., `MIT`, `Apache-2.0`) |
 | `repository` | No | Source repository URL |
+| `keywords` | No | Free-form tags that aid registry search/discovery (e.g. `["database", "utilities"]`) |
 | `main` | No | Primary `.42m` entry point |
 | `genero` | No | Genero BDL version constraint (e.g., `^4.0.0`) |
 | `root` | No | Base directory for package files when publishing (default `.`) |
@@ -242,6 +243,8 @@ The `publish` command uses the same OAuth/PAT credentials as the other consumer 
 ```bash
 # Package management
 fglpkg init                              # Initialise fglpkg.json interactively
+fglpkg init --template library           # Scaffold a publishable package
+fglpkg init --template app               # Scaffold a consuming application
 fglpkg install                           # Install deps (auto-detects local vs global)
 fglpkg install myutils                   # Add + install latest version
 fglpkg install myutils@1.2.0             # Add + install specific version
@@ -263,6 +266,8 @@ fglpkg bdl --list                        # List available BDL programs
 
 # Publishing
 fglpkg publish                           # Publish current package to registry
+fglpkg publish --dry-run                 # Preview the publish calls, no network
+fglpkg publish --ci                      # Non-interactive publish (CI): needs FGLPKG_TOKEN
 fglpkg unpublish pkg@1.0.0               # Remove a published version
 
 # Authentication

@@ -136,7 +136,18 @@ func Execute() error {
 
 // ─── init ─────────────────────────────────────────────────────────────────────
 
-func cmdInit(_ []string) error {
+func cmdInit(args []string) error {
+	tmplName, err := parseInitFlags(args)
+	if err != nil {
+		return err
+	}
+	var tmpl *projectTemplate
+	if tmplName != "" {
+		if tmpl = findTemplate(tmplName); tmpl == nil {
+			return fmt.Errorf("unknown template %q\nAvailable templates:\n%s", tmplName, templateList())
+		}
+	}
+
 	if _, err := os.Stat(manifest.Filename); err == nil {
 		return fmt.Errorf("%s already exists in the current directory", manifest.Filename)
 	}
@@ -145,11 +156,41 @@ func cmdInit(_ []string) error {
 	description := promptWithDefault("Description", "")
 	author := promptWithDefault("Author", "")
 	m := manifest.New(name, version, description, author)
+	if tmpl != nil {
+		tmpl.apply(m)
+	}
 	if err := m.Save("."); err != nil {
 		return fmt.Errorf("failed to write %s: %w", manifest.Filename, err)
 	}
 	fmt.Printf("✓ Created %s\n", manifest.Filename)
+	if tmpl != nil {
+		if err := tmpl.writeFiles(".", name); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+// parseInitFlags extracts the optional --template/-t value from `init` args.
+// Returns "" when no template was requested.
+func parseInitFlags(args []string) (string, error) {
+	tmpl := ""
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "--template" || a == "-t":
+			if i+1 >= len(args) {
+				return "", fmt.Errorf("%s requires a template name\nAvailable templates:\n%s", a, templateList())
+			}
+			i++
+			tmpl = args[i]
+		case strings.HasPrefix(a, "--template="):
+			tmpl = strings.TrimPrefix(a, "--template=")
+		default:
+			return "", fmt.Errorf("unexpected argument %q\nUsage: fglpkg init [--template <name>]", a)
+		}
+	}
+	return tmpl, nil
 }
 
 // ─── install ──────────────────────────────────────────────────────────────────
@@ -598,15 +639,26 @@ func parseSearchArgs(args []string) (term string, all bool, err error) {
 
 // ─── publish ──────────────────────────────────────────────────────────────────
 
-func cmdPublish(args []string) error {
-	var dryRun bool
+// parsePublishFlags reads the publish flags: --dry-run/-n (preview, no
+// network) and --ci (non-interactive pipeline mode).
+func parsePublishFlags(args []string) (dryRun, ci bool, err error) {
 	for _, a := range args {
 		switch a {
 		case "--dry-run", "-n":
 			dryRun = true
+		case "--ci":
+			ci = true
 		default:
-			return fmt.Errorf("unexpected argument %q", a)
+			return false, false, fmt.Errorf("unexpected argument %q", a)
 		}
+	}
+	return dryRun, ci, nil
+}
+
+func cmdPublish(args []string) error {
+	dryRun, ci, err := parsePublishFlags(args)
+	if err != nil {
+		return err
 	}
 
 	home, err := fglpkgHome()
@@ -633,12 +685,25 @@ func cmdPublish(args []string) error {
 		return err
 	}
 	registryURL := defaultPublishRegistry()
-	token, err := credentials.ActiveBearer(context.Background(), home, registryURL, oauth.Refresh)
-	if err != nil {
-		return err
-	}
-	if token == "" {
-		return fmt.Errorf("not logged in to %s\nRun 'fglpkg login' (or set FGLPKG_TOKEN) first", registryURL)
+
+	// Resolve the bearer. In --ci mode the token must come from the
+	// environment (FGLPKG_TOKEN / FGLPKG_PUBLISH_TOKEN) — CI runners should
+	// not depend on cached interactive credentials, and the error must not
+	// suggest the interactive `fglpkg login`.
+	var token string
+	if ci {
+		token = credentials.ConsumerEnvBearer()
+		if token == "" {
+			return fmt.Errorf("--ci: no registry token in the environment; set FGLPKG_TOKEN")
+		}
+	} else {
+		token, err = credentials.ActiveBearer(context.Background(), home, registryURL, oauth.Refresh)
+		if err != nil {
+			return err
+		}
+		if token == "" {
+			return fmt.Errorf("not logged in to %s\nRun 'fglpkg login' (or set FGLPKG_TOKEN) first", registryURL)
+		}
 	}
 
 	if dryRun {
@@ -656,6 +721,11 @@ func cmdPublish(args []string) error {
 		fmt.Printf("✓ Dry run complete for %s@%s — no changes made\n", m.Name, m.Version)
 	} else {
 		fmt.Printf("✓ Published %s@%s — pending admin review\n", m.Name, m.Version)
+		if ci {
+			// Stable, greppable line for pipeline consumption.
+			fmt.Printf("fglpkg-published name=%s version=%s variant=genero%s status=pending\n",
+				m.Name, m.Version, generoMajor)
+		}
 	}
 	return runHook(m, manifest.HookPostPublish, projectDir)
 }
@@ -2194,7 +2264,7 @@ USAGE:
   fglpkg <command> [arguments]
 
 COMMANDS:
-  init              Create a new fglpkg.json
+  init              Create a new fglpkg.json (--template <library|app> to scaffold)
   install [pkg...]  Install all dependencies (or add specific packages)
   remove <pkg>      Remove a package
   update            Re-resolve and update all dependencies
@@ -2209,8 +2279,10 @@ COMMANDS:
                     (-o file, --pretty, --production)
   completion <sh>   Print shell completion script (bash|zsh|fish|powershell)
   bdl <pkg> <mod>   Run a BDL program from an installed package
-  publish [--dry-run] Publish current package to the registry; submits for admin review
-                    (--dry-run prints what would happen without calling out)
+  publish           Publish current package to the registry; submits for admin review
+                    (--dry-run prints what would happen without calling out;
+                     --ci for non-interactive pipelines: requires FGLPKG_TOKEN,
+                     prints a machine-readable status line)
   pack [-o file]    Build the publishable zip locally without uploading
                     (--list prints contents without writing a file)
   unpublish <p>@<v> Remove a published version (LEGACY fly.dev registry only)

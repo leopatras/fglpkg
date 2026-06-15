@@ -270,6 +270,37 @@ func TestLoadAcceptsSchemaField(t *testing.T) {
 	}
 }
 
+func TestLoadAcceptsKeywords(t *testing.T) {
+	dir := t.TempDir()
+	raw := `{
+		"name": "x",
+		"version": "1.0.0",
+		"keywords": ["database", "utilities"]
+	}`
+	if err := os.WriteFile(filepath.Join(dir, "fglpkg.json"), []byte(raw), 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	m, err := manifest.Load(dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(m.Keywords) != 2 || m.Keywords[0] != "database" || m.Keywords[1] != "utilities" {
+		t.Errorf("Keywords = %v, want [database utilities]", m.Keywords)
+	}
+
+	// Round-trip preserves keywords.
+	if err := m.Save(dir); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	m2, err := manifest.Load(dir)
+	if err != nil {
+		t.Fatalf("Load after Save: %v", err)
+	}
+	if len(m2.Keywords) != 2 {
+		t.Errorf("after round-trip Keywords = %v, want 2 entries", m2.Keywords)
+	}
+}
+
 // ─── Strict parsing ──────────────────────────────────────────────────────────
 
 func TestLoadRejectsUnknownTopLevelField(t *testing.T) {
