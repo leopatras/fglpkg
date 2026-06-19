@@ -330,7 +330,6 @@ not require bumping the version. When a consumer runs `fglpkg install`, the
 resolver automatically selects the variant matching their local Genero major
 version.
 
-### Registry Storage
 ## Releases
 
 Releases are automated via GitHub Actions. Push a tag to create a release with binaries for all platforms:
