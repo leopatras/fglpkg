@@ -11,6 +11,12 @@
       "type": "string",
       "description": "Optional schema reference so editors can provide autocomplete and validation."
     },
+    "type": {
+      "type": "string",
+      "enum": ["bdl", "webcomponent"],
+      "default": "bdl",
+      "description": "Package kind. \"bdl\" (default) ships compiled Genero modules and optional Java JARs. \"webcomponent\" ships Genero webcomponent bundles (html/css/js) under variant 'webcomponent'."
+    },
     "name": {
       "type": "string",
       "description": "Package name. Must be unique within a registry; conventionally lowercase with no spaces.",
@@ -85,6 +91,16 @@
       "items": { "type": "string" },
       "uniqueItems": true
     },
+    "webcomponents": {
+      "type": "array",
+      "description": "COMPONENTTYPE names this package provides. Required (non-empty) when \"type\" is \"webcomponent\"; forbidden otherwise. Each name must match the Genero COMPONENTTYPE lexical rule and correspond to a webcomponents/<NAME>/ source directory.",
+      "items": {
+        "type": "string",
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]*$"
+      },
+      "minItems": 1,
+      "uniqueItems": true
+    },
     "hooks": {
       "type": "object",
       "description": "Declarative lifecycle steps. Each event (preinstall/postinstall/prepublish/postpublish/preuninstall) maps to an ordered list of operations from a fixed vocabulary; arbitrary shell commands are not supported.",
@@ -110,6 +126,34 @@
       "description": "Dependencies that are attempted like production deps but whose failure to resolve or download only emits a warning."
     }
   },
+  "allOf": [
+    {
+      "if":   { "properties": { "type": { "const": "webcomponent" } }, "required": ["type"] },
+      "then": {
+        "required": ["webcomponents"],
+        "not": {
+          "anyOf": [
+            { "required": ["main"] },
+            { "required": ["programs"] },
+            { "required": ["bin"] },
+            { "required": ["root"] },
+            { "properties": { "dependencies": { "required": ["java"] } }, "required": ["dependencies"] },
+            { "properties": { "devDependencies": { "required": ["java"] } }, "required": ["devDependencies"] },
+            { "properties": { "optionalDependencies": { "required": ["java"] } }, "required": ["optionalDependencies"] }
+          ]
+        }
+      }
+    },
+    {
+      "if":   {
+        "anyOf": [
+          { "properties": { "type": { "const": "bdl" } }, "required": ["type"] },
+          { "not": { "required": ["type"] } }
+        ]
+      },
+      "then": { "not": { "required": ["webcomponents"] } }
+    }
+  ],
   "definitions": {
     "dependencyBucket": {
       "type": "object",

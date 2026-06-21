@@ -58,6 +58,13 @@ type LockFile struct {
 
 	// JARs lists every resolved Java JAR, sorted by key for stable diffs.
 	JARs []LockedJAR `json:"jars"`
+
+	// Webcomponents lists every resolved webcomponent package (variant
+	// "webcomponent"), sorted by name for stable diffs. Separate from
+	// Packages because webcomponent packages have different install
+	// semantics (extracted to .fglpkg/webcomponents/, no genero variant,
+	// no bin scripts).
+	Webcomponents []LockedWebcomponent `json:"webcomponents,omitempty"`
 }
 
 // RootEntry records the identity of the root project.
@@ -99,6 +106,34 @@ type LockedPackage struct {
 	Scope string `json:"scope,omitempty"`
 }
 
+// LockedWebcomponent is the fully-pinned record of one webcomponent package.
+// COMPONENTTYPE names are not persisted here in v1 — they are inferred at
+// runtime by listing subdirectories of the install location. Future versions
+// may persist them once the registry exposes the manifest's webcomponents
+// field server-side.
+type LockedWebcomponent struct {
+	// Name is the package name, e.g. "chart-3d".
+	Name string `json:"name"`
+
+	// Version is the exact resolved semver string.
+	Version string `json:"version"`
+
+	// DownloadURL is the exact URL used to download this version (variant
+	// "webcomponent").
+	DownloadURL string `json:"downloadUrl"`
+
+	// Checksum is the SHA256 hex digest of the downloaded zip file.
+	Checksum string `json:"checksum,omitempty"`
+
+	// RequiredBy lists every package (or "<root>") that declared a dependency
+	// on this webcomponent package.
+	RequiredBy []string `json:"requiredBy"`
+
+	// Scope is the dependency scope: "dev" or "optional". Empty means
+	// production.
+	Scope string `json:"scope,omitempty"`
+}
+
 // LockedJAR is the fully-pinned record of one Java JAR.
 type LockedJAR struct {
 	// Key is "groupId:artifactId", the deduplication key.
@@ -122,12 +157,27 @@ type LockedJAR struct {
 // ─── Construction ─────────────────────────────────────────────────────────────
 
 // FromPlan builds a LockFile from a resolved Plan and the root manifest.
+// Packages with variant "webcomponent" land in the Webcomponents array;
+// everything else lands in Packages.
 func FromPlan(plan *resolver.Plan, root *manifest.Manifest) *LockFile {
 	pkgs := make([]LockedPackage, 0, len(plan.Packages))
+	wcs := make([]LockedWebcomponent, 0)
 	for _, p := range plan.Packages {
 		requiredBy := make([]string, len(p.RequiredBy))
 		copy(requiredBy, p.RequiredBy)
 		sort.Strings(requiredBy)
+
+		if p.IsWebcomponent() {
+			wcs = append(wcs, LockedWebcomponent{
+				Name:        p.Name,
+				Version:     p.Version.String(),
+				DownloadURL: p.DownloadURL,
+				Checksum:    p.Checksum,
+				RequiredBy:  requiredBy,
+				Scope:       scopeLockString(p.Scope),
+			})
+			continue
+		}
 
 		pkgs = append(pkgs, LockedPackage{
 			Name:        p.Name,
@@ -139,8 +189,8 @@ func FromPlan(plan *resolver.Plan, root *manifest.Manifest) *LockFile {
 			Scope:       scopeLockString(p.Scope),
 		})
 	}
-	// Sort by name for stable, reviewable diffs.
 	sort.Slice(pkgs, func(i, j int) bool { return pkgs[i].Name < pkgs[j].Name })
+	sort.Slice(wcs, func(i, j int) bool { return wcs[i].Name < wcs[j].Name })
 
 	jars := make([]LockedJAR, 0, len(plan.JARs))
 	for _, dep := range plan.JARs {
@@ -163,6 +213,7 @@ func FromPlan(plan *resolver.Plan, root *manifest.Manifest) *LockFile {
 		RootManifest:  RootEntry{Name: root.Name, Version: root.Version},
 		Packages:      pkgs,
 		JARs:          jars,
+		Webcomponents: wcs,
 	}
 }
 
@@ -219,6 +270,10 @@ type ValidationResult struct {
 	// MissingPackages lists packages in the lock that are not yet installed
 	// (install directory absent).
 	MissingPackages []string
+
+	// MissingWebcomponents lists webcomponent packages in the lock whose
+	// install does not appear under the webcomponents directory.
+	MissingWebcomponents []string
 }
 
 // IsClean returns true when there are no errors or mismatches at all.
@@ -226,7 +281,8 @@ func (vr *ValidationResult) IsClean() bool {
 	return vr.SchemaError == nil &&
 		vr.GeneroMismatch == nil &&
 		vr.ManifestMismatch == nil &&
-		len(vr.MissingPackages) == 0
+		len(vr.MissingPackages) == 0 &&
+		len(vr.MissingWebcomponents) == 0
 }
 
 // NeedsResolve returns true when a full re-resolution is required before
@@ -266,8 +322,9 @@ func (e *ManifestMismatchError) Error() string {
 
 // Validate checks whether the lock file is consistent with the current
 // environment and manifest. currentGenero may be "" to skip that check.
-// packagesDir is used to check which packages are actually installed on disk.
-func (lf *LockFile) Validate(root *manifest.Manifest, currentGenero, packagesDir string) *ValidationResult {
+// packagesDir / webcomponentsDir are used to check which BDL and webcomponent
+// installs are actually present on disk; pass "" to skip either check.
+func (lf *LockFile) Validate(root *manifest.Manifest, currentGenero, packagesDir, webcomponentsDir string) *ValidationResult {
 	result := &ValidationResult{}
 
 	// Schema version check.
@@ -309,6 +366,22 @@ func (lf *LockFile) Validate(root *manifest.Manifest, currentGenero, packagesDir
 		}
 	}
 
+	// Webcomponent presence check — a locked webcomponent package is
+	// considered installed if the webcomponents directory exists and is
+	// non-empty (the publisher controls the COMPONENTTYPE subdir names,
+	// not the package name, so we can only verify that *some* extraction
+	// happened — Phase 5 may persist the per-package component list).
+	if webcomponentsDir != "" {
+		for _, wc := range lf.Webcomponents {
+			// Treat a totally empty webcomponents directory as "all WC
+			// packages missing" so a fresh checkout triggers re-install.
+			entries, err := os.ReadDir(webcomponentsDir)
+			if err != nil || len(entries) == 0 {
+				result.MissingWebcomponents = append(result.MissingWebcomponents, wc.Name)
+			}
+		}
+	}
+
 	return result
 }
 
@@ -340,15 +413,16 @@ func scopeLockString(s manifest.Scope) string {
 // ToInstallList converts the lock file back into the flat lists needed by
 // the installer, so a locked install never touches the resolver or registry
 // for version negotiation — it uses exact URLs and checksums directly.
-func (lf *LockFile) ToInstallList() ([]LockedPackage, []LockedJAR) {
-	return lf.Packages, lf.JARs
+func (lf *LockFile) ToInstallList() ([]LockedPackage, []LockedJAR, []LockedWebcomponent) {
+	return lf.Packages, lf.JARs, lf.Webcomponents
 }
 
-// FilterForProduction returns the subset of packages and JARs that should be
-// installed when `fglpkg install --production` is used: everything except
-// dev-scoped entries. Optional entries are retained — they are still
-// attempted (a bad optional dep was already dropped at resolve time).
-func (lf *LockFile) FilterForProduction() ([]LockedPackage, []LockedJAR) {
+// FilterForProduction returns the subset of packages, JARs, and webcomponent
+// packages that should be installed when `fglpkg install --production` is
+// used: everything except dev-scoped entries. Optional entries are retained
+// — they are still attempted (a bad optional dep was already dropped at
+// resolve time).
+func (lf *LockFile) FilterForProduction() ([]LockedPackage, []LockedJAR, []LockedWebcomponent) {
 	pkgs := make([]LockedPackage, 0, len(lf.Packages))
 	for _, p := range lf.Packages {
 		if p.Scope == "dev" {
@@ -363,5 +437,12 @@ func (lf *LockFile) FilterForProduction() ([]LockedPackage, []LockedJAR) {
 		}
 		jars = append(jars, j)
 	}
-	return pkgs, jars
+	wcs := make([]LockedWebcomponent, 0, len(lf.Webcomponents))
+	for _, w := range lf.Webcomponents {
+		if w.Scope == "dev" {
+			continue
+		}
+		wcs = append(wcs, w)
+	}
+	return pkgs, jars, wcs
 }

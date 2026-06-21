@@ -11,6 +11,7 @@ This guide covers the day-to-day usage of fglpkg, the package manager for Genero
 - [Managing Dependencies](#managing-dependencies)
 - [Publishing a Package](#publishing-a-package)
 - [Working with Java JARs](#working-with-java-jars)
+- [Webcomponent Packages](#webcomponent-packages)
 - [Distributable Scripts](#distributable-scripts)
 - [Lifecycle Hooks](#lifecycle-hooks)
 - [Package Documentation](#package-documentation)
@@ -24,10 +25,11 @@ This guide covers the day-to-day usage of fglpkg, the package manager for Genero
 
 ## Getting Started
 
-fglpkg manages two types of dependencies for your Genero BDL projects:
+fglpkg manages three kinds of assets for your Genero BDL projects:
 
 - **BDL packages** — compiled Genero modules (`.42m`, `.42f`, `.sch` files) published to a registry
 - **Java JARs** — Java libraries downloaded from Maven Central (or custom URLs), needed when your BDL code calls into Java
+- **Webcomponent packages** — html/css/js bundles published under a `COMPONENTTYPE` name and consumed by `WEBCOMPONENT` form fields. See [Webcomponent Packages](#webcomponent-packages).
 
 ## Installing fglpkg
 
@@ -564,6 +566,139 @@ Genero BDL can call Java code, so fglpkg also manages JAR dependencies. Declare 
 | `url` | Override the download URL entirely (default: Maven Central) |
 
 JARs are downloaded to `~/.fglpkg/jars/` and added to `CLASSPATH` by `fglpkg env`.
+
+## Webcomponent Packages
+
+A webcomponent package ships a Genero `COMPONENTTYPE` — an html/css/js bundle that a form references with `WEBCOMPONENT … COMPONENTTYPE = "<name>"`. Webcomponent packages publish under their own variant (`webcomponent`), are not Genero-version-specific, and install to a parallel directory (`.fglpkg/webcomponents/`) so they coexist with BDL packages and Java JARs without colliding.
+
+A package is either BDL **or** webcomponent — never both. A BDL library that needs a webcomponent declares it as a regular dependency under `dependencies.fgl`, and fglpkg pulls in both.
+
+### Creating a webcomponent package
+
+```bash
+mkdir mywidget
+cd mywidget
+fglpkg init --template webcomponent
+```
+
+The template scaffolds:
+
+```
+mywidget/
+├── fglpkg.json                 # type: "webcomponent", webcomponents: ["MyWidget"]
+├── README.md
+├── .gitignore
+└── webcomponents/
+    └── MyWidget/
+        ├── MyWidget.html       # required entry point
+        ├── MyWidget.css
+        └── MyWidget.js         # demo gICAPI handshake
+```
+
+Rename `MyWidget` to your `COMPONENTTYPE`, update the `webcomponents` array in `fglpkg.json` to match, and fill in the HTML/CSS/JS. One package can ship multiple components — add more `webcomponents/<NAME>/` directories and list each name.
+
+### Manifest shape
+
+```json
+{
+  "name": "chart-3d",
+  "version": "1.0.0",
+  "type": "webcomponent",
+  "description": "3D chart widget for Genero forms",
+  "license": "MIT",
+  "repository": "https://github.com/4js-mikefolcher/chart-3d",
+  "webcomponents": ["3DChart"],
+  "dependencies": {
+    "fgl": {
+      "wc-theme-base": "^1.0.0"
+    }
+  }
+}
+```
+
+Notes:
+- `type: "webcomponent"` is the discriminator. Omit it (or use `"bdl"`) for a classic BDL package.
+- `webcomponents` is required and must list at least one `COMPONENTTYPE` name. Each name must match `^[A-Za-z0-9][A-Za-z0-9_-]*$` (digit-leading names like `3DChart` are valid).
+- `main`, `programs`, `bin`, `root`, and any `dependencies.java` / `devDependencies.java` / `optionalDependencies.java` are **forbidden** — they are BDL-only concepts. `dependencies.fgl` is allowed (depend on other packages, BDL or webcomponent).
+
+### Publishing
+
+```bash
+fglpkg login           # once, OAuth in the browser (or use FGLPKG_TOKEN)
+fglpkg pack --list     # preview the zip contents before pushing
+fglpkg publish --dry-run
+fglpkg publish
+```
+
+The publish flow uploads a single artifact per version under the `webcomponent` variant (no Genero-major fan-out). The in-zip layout has the `webcomponents/` prefix stripped — so a source file at `webcomponents/3DChart/3DChart.html` is stored as `3DChart/3DChart.html` in the artifact, ready to drop into the consumer's install directory.
+
+### Consuming a webcomponent package
+
+```bash
+# In the consuming project
+fglpkg install chart-3d
+eval "$(fglpkg env)"
+```
+
+`fglpkg install` extracts each `<COMPONENTTYPE>/` directory directly into `.fglpkg/webcomponents/`, so:
+
+```
+yourproject/
+└── .fglpkg/
+    └── webcomponents/
+        └── 3DChart/
+            ├── 3DChart.html
+            ├── 3DChart.css
+            └── 3DChart.js
+```
+
+Then reference the component from a form just like a built-in one:
+
+```
+WEBCOMPONENT wc = FORMONLY.mychart,
+    COMPONENTTYPE = "3DChart";
+```
+
+### Environment wiring
+
+`fglpkg env` adds `.fglpkg/` to `FGLIMAGEPATH` when webcomponents are installed, so Genero's direct-mode loader resolves `<COMPONENTTYPE>` against `.fglpkg/webcomponents/<COMPONENTTYPE>/<COMPONENTTYPE>.html` automatically:
+
+```bash
+$ eval "$(fglpkg env)"
+$ env | grep FGLIMAGEPATH
+FGLIMAGEPATH=/path/to/project/.fglpkg:...
+```
+
+Alongside the export, `fglpkg env` prints a hint comment showing the value to add to your GAS application's `.xcf` (fglpkg cannot edit your `.xcf` for you — that's a deployment concern):
+
+```bash
+$ fglpkg env --local
+export FGLLDPATH=...
+export FGLIMAGEPATH=/path/to/project/.fglpkg"${FGLIMAGEPATH:+:$FGLIMAGEPATH}"
+# For GAS: add to your .xcf's <WEB_COMPONENT_DIRECTORY>: /path/to/project/.fglpkg/webcomponents
+```
+
+### Packaging for GWA with `gwabuildtool`
+
+For Genero Web Applications, webcomponents must be bundled into the GWA artifact at build time. `fglpkg env --gwa` emits one `--webcomponent` flag per installed `COMPONENTTYPE`, suitable for splicing into a `gwabuildtool` invocation:
+
+```bash
+$ fglpkg env --gwa
+--webcomponent /path/to/project/.fglpkg/webcomponents/3DChart
+--webcomponent /path/to/project/.fglpkg/webcomponents/Heatmap
+
+$ gwabuildtool -p . -o build/ $(fglpkg env --gwa)
+```
+
+### Install layout summary
+
+| Asset | Install path | Discovered via |
+|---|---|---|
+| BDL package | `.fglpkg/packages/<name>/` | `FGLLDPATH` |
+| Java JAR | `.fglpkg/jars/<artifact>-<version>.jar` | `CLASSPATH` |
+| Webcomponent | `.fglpkg/webcomponents/<COMPONENTTYPE>/` | `FGLIMAGEPATH` (direct mode), `WEB_COMPONENT_DIRECTORY` (GAS), `--webcomponent` flag (GWA) |
+
+The lockfile records webcomponent packages under a separate `webcomponents` array, so a fresh `fglpkg install --frozen` from a committed `fglpkg.lock` reproduces the install byte-for-byte.
 
 ## Distributable Scripts
 

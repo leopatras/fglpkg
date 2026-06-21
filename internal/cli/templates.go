@@ -63,6 +63,22 @@ var templates = []projectTemplate{
 			{path: "Main.4gl", content: appSource},
 		},
 	},
+	{
+		name:    "webcomponent",
+		summary: "Genero webcomponent package (html/css/js bundle published as a COMPONENTTYPE)",
+		apply: func(m *manifest.Manifest) {
+			m.Type = manifest.KindWebcomponent
+			m.Webcomponents = []string{"MyWidget"}
+			m.Docs = []string{"README.md"}
+		},
+		files: []templateFile{
+			{path: "README.md", content: webcomponentReadme},
+			{path: ".gitignore", content: gitignoreContent},
+			{path: "webcomponents/MyWidget/MyWidget.html", content: webcomponentHTML},
+			{path: "webcomponents/MyWidget/MyWidget.css", content: webcomponentCSS},
+			{path: "webcomponents/MyWidget/MyWidget.js", content: webcomponentJS},
+		},
+	},
 }
 
 // findTemplate returns the template with the given name, or nil.
@@ -170,4 +186,73 @@ const appSource = `# {{NAME}} — application entry point
 MAIN
     DISPLAY "Hello from {{NAME}}"
 END MAIN
+`
+
+const webcomponentReadme = "# {{NAME}}\n\n" +
+	"A Genero webcomponent package — html/css/js bundles published as `COMPONENTTYPE` names\n" +
+	"and consumed by `WEBCOMPONENT` form fields.\n\n" +
+	"## Layout\n\n" +
+	"```\n" +
+	"webcomponents/\n" +
+	"  MyWidget/            # one directory per COMPONENTTYPE\n" +
+	"    MyWidget.html      # required entry point\n" +
+	"    MyWidget.css\n" +
+	"    MyWidget.js\n" +
+	"```\n\n" +
+	"Rename `MyWidget` to your COMPONENTTYPE and update the `webcomponents` array\n" +
+	"in `fglpkg.json` to match. You may ship multiple components in one package by\n" +
+	"adding more directories and listing each name in `webcomponents`.\n\n" +
+	"## Use it in a form\n\n" +
+	"```\n" +
+	"WEBCOMPONENT wc = FORMONLY.mywidget,\n" +
+	"   COMPONENTTYPE = \"MyWidget\";\n" +
+	"```\n\n" +
+	"## Install + publish\n\n" +
+	"```bash\n" +
+	"fglpkg install {{NAME}}     # consumer side\n" +
+	"fglpkg publish              # publisher side\n" +
+	"```\n"
+
+const webcomponentHTML = `<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>{{NAME}}</title>
+    <link rel="stylesheet" href="MyWidget.css">
+    <script src="MyWidget.js"></script>
+</head>
+<body>
+    <div id="root">Hello from {{NAME}}</div>
+</body>
+</html>
+`
+
+const webcomponentCSS = `#root {
+    font-family: system-ui, sans-serif;
+    padding: 1rem;
+}
+`
+
+const webcomponentJS = `// {{NAME}} — Genero webcomponent
+//
+// Uses the gICAPI protocol (window.parent.postMessage) to interact with the
+// Genero front-end. The two messages every component should know about:
+//   - "init"    sent by the front-end once on load
+//   - "setData" sent whenever the bound field's value changes
+//
+// Replace the stub below with your component's behavior.
+
+(function () {
+    function onMessage(event) {
+        var msg = event.data;
+        if (!msg || typeof msg !== "object") return;
+        // Handle inbound messages from the Genero front-end here.
+        // Example: if (msg.name === "setData") { ... }
+    }
+    window.addEventListener("message", onMessage);
+    // Signal readiness to the front-end.
+    if (window.parent && window.parent !== window) {
+        window.parent.postMessage({ name: "ready" }, "*");
+    }
+})();
 `

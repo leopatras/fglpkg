@@ -6,11 +6,31 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 
 	"github.com/4js-mikefolcher/fglpkg/internal/semver"
 )
+
+// PackageKind discriminates the asset type a package ships. New kinds may
+// be added without breaking older manifests (which default to KindBDL).
+type PackageKind string
+
+const (
+	// KindBDL packages ship compiled Genero modules (.42m/.42f/.sch) and
+	// optional Java JAR dependencies. This is the default when `type` is
+	// omitted in fglpkg.json.
+	KindBDL PackageKind = "bdl"
+	// KindWebcomponent packages ship Genero webcomponents — html/css/js
+	// bundles keyed by COMPONENTTYPE. See specs/webcomponent-packages.md.
+	KindWebcomponent PackageKind = "webcomponent"
+)
+
+// componentTypeName matches the Genero COMPONENTTYPE lexical rule:
+// alphanumeric leading character (digit-leading names like "3DChart" are
+// valid) followed by letters, digits, underscore, or hyphen.
+var componentTypeName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]*$`)
 
 const Filename = "fglpkg.json"
 
@@ -20,10 +40,15 @@ type Manifest struct {
 	// (`"$schema": "https://.../fglpkg.schema.json"`). It is not validated
 	// or used by fglpkg itself; the field exists only so DisallowUnknownFields
 	// does not reject manifests that opt into editor tooling.
-	Schema      string `json:"$schema,omitempty"`
-	Name        string `json:"name"`
-	Version     string `json:"version"`
-	Description string `json:"description,omitempty"`
+	Schema string `json:"$schema,omitempty"`
+	// Type identifies the package kind. Omit (or set to "bdl") for a
+	// classic BDL package; set to "webcomponent" for a Genero webcomponent
+	// bundle. The set of allowed manifest fields varies by kind — see
+	// Validate() and specs/webcomponent-packages.md.
+	Type        PackageKind `json:"type,omitempty"`
+	Name        string      `json:"name"`
+	Version     string      `json:"version"`
+	Description string      `json:"description,omitempty"`
 	Author      string `json:"author,omitempty"`
 	License     string `json:"license,omitempty"`
 	Repository  string `json:"repository,omitempty"`
@@ -57,10 +82,24 @@ type Manifest struct {
 	Bin                  map[string]string `json:"bin,omitempty"`      // command name -> script path
 	Docs                 []string          `json:"docs,omitempty"`     // glob patterns for doc files
 	Programs             []string          `json:"programs,omitempty"` // modules with MAIN blocks (e.g. "PoiConvert")
+	// Webcomponents lists the COMPONENTTYPE names this package provides.
+	// Required (and non-empty) when Type is KindWebcomponent; forbidden
+	// otherwise. Each name matches Genero's COMPONENTTYPE lexical rule and
+	// corresponds to a directory webcomponents/<NAME>/ in the source tree.
+	Webcomponents []string `json:"webcomponents,omitempty"`
 	// Hooks declare lifecycle steps to run on well-known events. Each value
 	// is an ordered list of declarative operations from a fixed vocabulary
 	// (see HookOp). Arbitrary shell commands are intentionally not supported.
 	Hooks Hooks `json:"hooks,omitempty"`
+}
+
+// EffectiveKind returns Type with the implicit default applied: a manifest
+// that omits `type` is a BDL package.
+func (m *Manifest) EffectiveKind() PackageKind {
+	if m.Type == "" {
+		return KindBDL
+	}
+	return m.Type
 }
 
 // Hooks maps a lifecycle event name to the ordered list of operations to
@@ -548,6 +587,9 @@ func (m *Manifest) Validate() error {
 	if m.Version == "" {
 		return fmt.Errorf("manifest missing required field: version")
 	}
+	if err := m.validateKind(); err != nil {
+		return err
+	}
 	if m.GeneroConstraint != "" && m.GeneroConstraint != "*" {
 		if _, err := semver.ParseConstraint(m.GeneroConstraint); err != nil {
 			return fmt.Errorf("invalid genero constraint %q: %w", m.GeneroConstraint, err)
@@ -634,6 +676,79 @@ func (m *Manifest) ValidateForPublish() error {
 	}
 	return fmt.Errorf("manifest is not ready to publish:\n%s",
 		strings.Join(missing, "\n"))
+}
+
+// validateKind enforces the type/field consistency rules. BDL is the
+// default when Type is omitted; webcomponent packages have a tighter
+// allowed-fields set documented in specs/webcomponent-packages.md.
+func (m *Manifest) validateKind() error {
+	switch m.EffectiveKind() {
+	case KindBDL:
+		if len(m.Webcomponents) > 0 {
+			return fmt.Errorf(
+				`"webcomponents" is only valid when "type" is "webcomponent" (current type: %q)`,
+				m.EffectiveKind(),
+			)
+		}
+	case KindWebcomponent:
+		if len(m.Webcomponents) == 0 {
+			return fmt.Errorf(
+				`"webcomponents" must list at least one COMPONENTTYPE when "type" is "webcomponent"`,
+			)
+		}
+		seen := make(map[string]bool, len(m.Webcomponents))
+		for _, name := range m.Webcomponents {
+			if !componentTypeName.MatchString(name) {
+				return fmt.Errorf(
+					`invalid COMPONENTTYPE %q in "webcomponents": must match %s`,
+					name, componentTypeName,
+				)
+			}
+			if seen[name] {
+				return fmt.Errorf(`duplicate COMPONENTTYPE %q in "webcomponents"`, name)
+			}
+			seen[name] = true
+		}
+		// BDL-only fields are forbidden — they have no meaning for a
+		// webcomponent bundle and would silently be ignored otherwise.
+		var conflicts []string
+		if m.Main != "" {
+			conflicts = append(conflicts, `"main"`)
+		}
+		if len(m.Programs) > 0 {
+			conflicts = append(conflicts, `"programs"`)
+		}
+		if len(m.Bin) > 0 {
+			conflicts = append(conflicts, `"bin"`)
+		}
+		if m.Root != "" {
+			conflicts = append(conflicts, `"root"`)
+		}
+		for _, scope := range []Scope{ScopeProd, ScopeDev, ScopeOptional} {
+			if len(m.bucket(scope).Java) > 0 {
+				switch scope {
+				case ScopeProd:
+					conflicts = append(conflicts, `"dependencies.java"`)
+				case ScopeDev:
+					conflicts = append(conflicts, `"devDependencies.java"`)
+				case ScopeOptional:
+					conflicts = append(conflicts, `"optionalDependencies.java"`)
+				}
+			}
+		}
+		if len(conflicts) > 0 {
+			return fmt.Errorf(
+				`%s cannot be used with "type": "webcomponent"`,
+				strings.Join(conflicts, ", "),
+			)
+		}
+	default:
+		return fmt.Errorf(
+			`unknown package type %q: expected "bdl" or "webcomponent"`,
+			m.Type,
+		)
+	}
+	return nil
 }
 
 // validateHookOp enforces per-operation required fields and the shared

@@ -12,17 +12,19 @@ import (
 
 // Generator builds the environment variable exports needed for Genero BDL.
 type Generator struct {
-	home        string
-	packagesDir string
-	jarsDir     string
+	home             string
+	packagesDir      string
+	jarsDir          string
+	webcomponentsDir string
 }
 
 // New creates a Generator rooted at the fglpkg home directory.
 func New(home string) *Generator {
 	return &Generator{
-		home:        home,
-		packagesDir: filepath.Join(home, "packages"),
-		jarsDir:     filepath.Join(home, "jars"),
+		home:             home,
+		packagesDir:      filepath.Join(home, "packages"),
+		jarsDir:          filepath.Join(home, "jars"),
+		webcomponentsDir: filepath.Join(home, "webcomponents"),
 	}
 }
 
@@ -50,6 +52,106 @@ func (g *Generator) Generate() ([]string, error) {
 		lines = append(lines, g.prependExportLine("CLASSPATH", javaClasspath))
 	}
 
+	fglimagepath := g.buildFGLIMAGEPATH()
+	if fglimagepath != "" {
+		lines = append(lines, g.prependExportLine("FGLIMAGEPATH", fglimagepath))
+		lines = append(lines, g.gasHintComment(fglimagepath))
+	}
+
+	return lines, nil
+}
+
+// buildFGLIMAGEPATH returns the directories to prepend to FGLIMAGEPATH so
+// Genero's direct-mode webcomponent loader finds installed bundles via
+// "<fglimagepath-dir>/webcomponents/<COMPONENTTYPE>/<COMPONENTTYPE>.html".
+// We add the *parent* of the webcomponents/ dir (i.e. .fglpkg/), per the
+// Genero search rule.
+//
+// Returns "" when no webcomponents are installed in any of the considered
+// scopes, so the export line is skipped entirely.
+func (g *Generator) buildFGLIMAGEPATH() string {
+	sep := pathSeparator()
+	var parts []string
+	seen := make(map[string]bool)
+	add := func(p string) {
+		if p != "" && !seen[p] {
+			parts = append(parts, p)
+			seen[p] = true
+		}
+	}
+	// Local project webcomponents (.fglpkg/) take precedence.
+	localWC := filepath.Join(".", ".fglpkg", "webcomponents")
+	if abs, err := filepath.Abs(localWC); err == nil && abs != g.webcomponentsDir {
+		if entries, err := os.ReadDir(abs); err == nil && len(entries) > 0 {
+			// Add the parent — not the webcomponents/ dir itself — so
+			// Genero's "<fglimagepath-dir>/webcomponents/<COMPONENTTYPE>"
+			// search rule resolves correctly.
+			add(filepath.Dir(abs))
+		}
+	}
+	// Global webcomponents (~/.fglpkg/webcomponents).
+	if entries, err := os.ReadDir(g.webcomponentsDir); err == nil && len(entries) > 0 {
+		add(filepath.Dir(g.webcomponentsDir))
+	}
+	return strings.Join(parts, sep)
+}
+
+// gasHintComment is a shell-comment line that tells the user what value
+// to add to their .xcf's <WEB_COMPONENT_DIRECTORY> for the same set of
+// installed webcomponents. fglpkg cannot edit .xcf files (deployment
+// concern), so we print the hint for copy/paste.
+func (g *Generator) gasHintComment(fglimagepathValue string) string {
+	sep := pathSeparator()
+	wcDirs := make([]string, 0)
+	for _, p := range strings.Split(fglimagepathValue, sep) {
+		if p == "" {
+			continue
+		}
+		// fglimagepathValue holds the *parent* of webcomponents/ — for
+		// GAS, point at webcomponents/ directly.
+		wcDirs = append(wcDirs, filepath.Join(p, "webcomponents"))
+	}
+	prefix := "# "
+	if runtime.GOOS == "windows" {
+		prefix = "REM "
+	}
+	return fmt.Sprintf("%sFor GAS: add to your .xcf's <WEB_COMPONENT_DIRECTORY>: %s",
+		prefix, strings.Join(wcDirs, sep))
+}
+
+// GenerateGWA returns one --webcomponent flag per installed component,
+// ready to splice into a `gwabuildtool` invocation. Each flag points at a
+// COMPONENTTYPE directory, which is the unit gwabuildtool consumes.
+//
+// Looks in both .fglpkg/webcomponents/ (local project) and ~/.fglpkg/
+// webcomponents/ (global) — typical projects only install locally, but
+// the global fallback lets `fglpkg env --gwa` work outside a project too.
+func (g *Generator) GenerateGWA() ([]string, error) {
+	var lines []string
+	seen := make(map[string]bool)
+	addFrom := func(dir string) {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			return
+		}
+		for _, e := range entries {
+			if !e.IsDir() {
+				continue
+			}
+			abs := filepath.Join(dir, e.Name())
+			if !seen[e.Name()] {
+				lines = append(lines, "--webcomponent "+abs)
+				seen[e.Name()] = true
+			}
+		}
+	}
+	localWC := filepath.Join(".", ".fglpkg", "webcomponents")
+	if abs, err := filepath.Abs(localWC); err == nil {
+		if abs != g.webcomponentsDir {
+			addFrom(abs)
+		}
+	}
+	addFrom(g.webcomponentsDir)
 	return lines, nil
 }
 
@@ -147,7 +249,7 @@ func (g *Generator) buildJavaClasspath() (string, error) {
 }
 
 // GenerateLocal returns export lines using only the local project's
-// .fglpkg/packages and .fglpkg/jars directories.
+// .fglpkg/packages, .fglpkg/jars, and .fglpkg/webcomponents directories.
 func (g *Generator) GenerateLocal() ([]string, error) {
 	var lines []string
 
@@ -167,6 +269,18 @@ func (g *Generator) GenerateLocal() ([]string, error) {
 	}
 	if classpath != "" {
 		lines = append(lines, g.prependExportLine("CLASSPATH", classpath))
+	}
+
+	// FGLIMAGEPATH for direct-mode webcomponent discovery — point at the
+	// parent of .fglpkg/webcomponents/ so Genero's
+	// "<fglimagepath-dir>/webcomponents/<COMPONENTTYPE>/" search resolves.
+	localWC := filepath.Join(".", ".fglpkg", "webcomponents")
+	if abs, err := filepath.Abs(localWC); err == nil {
+		if entries, err := os.ReadDir(abs); err == nil && len(entries) > 0 {
+			fglimagepath := filepath.Dir(abs)
+			lines = append(lines, g.prependExportLine("FGLIMAGEPATH", fglimagepath))
+			lines = append(lines, g.gasHintComment(fglimagepath))
+		}
 	}
 
 	return lines, nil

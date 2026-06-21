@@ -527,9 +527,13 @@ func cmdList(args []string) error {
 func cmdEnv(args []string) error {
 	_, forceLocal, forceGlobal, _ := parseFlags(args)
 	gst := false
+	gwa := false
 	for _, a := range args {
 		if a == "--gst" {
 			gst = true
+		}
+		if a == "--gwa" {
+			gwa = true
 		}
 	}
 
@@ -538,6 +542,19 @@ func cmdEnv(args []string) error {
 		return err
 	}
 	g := env.New(home)
+
+	// --gwa emits gwabuildtool --webcomponent flags and exits — it's an
+	// orthogonal output mode, not an additional export line.
+	if gwa {
+		flags, err := g.GenerateGWA()
+		if err != nil {
+			return err
+		}
+		for _, f := range flags {
+			fmt.Println(f)
+		}
+		return nil
+	}
 
 	// Determine if we should use local-only output.
 	// --gst always implies local. Otherwise, context-aware: if inside a
@@ -700,7 +717,8 @@ func cmdPublish(args []string) error {
 	if dryRun {
 		fmt.Printf("DRY RUN — no network calls will be made\n\n")
 	}
-	fmt.Printf("Publishing %s@%s (Genero %s variant) to %s...\n", m.Name, m.Version, generoMajor, registryURL)
+	variant := artifactVariant(m, generoMajor)
+	fmt.Printf("Publishing %s@%s (%s) to %s...\n", m.Name, m.Version, variantDescription(variant), registryURL)
 	projectDir, _ := os.Getwd()
 	if err := runHook(m, manifest.HookPrePublish, projectDir); err != nil {
 		return err
@@ -714,8 +732,8 @@ func cmdPublish(args []string) error {
 		fmt.Printf("✓ Published %s@%s — pending admin review\n", m.Name, m.Version)
 		if ci {
 			// Stable, greppable line for pipeline consumption.
-			fmt.Printf("fglpkg-published name=%s version=%s variant=genero%s status=pending\n",
-				m.Name, m.Version, generoMajor)
+			fmt.Printf("fglpkg-published name=%s version=%s variant=%s status=pending\n",
+				m.Name, m.Version, variant)
 		}
 	}
 	return runHook(m, manifest.HookPostPublish, projectDir)
@@ -747,8 +765,8 @@ func publishPackage(m *manifest.Manifest, registryURL, generoMajor string, dryRu
 	}
 	fmt.Printf("  Package zip: %d bytes (SHA256: %s)\n", len(zipData), checksum)
 
-	variant := "genero" + generoMajor
-	filename := gh.VariantAssetName(m.Name, m.Version, generoMajor)
+	variant := artifactVariant(m, generoMajor)
+	filename := artifactFilename(m.Name, m.Version, variant)
 	slug := m.Name
 	visibility := m.Visibility
 	if visibility == "" {
@@ -858,11 +876,87 @@ func docSizeLabel(content, marker string) string {
 	return label
 }
 
+// artifactVariant returns the registry variant tag for a package: a BDL
+// package uses "genero<major>", a webcomponent package uses the literal
+// "webcomponent" (genero-version-agnostic).
+func artifactVariant(m *manifest.Manifest, generoMajor string) string {
+	if m.EffectiveKind() == manifest.KindWebcomponent {
+		return "webcomponent"
+	}
+	return "genero" + generoMajor
+}
+
+// artifactFilename returns the zip filename for a published artifact:
+// "<name>-<version>-<variant>.zip".
+func artifactFilename(name, version, variant string) string {
+	return fmt.Sprintf("%s-%s-%s.zip", name, version, variant)
+}
+
+// variantDescription is a human-readable label for the variant, used in
+// publish/pack progress output.
+func variantDescription(variant string) string {
+	if variant == "webcomponent" {
+		return "webcomponent variant"
+	}
+	return "Genero " + strings.TrimPrefix(variant, "genero") + " variant"
+}
+
 func buildPackageZip(m *manifest.Manifest) ([]byte, string, error) {
 	var buf bytes.Buffer
 	h := sha256.New()
 	zw := zip.NewWriter(io.MultiWriter(&buf, h))
 
+	// Load .fglpkgignore from the project root (current directory). The
+	// manifest field is never excluded; everything else can be filtered.
+	ignore, err := loadIgnore(".")
+	if err != nil {
+		return nil, "", fmt.Errorf("cannot read %s: %w", ignoreFilename, err)
+	}
+
+	added := make(map[string]bool)
+
+	switch m.EffectiveKind() {
+	case manifest.KindWebcomponent:
+		if err := collectWebcomponentFiles(zw, m, ignore, added); err != nil {
+			return nil, "", err
+		}
+	default:
+		if err := collectBDLFiles(zw, m, ignore, added); err != nil {
+			return nil, "", err
+		}
+	}
+
+	// Include doc files matching the docs glob patterns (kind-agnostic).
+	if err := addDocFilesToZip(zw, m, ignore, added); err != nil {
+		return nil, "", err
+	}
+
+	// Always include the manifest, but use a publish-safe copy so the
+	// shipped fglpkg.json does not advertise devDependencies.
+	if !added[manifest.Filename] {
+		mfData, err := json.MarshalIndent(m.PublishCopy(), "", "  ")
+		if err != nil {
+			return nil, "", fmt.Errorf("cannot serialize publishable %s: %w", manifest.Filename, err)
+		}
+		fw, err := zw.Create(manifest.Filename)
+		if err != nil {
+			return nil, "", fmt.Errorf("cannot add %s to zip: %w", manifest.Filename, err)
+		}
+		if _, err := fw.Write(append(mfData, '\n')); err != nil {
+			return nil, "", fmt.Errorf("cannot write %s to zip: %w", manifest.Filename, err)
+		}
+	}
+
+	if err := zw.Close(); err != nil {
+		return nil, "", err
+	}
+	return buf.Bytes(), hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// collectBDLFiles walks the BDL package source tree, applying the manifest's
+// `files` patterns (defaulting to *.42m/*.42f/*.sch), and includes declared
+// `bin` scripts. The walked tree is m.Root (default ".").
+func collectBDLFiles(zw *zip.Writer, m *manifest.Manifest, ignore *ignoreSet, added map[string]bool) error {
 	// Determine the root directory for package files.
 	root := m.Root
 	if root == "" {
@@ -875,16 +969,8 @@ func buildPackageZip(m *manifest.Manifest) ([]byte, string, error) {
 		patterns = []string{"*.42m", "*.42f", "*.sch"}
 	}
 
-	// Load .fglpkgignore from the project root (current directory). The
-	// manifest field is never excluded; everything else can be filtered.
-	ignore, err := loadIgnore(".")
-	if err != nil {
-		return nil, "", fmt.Errorf("cannot read %s: %w", ignoreFilename, err)
-	}
-
 	// Walk the root directory tree and collect files matching the patterns.
-	added := make(map[string]bool)
-	err = filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
@@ -918,7 +1004,7 @@ func buildPackageZip(m *manifest.Manifest) ([]byte, string, error) {
 		return nil
 	})
 	if err != nil {
-		return nil, "", fmt.Errorf("error walking root %q: %w", root, err)
+		return fmt.Errorf("error walking root %q: %w", root, err)
 	}
 
 	// Include bin script files so they are present in the installed package.
@@ -931,31 +1017,46 @@ func buildPackageZip(m *manifest.Manifest) ([]byte, string, error) {
 		}
 		info, err := os.Stat(fullPath)
 		if err != nil {
-			return nil, "", fmt.Errorf("bin script %q not found: %w", scriptPath, err)
+			return fmt.Errorf("bin script %q not found: %w", scriptPath, err)
 		}
 		if info.IsDir() {
-			return nil, "", fmt.Errorf("bin script %q is a directory, not a file", scriptPath)
+			return fmt.Errorf("bin script %q is a directory, not a file", scriptPath)
 		}
 		relPath, relErr := filepath.Rel(".", fullPath)
 		if relErr != nil {
 			relPath = fullPath
 		}
 		if err := addFileToZip(zw, fullPath, relPath); err != nil {
-			return nil, "", fmt.Errorf("cannot add bin script %s to zip: %w", scriptPath, err)
+			return fmt.Errorf("cannot add bin script %s to zip: %w", scriptPath, err)
 		}
 		added[fullPath] = true
 	}
+	return nil
+}
 
-	// Include doc files matching the docs glob patterns.
-	if len(m.Docs) > 0 {
-		err := filepath.Walk(".", func(path string, info os.FileInfo, err error) error {
+// collectWebcomponentFiles walks each declared webcomponents/<COMPONENTTYPE>/
+// directory and adds its contents to the zip with the leading "webcomponents/"
+// prefix stripped — so a source file at webcomponents/3DChart/3DChart.html
+// is stored in the zip as 3DChart/3DChart.html. Each declared COMPONENTTYPE
+// must have a directory and a <COMPONENTTYPE>.html entry point.
+func collectWebcomponentFiles(zw *zip.Writer, m *manifest.Manifest, ignore *ignoreSet, added map[string]bool) error {
+	for _, name := range m.Webcomponents {
+		srcDir := filepath.Join("webcomponents", name)
+		info, err := os.Stat(srcDir)
+		if err != nil || !info.IsDir() {
+			return fmt.Errorf("webcomponent %q: directory %s/ is missing", name, srcDir)
+		}
+		// The HTML entry point is required by Genero's webcomponent loader.
+		entry := filepath.Join(srcDir, name+".html")
+		if _, err := os.Stat(entry); err != nil {
+			return fmt.Errorf("webcomponent %q: missing required entry point %s", name, entry)
+		}
+
+		err = filepath.Walk(srcDir, func(path string, info os.FileInfo, err error) error {
 			if err != nil {
 				return err
 			}
 			if info.IsDir() {
-				if isPackArtifactDir(path) {
-					return filepath.SkipDir
-				}
 				return nil
 			}
 			if added[path] {
@@ -965,48 +1066,69 @@ func buildPackageZip(m *manifest.Manifest) ([]byte, string, error) {
 			if relErr != nil {
 				relPath = path
 			}
-			for _, pattern := range m.Docs {
-				if matchGlob(pattern, relPath) {
-					if ignore.shouldExclude(relPath, false) {
-						break
-					}
-					if err := addFileToZip(zw, path, relPath); err != nil {
-						return fmt.Errorf("cannot add doc file %s to zip: %w", path, err)
-					}
-					added[path] = true
-					break
-				}
+			if ignore.shouldExclude(relPath, false) {
+				return nil
 			}
+			// Strip the leading "webcomponents/" so the in-zip path is
+			// <COMPONENTTYPE>/<file> — matching the layout the installer
+			// extracts directly into .fglpkg/webcomponents/.
+			zipPath, relErr := filepath.Rel("webcomponents", relPath)
+			if relErr != nil {
+				return fmt.Errorf("cannot compute zip path for %s: %w", relPath, relErr)
+			}
+			// Zip paths use forward slashes regardless of host OS.
+			zipPath = filepath.ToSlash(zipPath)
+			if err := addFileToZip(zw, path, zipPath); err != nil {
+				return fmt.Errorf("cannot add %s to zip: %w", path, err)
+			}
+			added[path] = true
 			return nil
 		})
 		if err != nil {
-			return nil, "", fmt.Errorf("error collecting doc files: %w", err)
+			return fmt.Errorf("error walking webcomponent %q: %w", name, err)
 		}
 	}
+	return nil
+}
 
-	// Always include the manifest, but use a publish-safe copy so the
-	// shipped fglpkg.json does not advertise devDependencies — those are
-	// developer-only and never resolved transitively, so they are noise to
-	// consumers (and let dev-only files leak into the package, see
-	// isPackArtifactDir).
-	if !added[manifest.Filename] {
-		mfData, err := json.MarshalIndent(m.PublishCopy(), "", "  ")
-		if err != nil {
-			return nil, "", fmt.Errorf("cannot serialize publishable %s: %w", manifest.Filename, err)
-		}
-		fw, err := zw.Create(manifest.Filename)
-		if err != nil {
-			return nil, "", fmt.Errorf("cannot add %s to zip: %w", manifest.Filename, err)
-		}
-		if _, err := fw.Write(append(mfData, '\n')); err != nil {
-			return nil, "", fmt.Errorf("cannot write %s to zip: %w", manifest.Filename, err)
-		}
+// addDocFilesToZip adds files matching the manifest's Docs globs at their
+// project-relative paths (no prefix stripping; docs live at the zip root).
+// Kind-agnostic — applies to both BDL and webcomponent packages.
+func addDocFilesToZip(zw *zip.Writer, m *manifest.Manifest, ignore *ignoreSet, added map[string]bool) error {
+	if len(m.Docs) == 0 {
+		return nil
 	}
-
-	if err := zw.Close(); err != nil {
-		return nil, "", err
-	}
-	return buf.Bytes(), hex.EncodeToString(h.Sum(nil)), nil
+	return filepath.Walk(".", func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			if isPackArtifactDir(path) {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if added[path] {
+			return nil
+		}
+		relPath, relErr := filepath.Rel(".", path)
+		if relErr != nil {
+			relPath = path
+		}
+		for _, pattern := range m.Docs {
+			if matchGlob(pattern, relPath) {
+				if ignore.shouldExclude(relPath, false) {
+					break
+				}
+				if err := addFileToZip(zw, path, relPath); err != nil {
+					return fmt.Errorf("cannot add doc file %s to zip: %w", path, err)
+				}
+				added[path] = true
+				break
+			}
+		}
+		return nil
+	})
 }
 
 // isPackArtifactDir reports whether a directory should never appear in
@@ -1957,6 +2079,8 @@ FLAGS (for install only):
 
 FLAGS (for env only):
   --gst             Output in Genero Studio format (implies --local)
+  --gwa             Emit --webcomponent flags for gwabuildtool, one per
+                    installed COMPONENTTYPE; suitable for $(fglpkg env --gwa)
 
 ENVIRONMENT:
   FGLPKG_HOME              Override ~/.fglpkg

@@ -59,7 +59,7 @@ Adding webcomponent packages closes the gap: a charting widget can be published 
 ### Field semantics
 
 - **`type`** (new) — package kind. One of `"bdl"` (default when omitted; the existing behavior) or `"webcomponent"`. Other kinds may be added later (e.g. `"theme"`, `"schema"`); the field is forward-extensible.
-- **`webcomponents`** (new) — non-empty array of `COMPONENTTYPE` names. Required when `type: "webcomponent"`; forbidden otherwise. Each name must match `^[A-Za-z][A-Za-z0-9_-]*$` (Genero's `COMPONENTTYPE` lexical rule) and must correspond to a directory `webcomponents/<NAME>/` in the publisher's source tree containing `<NAME>.html` at minimum.
+- **`webcomponents`** (new) — non-empty array of `COMPONENTTYPE` names. Required when `type: "webcomponent"`; forbidden otherwise. Each name must match `^[A-Za-z0-9][A-Za-z0-9_-]*$` (digit-leading names like `3DChart` are valid — matches Genero's example COMPONENTTYPE strings) and must correspond to a directory `webcomponents/<NAME>/` in the publisher's source tree containing `<NAME>.html` at minimum.
 - **`dependencies.fgl`** — webcomponent packages may depend on other packages (BDL or webcomponent). The resolver walks them like any other fgl dep; the installer routes the resulting artifacts by the resolved package's own `type`.
 - **`dependencies.java`** — forbidden for `type: "webcomponent"`. Webcomponents are frontend-only; a Java dep makes no sense and indicates the package should have been BDL.
 - **`main`, `programs`, `bin`, `root`** — forbidden for `type: "webcomponent"`. These are BDL-only concepts.

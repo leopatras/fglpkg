@@ -62,8 +62,13 @@ type PackageInfo struct {
 	GeneroConstraint string                    `json:"genero,omitempty"`
 	FGLDeps          map[string]string         `json:"fglDeps,omitempty"`
 	JavaDeps         []manifest.JavaDependency `json:"javaDeps,omitempty"`
-	Variants         []VariantInfo             `json:"variants,omitempty"`
-	Readme           string                    `json:"readme,omitempty"`
+	// Variant is the artifact variant tag selected by the registry client
+	// when fetching this version — "genero<N>" for BDL packages or
+	// "webcomponent" for webcomponent packages. The installer uses it to
+	// route the artifact to the right install directory.
+	Variant  string        `json:"variant,omitempty"`
+	Variants []VariantInfo `json:"variants,omitempty"`
+	Readme   string        `json:"readme,omitempty"`
 }
 
 // VariantInfo describes a Genero-major-version-specific build.
@@ -172,6 +177,7 @@ func FetchInfoForGenero(name, version, generoMajor string) (*PackageInfo, error)
 		GeneroConstraint: v.Genero,
 		FGLDeps:          v.Dependencies.FGL,
 		JavaDeps:         v.Dependencies.Java,
+		Variant:          art.Variant,
 		Readme:           v.Readme,
 	}
 	for _, a := range v.Artifacts {
@@ -489,12 +495,22 @@ func fetchPackageDetail(slug string) (*apiPackageDetail, error) {
 
 // pickArtifact selects the best matching artifact for generoMajor.
 // Order of preference:
-//  1. exact "genero<N>" match
-//  2. "default"
-//  3. first listed
+//  1. "webcomponent" — kind-discriminating variant, matches any genero version
+//  2. exact "genero<N>" match
+//  3. "default"
+//  4. first listed
+//
+// The webcomponent check is first because a webcomponent-only version has
+// exactly one artifact (the "webcomponent" one), and the BDL fallbacks
+// would otherwise miss it.
 func pickArtifact(arts []apiArtifact, generoMajor string) *apiArtifact {
 	if len(arts) == 0 {
 		return nil
+	}
+	for i := range arts {
+		if arts[i].Variant == "webcomponent" {
+			return &arts[i]
+		}
 	}
 	if generoMajor != "" {
 		want := "genero" + generoMajor

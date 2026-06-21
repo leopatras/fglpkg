@@ -29,18 +29,33 @@ import (
 	"github.com/4js-mikefolcher/fglpkg/internal/workspace"
 )
 
-// ResolvedPackage is a single BDL package in the final install plan.
+// ResolvedPackage is a single package in the final install plan. Despite
+// the legacy name, this entry may refer to either a BDL package or a
+// webcomponent package — the Variant field discriminates and the installer
+// routes accordingly.
 type ResolvedPackage struct {
 	Name        string
 	Version     semver.Version
 	DownloadURL string
 	Checksum    string
+	// Variant is the artifact variant tag selected by the registry: a
+	// BDL package uses "genero<N>", a webcomponent package uses
+	// "webcomponent". Empty for workspace-local members, which never
+	// install through the artifact path.
+	Variant string
 	// RequiredBy lists the packages that introduced this dependency.
 	RequiredBy []string
 	// Scope is the resolved dependency scope: prod, dev, or optional.
 	// When a package is reachable via multiple paths the strongest scope
 	// wins: prod beats optional beats dev.
 	Scope manifest.Scope
+}
+
+// IsWebcomponent reports whether this resolved entry is a webcomponent
+// package (variant tag "webcomponent"). Callers use this to route the
+// install step to .fglpkg/webcomponents/ instead of .fglpkg/packages/.
+func (r ResolvedPackage) IsWebcomponent() bool {
+	return r.Variant == "webcomponent"
 }
 
 // LocalMember describes a workspace member satisfying a local dependency.
@@ -539,6 +554,7 @@ func (s *state) buildPlan() *Plan {
 			Version:     entry.version,
 			DownloadURL: entry.info.DownloadURL,
 			Checksum:    entry.info.Checksum,
+			Variant:     entry.info.Variant,
 			RequiredBy:  requiredBy,
 			Scope:       entry.scope,
 		})

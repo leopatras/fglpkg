@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"sort"
 
-	gh "github.com/4js-mikefolcher/fglpkg/internal/github"
 	"github.com/4js-mikefolcher/fglpkg/internal/genero"
 	"github.com/4js-mikefolcher/fglpkg/internal/manifest"
 )
@@ -51,11 +50,18 @@ func cmdPack(args []string) error {
 		return fmt.Errorf("manifest is invalid: %w", err)
 	}
 
-	gv, err := genero.Detect()
-	if err != nil {
-		return fmt.Errorf("cannot detect Genero version: %w", err)
+	// Webcomponent packages are genero-version-agnostic, so skip the
+	// (potentially expensive) runtime detection in that case. For BDL
+	// packages the detected major is still needed for the variant tag.
+	var generoMajor string
+	if m.EffectiveKind() != manifest.KindWebcomponent {
+		gv, err := genero.Detect()
+		if err != nil {
+			return fmt.Errorf("cannot detect Genero version: %w", err)
+		}
+		generoMajor = gv.MajorString()
 	}
-	generoMajor := gv.MajorString()
+	variant := artifactVariant(m, generoMajor)
 
 	zipData, checksum, err := buildPackageZip(m)
 	if err != nil {
@@ -67,7 +73,7 @@ func cmdPack(args []string) error {
 		return fmt.Errorf("cannot read built zip: %w", err)
 	}
 
-	fmt.Printf("Package:  %s@%s (Genero %s variant)\n", m.Name, m.Version, generoMajor)
+	fmt.Printf("Package:  %s@%s (%s)\n", m.Name, m.Version, variantDescription(variant))
 	fmt.Printf("Size:     %d bytes\n", len(zipData))
 	fmt.Printf("SHA256:   %s\n", checksum)
 	fmt.Printf("Files:    %d\n", len(entries))
@@ -80,7 +86,7 @@ func cmdPack(args []string) error {
 	}
 
 	if outPath == "" {
-		outPath = gh.VariantAssetName(m.Name, m.Version, generoMajor)
+		outPath = artifactFilename(m.Name, m.Version, variant)
 	}
 	if parent := filepath.Dir(outPath); parent != "" && parent != "." {
 		if err := os.MkdirAll(parent, 0755); err != nil {
