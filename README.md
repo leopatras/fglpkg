@@ -270,6 +270,8 @@ fglpkg bdl --list                        # List available BDL programs
 fglpkg publish                           # Publish current package to registry
 fglpkg publish --dry-run                 # Preview the publish calls, no network
 fglpkg publish --ci                      # Non-interactive publish (CI): needs FGLPKG_TOKEN
+fglpkg publish --private                 # Publish as private (overrides fglpkg.json visibility)
+fglpkg publish --public                  # Publish as public (overrides fglpkg.json visibility)
 fglpkg unpublish pkg@1.0.0               # Remove a published version
 
 # Authentication
@@ -401,6 +403,13 @@ Packages are **public by default**. To restrict a package to members of your ten
   "version": "1.0.0",
   "visibility": "private"
 }
+```
+
+Alternatively, override the manifest at publish time with the `--private` / `--public` flags (mutually exclusive). The flag takes priority over `fglpkg.json`, which takes priority over the `public` default:
+
+```bash
+fglpkg publish --private    # publish as private regardless of fglpkg.json
+fglpkg publish --public     # publish as public regardless of fglpkg.json
 ```
 
 Visibility is recorded once when the package is first created on the registry and ignored on subsequent publishes — you cannot change it after the fact via `fglpkg publish`.
