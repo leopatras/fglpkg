@@ -1,6 +1,6 @@
 #!/bin/bash
 
-VERSION="${FGLPKG_VERSION:-3.0.0}"
+VERSION="${FGLPKG_VERSION:-3.1.0}"
 BUILD="${FGLPKG_BUILD:-$(date +%Y%m%d%H%M%S)}"
 LDFLAGS="-s -w -X github.com/4js-mikefolcher/fglpkg/internal/cli.Version=${VERSION} -X github.com/4js-mikefolcher/fglpkg/internal/cli.Build=${BUILD}"
 
