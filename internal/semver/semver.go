@@ -29,6 +29,7 @@ package semver
 
 import (
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 )
@@ -109,6 +110,30 @@ func MustParse(s string) Version {
 		panic(err)
 	}
 	return v
+}
+
+// strictSemverRe is the official SemVer 2.0.0 validation pattern
+// (see https://semver.org). It uses only features supported by Go's RE2
+// engine (no lookaround or backreferences), so it is safe to compile here.
+var strictSemverRe = regexp.MustCompile(`^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\+([0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?$`)
+
+// ValidateVersion reports whether s is a strictly valid semantic version of
+// the form MAJOR.MINOR.PATCH[-prerelease][+build], per the SemVer 2.0.0 spec.
+//
+// It is intentionally stricter than Parse and is meant for the "emit" side —
+// validating an author-supplied version at `init`/`publish` — while Parse
+// stays lenient for reading versions that already exist (lockfiles, the
+// registry, detected Genero versions). Compared to Parse it additionally:
+//
+//   - rejects a leading "v" (Parse strips it),
+//   - forbids leading zeros in the numeric components (e.g. "1.02.3"),
+//   - restricts prerelease/build identifiers to [0-9A-Za-z-] and forbids
+//     empty or leading-zero numeric prerelease identifiers.
+//
+// The caller is responsible for trimming surrounding whitespace; a value with
+// stray spaces is reported as invalid.
+func ValidateVersion(s string) bool {
+	return strictSemverRe.MatchString(s)
 }
 
 // Compare returns -1, 0, or 1 if v is less than, equal to, or greater than other.

@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
 	"strings"
@@ -28,6 +29,7 @@ import (
 	"github.com/4js-mikefolcher/fglpkg/internal/manifest"
 	"github.com/4js-mikefolcher/fglpkg/internal/oauth"
 	"github.com/4js-mikefolcher/fglpkg/internal/registry"
+	"github.com/4js-mikefolcher/fglpkg/internal/semver"
 	"github.com/4js-mikefolcher/fglpkg/internal/workspace"
 )
 
@@ -70,6 +72,16 @@ func privateHint(err error, pkg string) error {
 		return err
 	}
 	return fmt.Errorf("%w\n  hint: if %q is a private package, run: fglpkg login", err, pkg)
+}
+
+// validSlugRe is the regular expression that determines whether a package.
+// slug is valid. Currently, a package slug is valid if it is between
+// 2 and 64 characters and only consists of lowercase letters, digits, or hyphens
+var validSlugRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}[a-z0-9]$`)
+
+// isValidPackageSlug returns whether a package slug is valid. it uses validSlugRe to verify
+func isValidPackageSlug(slug string) bool {
+	return validSlugRe.MatchString(slug)
 }
 
 // Execute is the main CLI entry point.
@@ -152,10 +164,10 @@ func cmdInit(args []string) error {
 	if _, err := os.Stat(manifest.Filename); err == nil {
 		return fmt.Errorf("%s already exists in the current directory", manifest.Filename)
 	}
-	name := promptWithDefault("Package name", filepathBase())
-	version := promptWithDefault("Version", "0.1.0")
-	description := promptWithDefault("Description", "")
-	author := promptWithDefault("Author", "")
+	name := promptPackageSlug()
+	version := promptPackageVersion()
+	description := promptNonEmptyString("Description") //promptWithDefault("Description", "")
+	author := promptNonEmptyString("Author")           //promptWithDefault("Author", "")
 	m := manifest.New(name, version, description, author)
 	if tmpl != nil {
 		tmpl.apply(m)
@@ -2259,4 +2271,59 @@ func promptWithDefault(label, def string) string {
 		return def
 	}
 	return val
+}
+
+// promptPackageSlug prompts for the package name and re-prompts until the
+// entry is a valid registry slug (2-64 chars: lowercase letters, digits,
+// hyphens), catching invalid names at init instead of at publish time where
+// the registry would reject the slug. The current directory name is offered
+// as the default, but only when it is itself a valid slug — otherwise the
+// default is cleared so the user must type a valid name rather than accept an
+// invalid suggestion by pressing enter.
+func promptPackageSlug() string {
+	const slugPrompt = "Package name"
+
+	defaultSlug := filepathBase()
+	if !isValidPackageSlug(defaultSlug) {
+		defaultSlug = ""
+	}
+
+	name := promptWithDefault(slugPrompt, defaultSlug)
+	for !isValidPackageSlug(name) {
+		fmt.Printf("error: Invalid package name \"%s\" - must be 2-64 chars: lowercase letters, digits, hyphens\n", name)
+		name = promptWithDefault(slugPrompt, defaultSlug)
+	}
+	return name
+}
+
+// promptPackageVersion prompts for the initial version and re-prompts until
+// the entry is strict semver (MAJOR.MINOR.PATCH with an optional -prerelease),
+// defaulting to 0.1.0. Validating here keeps a published package's version in
+// the ordered, comparable form the resolver and `outdated` rely on, rather
+// than letting an arbitrary string through to the registry.
+func promptPackageVersion() string {
+	const versionPrompt = "Version"
+	const defaultVersion = "0.1.0"
+
+	version := promptWithDefault(versionPrompt, defaultVersion)
+	for !semver.ValidateVersion(version) {
+		fmt.Printf("error: Invalid version \"%s\" - must be MAJOR.MINOR.PATCH, e.g. 1.0.0 or 2.1.0-rc.1\n", version)
+		version = promptWithDefault(versionPrompt, defaultVersion)
+	}
+	return version
+}
+
+// promptNonEmptyString prompts with the given label and re-prompts until the
+// user enters a non-empty value, used for required free-text fields that have
+// no sensible default (e.g. description, author). The label is lowercased when
+// echoed back in the error line, so callers should pass it in display case
+// (e.g. "Description" yields "Invalid description - cannot be empty").
+func promptNonEmptyString(prompt string) string {
+	str := promptWithDefault(prompt, "")
+	toLower := strings.ToLower(prompt)
+	for str == "" {
+		fmt.Printf("error: Invalid %s - cannot be empty\n", toLower)
+		str = promptWithDefault(prompt, "")
+	}
+	return str
 }
