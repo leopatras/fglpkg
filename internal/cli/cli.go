@@ -166,8 +166,8 @@ func cmdInit(args []string) error {
 	}
 	name := promptPackageSlug()
 	version := promptPackageVersion()
-	description := promptNonEmptyString("Description") //promptWithDefault("Description", "")
-	author := promptNonEmptyString("Author")           //promptWithDefault("Author", "")
+	description := promptNonEmptyString("Description")
+	author := promptNonEmptyString("Author")
 	m := manifest.New(name, version, description, author)
 	if tmpl != nil {
 		tmpl.apply(m)
