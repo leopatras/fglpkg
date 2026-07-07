@@ -1,6 +1,6 @@
 # Spec: Package signing & provenance (v1)
 
-**Status:** Draft
+**Status:** Draft — reconciled 2026-07-07 with the GI-side implementation. Layer 1 and Layer 2 have shipped in the Genero Intelligence registry; the sections below carry the 11-point decision log (custody, key tooling, read-model, JCS guardrails, sign ordering, attestation keying, in-Worker Layer 2 verify). Source: `4js-genero-intelligence/specs/package-signing-gi-decisions.md`.
 **Date:** 2026-07-02
 **Author:** Mike Folcher
 **Tracking:** Workstream C, item #6 (P0) in [docs/outstanding-work.md](../docs/outstanding-work.md); market-readiness gap #6.
@@ -51,11 +51,12 @@ Layer 1 delivers most of the value with near-zero publisher friction. Layer 2 de
 | Decision | Choice | Rationale |
 |---|---|---|
 | Signing algorithm | **Ed25519** | ~64-byte signatures, stdlib support, no r/s encoding surprises. |
-| Root key custody | **Cloudflare KMS / Secrets Store** | Fully cloud-native ops; can be strengthened later without wire-protocol change. |
+| Key custody | **Working key in a Worker Secret; root key OFFLINE** | Cloudflare has no server-side signing KMS (secrets only return the value). The working Ed25519 key is loaded into the Worker (WebCrypto); the root key never touches the Worker — it signs the manifest out-of-band. Custody = encrypted-at-rest storage + access control, not hardware non-extractability. Upgradeable to an external KMS `Sign` later without a wire change. |
 | CI platforms in Layer 2 v1 | **All sigstore-go supported providers** | GitHub Actions, GitLab, Buildkite, CircleCI, GCP Cloud Build. Env detection + OIDC fetch is a thin per-provider adapter. |
 | Laptop publish when package requires provenance | **Blocked unless `--no-provenance --i-accept-risk` is passed** | Middle ground: preserves emergency-fix path but records the operator's conscious override in the audit log. |
-| Sigstore trust root | **Hardcoded public-good instance** | No pluggable trust root in v1. |
-| Canonical JSON | **RFC 8785 (JSON Canonicalization Scheme)** | Deterministic bytes for signing; well-specified; existing Go libraries. |
+| Sigstore trust root | **Hardcoded public-good instance, pinned at deploy** | No pluggable trust root in v1; rotate by redeploy. |
+| Layer 2 server-side verify | **In-Worker `@sigstore/verify` (Option A)** | GI is a Worker and can't run `sigstore-go`. Confirmed under `workerd`/`nodejs_compat` via a spike; needs a one-line `patch-package` shim on `@sigstore/core` (explicit `sha256` digest for ECDSA verify). No Go sidecar. |
+| Canonical JSON | **RFC 8785 (JCS), strings + one integer** | Deterministic bytes for signing. Payload is all strings except the integer `size` — never a float — sidestepping JCS number formatting. Reference impls both sides (`canonicalize` / `gowebpki/jcs`), pinned by shared golden vectors. |
 
 ## Layer 1 — Registry-signed artifacts
 
@@ -79,6 +80,8 @@ Layer 1 delivers most of the value with near-zero publisher friction. Layer 2 de
 
 The payload is serialised with **RFC 8785 JSON Canonicalization** to produce a deterministic byte sequence, then signed with Ed25519. The signing input is the RFC-8785 output — not a hash of it. Ed25519 hashes internally.
 
+**JCS parity guardrails (load-bearing).** Two independent JCS impls (Go on the CLI, TS in the Worker) must produce byte-identical output or every signature fails. So: (1) the payload is **strings + one integer** (`size`) — we never emit a float, sidestepping JCS's number-formatting minefield; (2) both sides use the RFC author's reference impls — [`canonicalize`](https://www.npmjs.com/package/canonicalize) (TS/Worker) and [`gowebpki/jcs`](https://github.com/gowebpki/jcs) (Go/CLI); (3) a **shared golden-vectors fixture** (`payload → canonical bytes → signature under a test key`, incl. boundary `size` ints and key-order permutations) is a blocking CI gate in **both** repos.
+
 **Signature envelope** (as returned in responses and stored in the lockfile):
 
 ```json
@@ -86,11 +89,11 @@ The payload is serialised with **RFC 8785 JSON Canonicalization** to produce a d
   "keyid": "fglpkg-gi-2026-1",
   "alg": "ed25519",
   "sig": "<base64 raw 64-byte signature>",
-  "canonicalized_payload_sha256": "<hex>"
+  "signed_at": "2026-07-02T14:22:00Z"
 }
 ```
 
-The `canonicalized_payload_sha256` is a courtesy debugging field — verification uses the payload the client reconstructs, not this value.
+`signed_at` is **audit-only** and is **not** part of the signed payload (the payload uses `uploaded_at`). It yields the audit signal for free: at-publish signing has `signed_at ≈ uploaded_at`; a backfilled signature has `signed_at ≠ uploaded_at`. This blob is stored in the artifact's `signature` column; the HTTP wire response carries `{keyid, alg, sig}` and surfaces `signed_at` only where useful.
 
 **Signed keys manifest** at `GET /registry/.well-known/keys.json`:
 
@@ -118,34 +121,42 @@ The signature covers the RFC-8785 canonicalization of `{keys, issuedAt}`. The **
 
 ### GI service — new & changed
 
-#### New: KMS integration
+#### Key custody & lifecycle (offline root, working key as a Worker Secret)
 
-- Root private key held in Cloudflare Secrets Store, tagged `fglpkg-root`. Access via Workers binding, restricted to the "keys manifest signer" endpoint only.
-- Working private key held in Cloudflare Secrets Store, tagged `fglpkg-signing-<year>-<n>`. Access via Workers binding, restricted to the artifact-upload path.
+Cloudflare has no server-side signing KMS — Secrets Store / Worker Secrets only return the secret *value*, there is no `Sign` API. So:
+
+- **Working private key** — an Ed25519 key stored as a Worker Secret (`REGISTRY_SIGNING_PRIVATE_KEY`, a JWK) + `REGISTRY_SIGNING_KEYID`. Loaded into the Worker and used via WebCrypto on the artifact-upload path. Custody = encrypted-at-rest storage + access control, **not** hardware non-extractability.
+- **Root private key** — held **entirely offline**. Its only job is signing the (rarely changing) keys manifest, done out-of-band by a local tool; the Worker never holds it, so there is **no in-Worker root-signer endpoint**. Root rotation = re-sign a manifest offline + ship a CLI release with the new pinned root pubkey.
+- **Offline key-management tool** (`scripts/gen-signing-key.mjs` in the GI repo — committed, never deployed): generates a working keypair → emits the private JWK for `wrangler secret put` + the keyid; assembles the manifest from the currently-valid working pubkeys; **signs it offline with the root key** over the RFC-8785 canonicalization of `{issuedAt, keys}`. Runbook: generate / rotate / retire.
 - A small `internal/signing/` module in the GI Worker abstracts sign/verify + key resolution.
+
+*(Upgrade path, non-v1: true non-extractable custody = call an external KMS `Sign` from the Worker. Non-breaking — the envelope `{keyid, alg, sig}` is agnostic to where signing happens.)*
 
 #### New: `GET /registry/.well-known/keys.json`
 
-- Returns the current signed keys manifest (schema above).
+- Serves the newest issued manifest **verbatim from D1** (`registry_keys_manifests`) — the offline-signed bytes, not reassembled per request.
 - Cache headers: `Cache-Control: public, max-age=3600` (working keys), `s-maxage=300` on the edge.
-- Regenerated whenever a key is added, retired, or the root key rotates — not on every request.
+- Ingested via a `super_admin`-gated **`POST /admin/registry/signing/manifest`** endpoint: the offline tool submits the signed manifest, auditable via admin-action events — no raw prod-DB access needed to rotate. Registry-scoped path; the CLI pins the full `/registry/.well-known/keys.json` (not the RFC 8615 site root).
 
 #### Changed: `PUT /registry/packages/:slug/versions/:version/artifacts/:variant`
 
-After the existing size/sha256 computation, before storing the DB row:
+**Sign BEFORE the R2 put**, so a signing failure writes nothing anywhere (no orphaned R2 object, no unsigned row). Order:
 
-1. Load current working private key from Secrets Store.
-2. Build the canonical payload from the artifact record (name/version/variant/sha256/size/uploaded_at/uploader).
-3. Sign with Ed25519.
-4. Store `signature.keyid`, `signature.sig` in a new `registry_artifacts.signature` JSON column.
+1. Read body → `size` + `sha256`.
+2. Generate `uploaded_at` **once** and `uploader` = `partner:<owner_partner_id>`.
+3. Build the canonical payload (name/version/variant/sha256/size/uploaded_at/uploader) and **sign** with Ed25519.
+4. `R2.put` the bytes.
+5. DB insert — storing the signature JSON, `uploader`, and `created_at = uploaded_at` (the same value that was signed and is returned, so the client reconstructs an identical payload).
 
-Failure to sign is a 500 — the artifact must not land in the DB unsigned.
+`signArtifact()` returns `null` when no working key is configured (row stored **unsigned**) and throws (→ 500) when a key IS configured but signing fails — so a signing registry never stores an unsigned row.
 
 #### Changed: artifact reads
 
-Extend the artifact record everywhere it's returned (info, resolve, version-list) to include:
+Extend the artifact record everywhere it's returned (info, resolve, version-list) with the signed inputs **and** the signature, so the client can reconstruct the RFC-8785 canonical payload and verify (returning just the signature is insufficient — the client also needs `uploaded_at` and `uploader`):
 
 ```json
+"uploaded_at": "2026-07-02T14:22:00Z",
+"uploader": "partner:pt_7f2a…",
 "signature": {
   "keyid": "fglpkg-gi-2026-1",
   "alg": "ed25519",
@@ -153,15 +164,18 @@ Extend the artifact record everywhere it's returned (info, resolve, version-list
 }
 ```
 
-#### New: backfill script
+`signature` is `null` for unsigned rows (pre-signing history, or when no working key is configured).
 
-A one-shot Worker script that signs every historical artifact. Records `signed_at` = "now" (not `uploaded_at`) so the audit trail is clear about which signatures are historical backfill vs. at-publish.
+#### New: backfill (one-shot Worker)
 
-#### New: schema additions
+Signs every historical artifact. **Invariant:** it builds the canonical payload from each artifact's **original `created_at`** as `uploaded_at` (never "now") — otherwise a backfilled signature wouldn't match what the client reconstructs and would fail to verify. It records `signed_at` = "now" in the signature JSON so the audit trail distinguishes backfill (`signed_at ≠ uploaded_at`) from at-publish.
 
-- `registry_artifacts.signature JSON NOT NULL` (backfilled first, NOT NULL constraint applied after)
-- `registry_signing_keys(keyid PK, alg, pub_pem, valid_from, valid_to, retired_at)`
-- `registry_keys_manifests(issued_at PK, body, sig)` — stores each issued keys.json for audit.
+#### New: schema additions (migration `0026_registry_signing.sql`)
+
+- `registry_artifacts.signature TEXT` — **nullable**, JSON `{keyid, alg, sig, signed_at}`; NULL = unsigned. Enforced in the **app layer** (the PUT path always signs when a key is configured; a sign failure is a 500). SQLite/D1 can't add `NOT NULL` to an existing column, and the "warn" rollout wants unsigned rows to coexist during the transition — so no NOT NULL constraint.
+- `registry_artifacts.uploader TEXT NOT NULL DEFAULT ''` — `partner:<owner_partner_id>`, frozen at sign time (part of the signed payload); `""` for pre-signing rows.
+- `registry_signing_keys(keyid PK, alg, pub, valid_from, valid_to, retired_at)` — `pub` is the **base64-raw 32-byte** Ed25519 public key (not PEM): natural Ed25519 form, matches the manifest wire format with zero conversion, imports directly on both sides.
+- `registry_keys_manifests(issued_at PK, body, sig)` — stores each issued keys.json for audit + serving.
 
 ### fglpkg CLI — new & changed
 
@@ -279,15 +293,15 @@ The in-toto Statement carries a **SLSA v1 Provenance predicate**:
 #### New: `PUT /registry/packages/:slug/versions/:version/attestations/:variant`
 
 - Body: `application/vnd.dev.sigstore.bundle+json` (the raw bundle bytes; typically 2–8 KB).
-- Auth: same OAuth bearer as artifact upload.
-- Server-side verification **before storing**:
-  1. Parse the bundle via sigstore-go's `verify.Verifier`.
-  2. Verify Rekor inclusion proof (log integrity).
-  3. Verify Fulcio cert chain against the pinned Sigstore trust root (bundled with GI Worker at deploy time).
-  4. Extract the DSSE payload's subject digest, confirm it equals the artifact record's stored sha256.
-  5. Extract the signer identity claims (issuer, subject, e.g. GitHub Actions repo + workflow ref).
-- On failure: 400 with a descriptive error. Don't store partial state.
-- On success: store the bundle in R2 keyed as `<slug>/<version>/<variant>.sigstore.json` + a row in `registry_attestations` with parsed identity fields for query.
+- Auth: same OAuth bearer as artifact upload (owning partner).
+- Server-side verification **before storing** — **in the Worker** with the JS Sigstore libraries (`@sigstore/verify` / `@sigstore/bundle` / `@sigstore/core`), **not** `sigstore-go`. The GI registry is a Cloudflare Worker (TypeScript/V8) and can't run the Go library. A spike confirmed `@sigstore/verify` runs under `workerd`/`nodejs_compat`, with one caveat: `@sigstore/core` calls `crypto.verify` with an undefined digest in the Rekor tlog paths, which workerd rejects for ECDSA (Node infers SHA-256) — fixed by a one-line `patch-package` shim (explicit `sha256` for EC keys). The Sigstore **trust root is pinned at deploy** (`sigstore-trusted-root.json`), rotated by redeploy — no runtime TUF.
+  1. Cheap first-line reject: parse the DSSE subject digest, confirm it equals the artifact record's stored `sha256` — before any heavy crypto.
+  2. Full verify via `@sigstore/verify`: Rekor inclusion, Fulcio cert chain vs the pinned root, CT-log SCT, DSSE signature.
+  3. Extract the signer identity claims (issuer, SAN — e.g. GitHub Actions repo + workflow ref) and the Rekor entry id.
+- On failure: 400 with a descriptive error. Nothing is stored.
+- On success: store the bundle in R2 keyed by package **id**, beside the artifact: `registry/{packageId}/{version}/{variant}.sigstore.json` + a row in `registry_attestations` with parsed identity fields for query.
+
+*(The fglpkg **CLI**'s consumer-side verification still uses `sigstore-go`; only the GI **server** uses `@sigstore/verify`. Shared golden bundle fixtures keep the two impls in agreement.)*
 
 #### New: `GET /registry/packages/:slug/versions/:version/attestations/:variant`
 
@@ -310,14 +324,14 @@ Extend each artifact record with:
 
 #### New: per-package policy
 
-- New column `registry_packages.require_provenance BOOLEAN NOT NULL DEFAULT FALSE`.
-- New endpoint `PATCH /registry/packages/:slug { "require_provenance": true }`. Owner-only, audit-logged.
-- Enforced at `POST /registry/packages/:slug/versions/:version/submit`: if `require_provenance = true` and any artifact under this version has no attestation, submit returns 409 with a message pointing at the missing variants.
+- New column `registry_packages.require_provenance` (INTEGER 0/1, default 0).
+- `PATCH /registry/packages/:slug { "requireProvenance": true }` — owner-only, audit-logged. This route also carries the status (withdraw/relist) and npm-style deprecate operations; it dispatches **one operation per call** — a body mixing operations (e.g. `status` + `requireProvenance`) is a **400** ("one operation at a time"), keeping per-op audit events clean.
+- Enforced at `POST /registry/packages/:slug/versions/:version/submit`: if `require_provenance` is set and any artifact variant under this version lacks a verified attestation, submit returns **400** pointing at the missing variants.
 
-#### New: schema additions
+#### New: schema additions (migration `0028_registry_provenance.sql`)
 
-- `registry_packages.require_provenance BOOLEAN NOT NULL DEFAULT FALSE`
-- `registry_attestations(id PK, slug, version, variant, bundle_r2_key, issuer, subject, rekor_uuid, created_at)`
+- `registry_packages.require_provenance INTEGER NOT NULL DEFAULT 0`
+- `registry_attestations(id PK, version_id, variant, bundle_r2_key, issuer, subject, rekor_uuid, created_at)` — keyed by **`version_id` + `variant`** (FK-consistent with `registry_artifacts`, slug-change-proof), `UNIQUE(version_id, variant)`.
 
 ### fglpkg CLI — new & changed
 
@@ -473,11 +487,11 @@ consumer (CLI)     │  1. resolve ─────────────► GI
 ## Acceptance milestones
 
 **M1 — Layer 1 registry (~1 week)**
-- Cloudflare Secrets Store bindings wired; root + working keys generated.
-- `POST/PUT` to artifacts signs and stores.
-- `GET /registry/.well-known/keys.json` returns a manifest that verifies against the root key.
-- Artifact JSON reads include the signature.
-- Backfill script has signed every historical artifact; DB has NOT NULL constraint on `signature`.
+- Offline key tool generates the working keypair + a root-signed manifest; working key provisioned as a Worker Secret (`REGISTRY_SIGNING_PRIVATE_KEY` + `_KEYID`), manifest ingested via the `super_admin` admin endpoint.
+- `PUT` to artifacts signs **before the R2 put** and stores (unsigned when no key is configured).
+- `GET /registry/.well-known/keys.json` serves the manifest that verifies against the pinned root key.
+- Artifact JSON reads include `uploaded_at`, `uploader`, and the signature.
+- Backfill (one-shot Worker) has signed every historical artifact from its original `created_at`. `signature` stays **nullable** (app-enforced) — no DB NOT NULL constraint.
 
 **M2 — Layer 1 CLI (~1 week)**
 - `internal/signing/` package with golden-vectors test suite (shared with the GI-side JCS impl).
@@ -493,8 +507,8 @@ consumer (CLI)     │  1. resolve ─────────────► GI
 
 **M3 — Layer 2 registry (~2 weeks)**
 - Attestation PUT/GET endpoints.
-- Server-side sigstore-go verify at receive time (Fulcio chain, Rekor inclusion, subject digest match).
-- `require_provenance` toggle + submit-time enforcement.
+- Server-side **in-Worker `@sigstore/verify`** at receive time (subject digest match, Fulcio chain vs the pinned trust root, Rekor inclusion, CT SCT), via the `patch-package` ECDSA-digest shim.
+- `require_provenance` toggle (one-op PATCH) + submit-time enforcement.
 - Artifact JSON includes parsed attestation identity fields.
 
 **M4 — Layer 2 CLI (~3 weeks)**
