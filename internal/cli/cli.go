@@ -82,6 +82,28 @@ func Execute() error {
 	cmd := os.Args[1]
 	args := os.Args[2:]
 
+	// `fglpkg help [command]` and the top-level -h/--help both show usage;
+	// with a command argument, `help` shows that command's page.
+	if cmd == "help" || cmd == "--help" || cmd == "-h" {
+		if len(args) > 0 {
+			if c := commandIndex[args[0]]; c != nil {
+				printCommandHelp(c)
+				return nil
+			}
+		}
+		printUsage()
+		return nil
+	}
+
+	// Per-command help: `fglpkg <command> --help` / `-h`. Handled here, before
+	// the dispatch switch, so every command gets consistent help without each
+	// handler re-implementing it. Passthrough commands (run, bdl) only treat a
+	// leading help flag as ours; the rest is forwarded to the invoked program.
+	if c := commandIndex[cmd]; c != nil && c.helpRequested(args) {
+		printCommandHelp(c)
+		return nil
+	}
+
 	switch cmd {
 	case "init":
 		return cmdInit(args)
@@ -1447,9 +1469,6 @@ func parseLoginArgs(args []string) (pat string, err error) {
 			}
 			pat = strings.TrimSpace(args[i+1])
 			i += 2
-		case "-h", "--help":
-			fmt.Println("usage: fglpkg login [--token <PAT>]")
-			os.Exit(0)
 		default:
 			return "", fmt.Errorf("unknown argument %q\nusage: fglpkg login [--token <PAT>]", a)
 		}
@@ -2066,55 +2085,23 @@ USAGE:
   fglpkg <command> [arguments]
 
 COMMANDS:
-  init              Create a new fglpkg.json (--template <library|app> to scaffold)
-  install [pkg...]  Install all dependencies (or add specific packages)
-  remove <pkg>      Remove a package
-  update            Re-resolve and update all dependencies
-  list              List installed packages
-  env               Print environment variable exports
-  search <term>     Search the registry (use --all to list every package)
-  info <pkg>[@ver]  Show registry metadata for a package (--json for raw output)
-  outdated          Show FGL deps with newer versions available (--json for JSON)
-  audit             Check installed Java JARs for known vulnerabilities
-                    (--json, --severity=<level>, --production)
-  sbom              Emit a CycloneDX SBOM for the project from fglpkg.lock
-                    (-o file, --pretty, --production)
-  completion <sh>   Print shell completion script (bash|zsh|fish|powershell)
-  bdl <pkg> <mod>   Run a BDL program from an installed package
-  publish           Publish current package to the registry; submits for admin review
-                    (--dry-run prints what would happen without calling out;
-                     --ci for non-interactive pipelines: requires FGLPKG_TOKEN,
-                     prints a machine-readable status line)
-  pack [-o file]    Build the publishable zip locally without uploading
-                    (--list prints contents without writing a file)
-  login             Sign in to the registry (OAuth browser flow, or --token <PAT>)
-  logout            Remove saved credentials
-  whoami            Show current authenticated user
-  workspace         Manage monorepo workspaces
-  run <command>     Run a script from an installed package
-  docs <package>    List or view package documentation
-  version [bump]    Print fglpkg version, or bump package version
-                    (bump = patch|minor|major|prerelease|<semver>, add --git to tag)
-  help              Show this help
-
-FLAGS (for install, remove, update, list, env):
-  --local, -l       Force local project directory (.fglpkg/)
-  --global, -g      Force global home directory (~/.fglpkg/)
-  (default)         Auto-detect: local if .fglpkg/ or fglpkg.json exists
-
-FLAGS (for install only):
-  --force, -f           Delete fglpkg.lock and .fglpkg/ first, then re-download
-                        every package from the registry (local installs only)
-  --save-dev, -D        Record added packages under "devDependencies"
-  --save-optional, -O   Record added packages under "optionalDependencies"
-  --save-prod, -P       Record added packages under "dependencies" (default)
-  --production, --prod  Skip devDependencies when installing (optional deps
-                        are still attempted)
-
-FLAGS (for env only):
-  --gst             Output in Genero Studio format (implies --local)
-  --gwa             Emit --webcomponent flags for gwabuildtool, one per
-                    installed COMPONENTTYPE; suitable for $(fglpkg env --gwa)
+`)
+	for _, c := range commands {
+		name := c.Name
+		if c.Args != "" {
+			name += " " + c.Args
+		}
+		// The list entry is Summary plus its list-only ListDetail; either may
+		// contain newlines. The first line prints beside the command name, the
+		// rest hang-indent under the description column.
+		lines := strings.Split(c.Summary+c.ListDetail, "\n")
+		fmt.Printf("  %-18s%s\n", name, lines[0])
+		for _, cont := range lines[1:] {
+			fmt.Printf("  %-18s%s\n", "", cont)
+		}
+	}
+	fmt.Print(`
+Run 'fglpkg <command> --help' for command-specific options.
 
 ENVIRONMENT:
   FGLPKG_HOME              Override ~/.fglpkg

@@ -37,7 +37,7 @@ func TestSbomFlagParsing(t *testing.T) {
 		if err != nil {
 			t.Fatalf("parseSbomFlags(nil) error: %v", err)
 		}
-		if f.output != "" || f.format != "" || f.production || f.pretty || f.help {
+		if f.output != "" || f.format != "" || f.production || f.pretty {
 			t.Errorf("default flags should all be zero, got %+v", f)
 		}
 	})

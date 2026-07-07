@@ -99,7 +99,7 @@ func TestAuditFlagParsing(t *testing.T) {
 		if f.severity != audit.SeverityMedium {
 			t.Errorf("default severity = %q, want medium", f.severity)
 		}
-		if f.jsonOut || f.production || f.offline || f.help {
+		if f.jsonOut || f.production || f.offline {
 			t.Errorf("default flags should all be false, got %+v", f)
 		}
 	})

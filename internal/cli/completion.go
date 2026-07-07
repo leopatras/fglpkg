@@ -6,17 +6,18 @@ import (
 	"strings"
 )
 
-// completionCommands lists every top-level subcommand users can invoke.
-// Keep this in lockstep with the switch in runCommand — the schema-like
-// drift cost is low, and static lists produce simpler completion scripts
-// than introspecting the CLI at runtime.
-var completionCommands = []string{
-	"init", "install", "remove", "update", "list", "env", "search",
-	"publish", "pack", "login", "logout", "whoami",
-	"workspace", "ws", "run", "bdl",
-	"docs", "version", "info", "view", "outdated", "audit",
-	"sbom", "completion", "help",
-}
+// completionCommands lists every top-level subcommand (and alias) users can
+// invoke. It is derived from the command registry in commands.go, so it stays
+// in lockstep with the documented command set automatically. Static lists
+// produce simpler completion scripts than introspecting the CLI at runtime.
+var completionCommands = func() []string {
+	names := make([]string, 0, len(commands))
+	for _, c := range commands {
+		names = append(names, c.Name)
+		names = append(names, c.Aliases...)
+	}
+	return names
+}()
 
 // completionFlags lists the long + short flags used across commands.
 // We deliberately do NOT discriminate per-command: a single universal

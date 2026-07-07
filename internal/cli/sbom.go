@@ -17,7 +17,6 @@ type sbomFlags struct {
 	format     string
 	production bool
 	pretty     bool
-	help       bool
 }
 
 // cmdSbom emits a Software Bill of Materials (CycloneDX 1.5 JSON) for
@@ -32,10 +31,6 @@ func cmdSbom(args []string) error {
 	flags, err := parseSbomFlags(args)
 	if err != nil {
 		return err
-	}
-	if flags.help {
-		printSbomUsage()
-		return nil
 	}
 	if flags.format != "" && flags.format != "cyclonedx" {
 		return fmt.Errorf("%s format not supported in v1 (use --format=cyclonedx)", flags.format)
@@ -82,8 +77,6 @@ func parseSbomFlags(args []string) (sbomFlags, error) {
 			f.pretty = true
 		case a == "--production", a == "--prod":
 			f.production = true
-		case a == "--help", a == "-h":
-			f.help = true
 		case a == "-o", a == "--output":
 			if i+1 >= len(args) {
 				return f, fmt.Errorf("%s requires a file path", a)
@@ -124,28 +117,4 @@ func writeSbom(w io.Writer, doc *sbom.Document, pretty bool) error {
 		return fmt.Errorf("failed to write SBOM: %w", err)
 	}
 	return nil
-}
-
-func printSbomUsage() {
-	fmt.Print(`fglpkg sbom - Emit a Software Bill of Materials for the current project
-
-USAGE:
-  fglpkg sbom [flags]
-
-FLAGS:
-  -o, --output <path>             Write to file instead of stdout
-  --pretty                        Indented JSON (default: compact)
-  --production, --prod            Skip dev-scoped JARs
-  --format=<cyclonedx|spdx>       Output format. Default: cyclonedx
-                                  (spdx is reserved for a future release)
-  --help, -h                      Show this help
-
-NOTES:
-  v1 emits CycloneDX 1.5 JSON, generated from fglpkg.lock. No network
-  calls — output is deterministic given the lockfile.
-
-  License / supplier metadata is not currently in the lockfile and is
-  therefore omitted from per-component entries. A future --enrich flag
-  will fetch these from the registry.
-`)
 }

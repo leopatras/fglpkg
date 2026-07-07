@@ -19,19 +19,18 @@ type auditFlags struct {
 	severity   string
 	production bool
 	offline    bool
-	help       bool
 }
 
 // auditReport is the JSON shape emitted by `fglpkg audit --json`.
 // schemaVersion lets future fields be added without breaking CI parsers.
 type auditReport struct {
-	SchemaVersion int              `json:"schemaVersion"`
-	AuditedAt     string           `json:"auditedAt"`
-	Source        string           `json:"source"`
-	JARsAudited   int              `json:"jarsAudited"`
-	Findings      []audit.Finding  `json:"findings"`
-	Summary       auditCounts      `json:"summary"`
-	Notes         []string         `json:"notes,omitempty"`
+	SchemaVersion int             `json:"schemaVersion"`
+	AuditedAt     string          `json:"auditedAt"`
+	Source        string          `json:"source"`
+	JARsAudited   int             `json:"jarsAudited"`
+	Findings      []audit.Finding `json:"findings"`
+	Summary       auditCounts     `json:"summary"`
+	Notes         []string        `json:"notes,omitempty"`
 }
 
 type auditCounts struct {
@@ -61,10 +60,6 @@ func cmdAudit(args []string) error {
 	flags, err := parseAuditFlags(args)
 	if err != nil {
 		return &ExitError{Code: 2, Err: err}
-	}
-	if flags.help {
-		printAuditUsage()
-		return nil
 	}
 	if flags.offline {
 		return &ExitError{Code: 2, Err: fmt.Errorf("--offline mode not yet supported")}
@@ -133,8 +128,6 @@ func parseAuditFlags(args []string) (auditFlags, error) {
 			f.production = true
 		case a == "--offline":
 			f.offline = true
-		case a == "--help", a == "-h":
-			f.help = true
 		case strings.HasPrefix(a, "--severity="):
 			sev := strings.TrimPrefix(a, "--severity=")
 			if !audit.ValidSeverity(sev) {
@@ -274,29 +267,4 @@ func pluralS(n int) string {
 		return ""
 	}
 	return "s"
-}
-
-func printAuditUsage() {
-	fmt.Print(`fglpkg audit - Check installed Java JARs for known vulnerabilities
-
-USAGE:
-  fglpkg audit [flags]
-
-FLAGS:
-  --json                          Emit a JSON report on stdout
-  --severity=<low|medium|high|critical>
-                                  Minimum severity that fails the build (default: medium)
-  --production, --prod            Skip dev-scoped JARs
-  --offline                       Reserved for a future cached-advisory mode (errors today)
-  --help, -h                      Show this help
-
-EXIT CODES:
-  0  no findings at or above --severity
-  1  one or more findings at or above --severity
-  2  audit itself failed (missing lockfile, network error, etc.)
-
-NOTES:
-  Java JARs are audited against the OSV.dev v1 API (anonymous, free).
-  BDL packages are not scanned in this version (no public advisory feed).
-`)
 }
