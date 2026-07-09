@@ -85,6 +85,21 @@ func TestParseInstallFlagsProduction(t *testing.T) {
 	}
 }
 
+func TestParseInstallFlagsNoManifestFallback(t *testing.T) {
+	f, err := parseInstallFlags([]string{"--no-manifest-fallback"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !f.noManifestFallback {
+		t.Error("--no-manifest-fallback not set")
+	}
+	// Default is off (fallback enabled).
+	def, _ := parseInstallFlags([]string{"pkg"})
+	if def.noManifestFallback {
+		t.Error("noManifestFallback should default to false")
+	}
+}
+
 func TestParseInstallFlagsConflicting(t *testing.T) {
 	cases := [][]string{
 		{"--save-dev", "--save-optional", "x"},

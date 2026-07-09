@@ -269,7 +269,7 @@ func cmdInstall(args []string) error {
 		}
 	}
 
-	instOpts := installer.Options{Production: flags.production}
+	instOpts := installer.Options{Production: flags.production, NoManifestFallback: flags.noManifestFallback}
 
 	if len(flags.pkgs) == 0 {
 		m, err := manifest.Load(".")
@@ -448,12 +448,13 @@ func parseFlags(args []string) (remaining []string, local, global, force bool) {
 // (default), ScopeDev, or ScopeOptional, reflecting where newly added
 // packages should be recorded.
 type installFlags struct {
-	local      bool
-	global     bool
-	force      bool
-	production bool
-	scope      manifest.Scope
-	pkgs       []string
+	local              bool
+	global             bool
+	force              bool
+	production         bool
+	noManifestFallback bool
+	scope              manifest.Scope
+	pkgs               []string
 }
 
 // parseInstallFlags extends parseFlags with --save-dev/-D, --save-optional/-O,
@@ -471,6 +472,8 @@ func parseInstallFlags(args []string) (installFlags, error) {
 			f.force = true
 		case "--production", "--prod":
 			f.production = true
+		case "--no-manifest-fallback":
+			f.noManifestFallback = true
 		case "--save-dev", "-D":
 			devSeen = true
 			f.scope = manifest.ScopeDev
@@ -499,7 +502,7 @@ func cmdRemove(args []string) error {
 	if len(pkgArgs) == 0 {
 		return fmt.Errorf("usage: fglpkg remove <package>")
 	}
-	home, _, err := resolveHome(forceLocal, forceGlobal)
+	home, isLocal, err := resolveHome(forceLocal, forceGlobal)
 	if err != nil {
 		return err
 	}
@@ -511,25 +514,54 @@ func cmdRemove(args []string) error {
 	if err := runHook(m, manifest.HookPreUninstall, projectDir); err != nil {
 		return err
 	}
-	inst := newInstaller(home)
+
+	// Update the manifest first. Pruning of installed files (below) is driven
+	// by re-resolving the *updated* manifest, so nothing is deleted until the
+	// dependency it belongs to is actually gone from the graph.
 	for _, pkg := range pkgArgs {
-		if err := inst.Remove(pkg); err != nil {
-			return fmt.Errorf("failed to remove %s: %w", pkg, err)
-		}
 		if scope := m.RemoveFGLDependency(pkg); scope != "" {
 			fmt.Printf("✓ Removed %s from %s\n", pkg, scopeDisplayName(scope))
 		} else {
 			fmt.Printf("✓ Removed %s (not declared in manifest)\n", pkg)
 		}
 	}
-	return m.Save(".")
+	if err := m.Save("."); err != nil {
+		return err
+	}
+
+	// Reconcile installed state with the shrunk manifest: rewrite the lock and
+	// (for local installs only) prune packages/JARs the graph no longer needs.
+	inst := newInstaller(home)
+	pruned, err := inst.ReconcileAfterRemove(m, projectDir, isLocal)
+	if err != nil {
+		fmt.Printf("warning: could not re-resolve to prune orphaned dependencies: %v\n", err)
+		fmt.Println("  The manifest was updated; run 'fglpkg install' when able to reconcile installed files.")
+		// Best-effort so the named packages at least leave disk. Only touch a
+		// local home — a global home is shared with other projects.
+		if isLocal {
+			for _, pkg := range pkgArgs {
+				_ = inst.Remove(pkg)
+			}
+		}
+		return nil
+	}
+	if !isLocal && len(pkgArgs) > 0 {
+		fmt.Println("  Note: global packages/JARs are shared across projects and were not pruned from disk.")
+	}
+	for _, p := range pruned {
+		fmt.Printf("  pruned %s\n", p)
+	}
+	return nil
 }
 
 // ─── update ───────────────────────────────────────────────────────────────────
 
 func cmdUpdate(args []string) error {
-	_, forceLocal, forceGlobal, _ := parseFlags(args)
-	home, _, err := resolveHome(forceLocal, forceGlobal)
+	flags, err := parseInstallFlags(args)
+	if err != nil {
+		return err
+	}
+	home, _, err := resolveHome(flags.local, flags.global)
 	if err != nil {
 		return err
 	}
@@ -539,7 +571,8 @@ func cmdUpdate(args []string) error {
 	}
 	projectDir, _ := os.Getwd()
 	fmt.Println("Ignoring lock file and re-resolving all dependencies...")
-	return newInstaller(home).InstallAll(m, projectDir, true)
+	instOpts := installer.Options{Production: flags.production, NoManifestFallback: flags.noManifestFallback}
+	return newInstaller(home).InstallAllWithOptions(m, projectDir, true, instOpts)
 }
 
 // ─── list ─────────────────────────────────────────────────────────────────────

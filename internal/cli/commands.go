@@ -57,6 +57,9 @@ Prompts for name, version, description, and author, then writes fglpkg.json.
   --save-optional, -O      Record added packages under "optionalDependencies"
   --save-prod, -P          Record added packages under "dependencies" (default)
   --production, --prod     Skip devDependencies when installing
+  --no-manifest-fallback   Do not install Java dependencies a package's bundled
+                           manifest declares but its registry record omits; the
+                           divergence is still reported
 
 With no package arguments, installs everything declared in fglpkg.json.
 With one or more <package>[@<version>] arguments, resolves and adds them.
@@ -72,6 +75,11 @@ Without --local/--global, the target is auto-detected: local when a
 		Long: `FLAGS:
   --local, -l              Force local project directory (.fglpkg/)
   --global, -g             Force global home directory (~/.fglpkg/)
+
+Drops the package from fglpkg.json, re-resolves the remaining graph, and
+rewrites fglpkg.lock. For a local (.fglpkg/) install it also prunes packages
+and Java JARs the graph no longer needs. Global (~/.fglpkg/) artifacts are
+shared across projects and are left on disk.
 `,
 	},
 	{
@@ -81,6 +89,9 @@ Without --local/--global, the target is auto-detected: local when a
 		Long: `FLAGS:
   --local, -l              Force local project directory (.fglpkg/)
   --global, -g             Force global home directory (~/.fglpkg/)
+  --no-manifest-fallback   Do not install Java dependencies a package's bundled
+                           manifest declares but its registry record omits; the
+                           divergence is still reported
 
 Ignores fglpkg.lock and re-resolves every dependency to the newest version
 allowed by the manifest constraints.

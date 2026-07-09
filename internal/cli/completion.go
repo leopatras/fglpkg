@@ -34,6 +34,7 @@ var completionFlags = []string{
 	"--list",
 	"--output", "-o",
 	"--production",
+	"--no-manifest-fallback",
 	"--severity=",
 	"--offline",
 	"--pretty",

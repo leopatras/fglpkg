@@ -152,6 +152,14 @@ type LockedJAR struct {
 	// Scope is the dependency scope this JAR was installed under: "dev"
 	// or "optional". Empty means production.
 	Scope string `json:"scope,omitempty"`
+
+	// Source records where this JAR entry came from: "" / "registry"
+	// (resolved from registry metadata) or "manifest" (recovered from a
+	// package's bundled manifest via the dependency cross-check fallback).
+	// Informational; lets a reader see which JARs bypassed the registry's
+	// declared dependency set, and is the audit trail that makes future
+	// enforcement of manifest↔registry divergence possible.
+	Source string `json:"source,omitempty"`
 }
 
 // ─── Construction ─────────────────────────────────────────────────────────────
@@ -215,6 +223,40 @@ func FromPlan(plan *resolver.Plan, root *manifest.Manifest) *LockFile {
 		JARs:          jars,
 		Webcomponents: wcs,
 	}
+}
+
+// AddManifestJARs appends Java dependencies recovered by the manifest
+// cross-check fallback to the lock's JAR list, marking each Source
+// "manifest". Coordinates already present (by key) are left untouched, so an
+// entry the resolver already recorded is never downgraded to manifest-sourced.
+// The list is re-sorted by key so diffs stay stable. Returns true if at least
+// one new entry was added.
+func (lf *LockFile) AddManifestJARs(deps []manifest.JavaDependency) bool {
+	existing := make(map[string]bool, len(lf.JARs))
+	for _, j := range lf.JARs {
+		existing[j.Key] = true
+	}
+	added := false
+	for _, dep := range deps {
+		if existing[dep.Key()] {
+			continue
+		}
+		lf.JARs = append(lf.JARs, LockedJAR{
+			Key:         dep.Key(),
+			GroupID:     dep.GroupID,
+			ArtifactID:  dep.ArtifactID,
+			Version:     dep.Version,
+			DownloadURL: dep.MavenURL(),
+			Checksum:    dep.Checksum,
+			Source:      "manifest",
+		})
+		existing[dep.Key()] = true
+		added = true
+	}
+	if added {
+		sort.Slice(lf.JARs, func(i, j int) bool { return lf.JARs[i].Key < lf.JARs[j].Key })
+	}
+	return added
 }
 
 // ─── Persistence ──────────────────────────────────────────────────────────────

@@ -59,6 +59,12 @@ type Options struct {
 	// Production skips dev-scoped packages and JARs. Optional entries are
 	// still attempted.
 	Production bool
+	// NoManifestFallback disables the fallback half of the dependency
+	// cross-check: when set, the installer still diffs each package's
+	// bundled manifest against the install set and warns on divergence, but
+	// it does NOT install Java coordinates the manifest declares and the
+	// install set omits. Default (false) means fallback is on.
+	NoManifestFallback bool
 }
 
 // InstallAll resolves or reads from the lock file, then installs every
@@ -101,7 +107,7 @@ func (i *Installer) InstallAllWithOptions(m *manifest.Manifest, projectDir strin
 				}
 				// Lock is valid but some packages are missing on disk — install them.
 				fmt.Printf("Installing from lock file (Genero %s)...\n", gv)
-				return i.installFromLock(lf, opts)
+				return i.installFromLock(lf, m, opts, projectDir)
 			}
 		}
 	}
@@ -136,13 +142,13 @@ func (i *Installer) InstallAllWithOptions(m *manifest.Manifest, projectDir strin
 		}
 	}
 
-	return i.installFromPlan(plan)
+	return i.installFromPlan(plan, m, opts, projectDir)
 }
 
 // installFromLock installs every entry in the lock file using its pinned
 // URLs and checksums, bypassing the resolver entirely. When opts.Production
 // is true, dev-scoped entries are skipped.
-func (i *Installer) installFromLock(lf *lockfile.LockFile, opts Options) error {
+func (i *Installer) installFromLock(lf *lockfile.LockFile, root *manifest.Manifest, opts Options, projectDir string) error {
 	var pkgs []lockfile.LockedPackage
 	var jars []lockfile.LockedJAR
 	var wcs []lockfile.LockedWebcomponent
@@ -204,7 +210,28 @@ func (i *Installer) installFromLock(lf *lockfile.LockFile, opts Options) error {
 		return err
 	}
 
-	// Filter JARs that are already on disk.
+	// ── Dependency cross-check (post-extraction) ────────────────────────────
+	// Diff each installed package's bundled manifest against the locked JAR
+	// set. Scans ALL locked packages (including those already on disk) so a
+	// stale lock is still cross-checked.
+	installedPkgs := make(map[string]bool, len(pkgs)+len(wcs))
+	bdlPkgNames := make([]string, 0, len(pkgs))
+	for _, p := range pkgs {
+		installedPkgs[p.Name] = true
+		bdlPkgNames = append(bdlPkgNames, p.Name)
+	}
+	for _, w := range wcs {
+		installedPkgs[w.Name] = true
+	}
+	install := make(map[string]manifest.JavaDependency, len(jars))
+	for _, jar := range jars {
+		install[jar.Key] = manifest.JavaDependency{
+			GroupID: jar.GroupID, ArtifactID: jar.ArtifactID, Version: jar.Version,
+		}
+	}
+	supplemental := i.crossCheckJava(root, bdlPkgNames, install, installedPkgs, opts)
+
+	// Filter locked JARs that are already on disk.
 	var jarsToInstall []lockfile.LockedJAR
 	for _, jar := range jars {
 		dep := manifest.JavaDependency{
@@ -217,7 +244,7 @@ func (i *Installer) installFromLock(lf *lockfile.LockFile, opts Options) error {
 		jarsToInstall = append(jarsToInstall, jar)
 	}
 
-	return runParallel(jarsToInstall, cap, func(jar lockfile.LockedJAR) error {
+	if err := runParallel(jarsToInstall, cap, func(jar lockfile.LockedJAR) error {
 		dep := manifest.JavaDependency{
 			GroupID:    jar.GroupID,
 			ArtifactID: jar.ArtifactID,
@@ -230,13 +257,33 @@ func (i *Installer) installFromLock(lf *lockfile.LockFile, opts Options) error {
 		}
 		printSync("  ✓ %s\n", jar.Key)
 		return nil
-	})
+	}); err != nil {
+		return err
+	}
+
+	// Fallback JARs recovered from bundled manifests — install as full
+	// JavaDependency structs so url/jar overrides survive. InstallJar is
+	// idempotent (skips JARs already on disk).
+	if err := runParallel(supplemental, cap, func(dep manifest.JavaDependency) error {
+		if err := i.InstallJar(dep); err != nil {
+			return fmt.Errorf("failed to install fallback JAR %s: %w", dep.Key(), err)
+		}
+		printSync("  ✓ %s (manifest fallback)\n", dep.JarFileName())
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	if !opts.Production {
+		i.recordManifestJARs(projectDir, supplemental)
+	}
+	return nil
 }
 
 // installFromPlan installs every entry in a freshly resolved Plan.
 // Optional-scoped items whose download or extraction fails emit a warning
 // and are skipped; hard-scope failures abort the install.
-func (i *Installer) installFromPlan(plan *resolver.Plan) error {
+func (i *Installer) installFromPlan(plan *resolver.Plan, root *manifest.Manifest, opts Options, projectDir string) error {
 	cap := installConcurrency()
 
 	if err := runParallel(plan.Packages, cap, func(pkg resolver.ResolvedPackage) error {
@@ -271,7 +318,26 @@ func (i *Installer) installFromPlan(plan *resolver.Plan) error {
 		return err
 	}
 
-	return runParallel(plan.JARs, cap, func(dep manifest.JavaDependency) error {
+	// ── Dependency cross-check (post-extraction) ────────────────────────────
+	var bdlPkgNames []string
+	installedPkgs := make(map[string]bool, len(plan.Packages))
+	for _, p := range plan.Packages {
+		installedPkgs[p.Name] = true
+		if !p.IsWebcomponent() {
+			bdlPkgNames = append(bdlPkgNames, p.Name)
+		}
+	}
+	install := make(map[string]manifest.JavaDependency, len(plan.JARs))
+	for _, dep := range plan.JARs {
+		install[dep.Key()] = dep
+	}
+	supplemental := i.crossCheckJava(root, bdlPkgNames, install, installedPkgs, opts)
+
+	// Install the resolved JARs plus any manifest-fallback JARs. Fallback
+	// JARs carry no plan scope, so they never hit the optional-skip path
+	// (transitive Java is always production for the consumer).
+	jarsToInstall := append(append([]manifest.JavaDependency(nil), plan.JARs...), supplemental...)
+	if err := runParallel(jarsToInstall, cap, func(dep manifest.JavaDependency) error {
 		if err := i.InstallJar(dep); err != nil {
 			if plan.JARScopes[dep.Key()] == manifest.ScopeOptional {
 				printSync("  warning: skipping optional JAR %s: %v\n", dep.Key(), err)
@@ -281,7 +347,14 @@ func (i *Installer) installFromPlan(plan *resolver.Plan) error {
 		}
 		printSync("  ✓ %s\n", dep.JarFileName())
 		return nil
-	})
+	}); err != nil {
+		return err
+	}
+
+	if !opts.Production {
+		i.recordManifestJARs(projectDir, supplemental)
+	}
+	return nil
 }
 
 // Install downloads, verifies, and unpacks a single package — dispatching
@@ -420,6 +493,99 @@ func (i *Installer) Remove(name string) error {
 		return fmt.Errorf("package %q is not installed", name)
 	}
 	return os.RemoveAll(dir)
+}
+
+// ReconcileAfterRemove brings the install state back in line with a manifest
+// that has just had one or more dependencies removed. It re-resolves the
+// remaining graph, rewrites the lock file (so the removed package and its now
+// unreferenced JARs no longer reappear on the next install), and — when prune
+// is true — deletes installed packages and JARs that the resolved graph no
+// longer requires.
+//
+// prune MUST be false for a global (~/.fglpkg) home: those package and JAR
+// directories are shared across every project, so pruning against a single
+// project's graph would delete another project's dependencies. It is only
+// safe for a project-local (.fglpkg/) install. The lock rewrite is always
+// safe — the lock is project-local regardless of where artifacts live.
+//
+// A resolution failure (e.g. offline, registry unreachable) is returned so the
+// caller can fall back to a manifest-only removal; nothing is pruned in that
+// case.
+func (i *Installer) ReconcileAfterRemove(m *manifest.Manifest, projectDir string, prune bool) ([]string, error) {
+	if err := i.ensureDirs(); err != nil {
+		return nil, err
+	}
+	r, err := resolver.New()
+	if err != nil {
+		return nil, fmt.Errorf("cannot initialise resolver: %w", err)
+	}
+	plan, err := r.ResolveWithOptions(m, resolver.DefaultResolveOptions())
+	if err != nil {
+		return nil, fmt.Errorf("dependency resolution failed:\n%w", err)
+	}
+
+	// Rewrite the lock only if the project already had one; a `remove` should
+	// not conjure a lock for a project that was never installed.
+	if lockfile.Exists(projectDir) {
+		if err := lockfile.FromPlan(plan, m).Save(projectDir); err != nil {
+			return nil, fmt.Errorf("cannot write lock file: %w", err)
+		}
+	}
+
+	if !prune {
+		return nil, nil
+	}
+	return i.pruneToPlan(plan)
+}
+
+// pruneToPlan deletes installed BDL packages and JARs that are absent from
+// plan, returning a human-readable list of what it removed. Webcomponent
+// bundles are not pruned: their on-disk layout is keyed by COMPONENTTYPE, not
+// package name, and that mapping is not persisted, so there is no reliable way
+// to know which bundle belonged to a removed package.
+func (i *Installer) pruneToPlan(plan *resolver.Plan) ([]string, error) {
+	wantPkg := make(map[string]bool, len(plan.Packages))
+	for _, p := range plan.Packages {
+		if !p.IsWebcomponent() {
+			wantPkg[p.Name] = true
+		}
+	}
+	wantJar := make(map[string]bool, len(plan.JARs))
+	for _, dep := range plan.JARs {
+		wantJar[dep.JarFileName()] = true
+	}
+
+	var pruned []string
+
+	pkgEntries, err := os.ReadDir(i.packagesDir)
+	if err != nil && !os.IsNotExist(err) {
+		return pruned, err
+	}
+	for _, e := range pkgEntries {
+		if !e.IsDir() || wantPkg[e.Name()] {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(i.packagesDir, e.Name())); err != nil {
+			return pruned, fmt.Errorf("cannot prune package %s: %w", e.Name(), err)
+		}
+		pruned = append(pruned, "package "+e.Name())
+	}
+
+	jarEntries, err := os.ReadDir(i.jarsDir)
+	if err != nil && !os.IsNotExist(err) {
+		return pruned, err
+	}
+	for _, e := range jarEntries {
+		if e.IsDir() || wantJar[e.Name()] {
+			continue
+		}
+		if err := os.Remove(filepath.Join(i.jarsDir, e.Name())); err != nil {
+			return pruned, fmt.Errorf("cannot prune jar %s: %w", e.Name(), err)
+		}
+		pruned = append(pruned, "jar "+e.Name())
+	}
+
+	return pruned, nil
 }
 
 // List returns all currently installed BDL packages by scanning the packages dir.
