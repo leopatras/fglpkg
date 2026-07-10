@@ -617,11 +617,10 @@ func (m *Manifest) Validate() error {
 		if strings.ContainsAny(cmd, "/\\") {
 			return fmt.Errorf("bin command name %q must not contain path separators", cmd)
 		}
-		if scriptPath == "" {
-			return fmt.Errorf("bin script path for command %q must not be empty", cmd)
-		}
-		if filepath.IsAbs(scriptPath) {
-			return fmt.Errorf("bin script path %q for command %q must be relative", scriptPath, cmd)
+		// safeRelPath rejects empty, absolute (including "/"-rooted paths
+		// that filepath.IsAbs misses on Windows), and ".."-escaping paths.
+		if err := safeRelPath(fmt.Sprintf("bin script path for command %q", cmd), scriptPath); err != nil {
+			return err
 		}
 	}
 	for _, pattern := range m.Docs {

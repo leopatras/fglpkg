@@ -177,7 +177,10 @@ func copyFile(src, dst string, mode os.FileMode) error {
 // we re-check here so the executor is safe even if invoked with a
 // programmatically-constructed manifest that bypassed validation.
 func resolveInside(root, rel string) (string, error) {
-	if filepath.IsAbs(rel) {
+	// filepath.IsAbs treats a leading "/" as absolute only on Unix; on
+	// Windows an absolute path needs a drive letter, so check the "/" prefix
+	// explicitly to reject "/etc/evil"-style paths on every OS.
+	if filepath.IsAbs(rel) || strings.HasPrefix(rel, "/") {
 		return "", fmt.Errorf("path %q must be relative", rel)
 	}
 	joined := filepath.Join(root, rel)

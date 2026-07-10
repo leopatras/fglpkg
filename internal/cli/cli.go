@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -2204,13 +2205,15 @@ func filepathBase() string {
 // (Earlier versions silently fell back to matching pattern against the
 // basename, which let a devDependency's USERGUIDE.md sneak into a parent
 // project's published zip — see buildPackageZip.)
-func matchGlob(pattern, path string) bool {
-	// Normalise separators.
+func matchGlob(pattern, p string) bool {
+	// Normalise separators, then match with the "path" package (always
+	// "/"-based) rather than "path/filepath", whose separator is "\" on
+	// Windows — there "*" would match across "/" and over-match.
 	pattern = filepath.ToSlash(pattern)
-	path = filepath.ToSlash(path)
+	p = filepath.ToSlash(p)
 
 	if !strings.Contains(pattern, "**") {
-		matched, _ := filepath.Match(pattern, path)
+		matched, _ := path.Match(pattern, p)
 		return matched
 	}
 
@@ -2221,7 +2224,7 @@ func matchGlob(pattern, path string) bool {
 
 	// Check prefix: the path must start with the prefix directory (if any).
 	if prefix != "" {
-		if !strings.HasPrefix(path, prefix+"/") && path != prefix {
+		if !strings.HasPrefix(p, prefix+"/") && p != prefix {
 			return false
 		}
 	}
@@ -2231,11 +2234,11 @@ func matchGlob(pattern, path string) bool {
 	}
 
 	// The remaining path (after prefix) must end with a segment matching suffix.
-	remaining := path
+	remaining := p
 	if prefix != "" {
-		remaining = strings.TrimPrefix(path, prefix+"/")
+		remaining = strings.TrimPrefix(p, prefix+"/")
 	}
-	matched, _ := filepath.Match(suffix, filepath.Base(remaining))
+	matched, _ := path.Match(suffix, path.Base(remaining))
 	return matched
 }
 
