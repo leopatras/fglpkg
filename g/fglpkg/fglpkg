@@ -1,0 +1,6 @@
+#!/bin/sh
+#fglpkg launcher: runs the 4GL implementation via fglrun
+dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+FGLLDPATH="$dir/..${FGLLDPATH:+:$FGLLDPATH}"
+export FGLLDPATH
+exec fglrun "$dir/main.42m" "$@"
