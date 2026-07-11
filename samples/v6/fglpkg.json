@@ -1,0 +1,11 @@
+{
+  "name": "sample-v6",
+  "version": "1.0.0",
+  "description": "fglpkg sample package requiring Genero 6 (prometheus package)",
+  "author": "fglpkg samples",
+  "license": "MIT",
+  "repository": "https://github.com/4js-mikefolcher/fglpkg",
+  "genero": ">=6.00",
+  "root": ".",
+  "files": ["*.4gl", "*.42m"]
+}

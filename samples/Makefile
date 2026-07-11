@@ -1,9 +1,11 @@
-# fglpkg samples — three packages (A, B, C) and a consumer project (D).
+# fglpkg samples — five packages (A, B, C, v5, v6) and a consumer (D).
 #
-#   sample-a (A/)  no dependencies
-#   sample-b (B/)  depends on sample-a and sample-c
-#   sample-c (C/)  depends on sample-a and sample-b   (B <-> C is a cycle)
-#   sample-d (D/)  app project consuming all three via `fglpkg install`
+#   sample-a  (A/)   no dependencies
+#   sample-b  (B/)   depends on sample-a and sample-c
+#   sample-c  (C/)   depends on sample-a and sample-b   (B <-> C is a cycle)
+#   sample-v5 (v5/)  requires Genero >= 5.00.03 (base.Channel.getExitStatus)
+#   sample-v6 (v6/)  requires Genero >= 6.00    (prometheus package)
+#   sample-d  (D/)   app project consuming a/b/c via `fglpkg install`
 #
 # Targets:
 #   make demo-4gl   end-to-end with the Genero 4GL fglpkg (g/fglpkg)
@@ -43,10 +45,12 @@ define demo_flow
 	python3 $(REPO)/g/fglpkg/test/mock_registry.py $(REGISTRY_PORT) .registry-state & REG=$$!; \
 	trap 'kill $$REG 2>/dev/null || true' EXIT; \
 	sleep 1; \
-	for p in A C B; do \
+	for p in A C B v5 v6; do \
 	  echo "== publish $$p"; \
 	  (cd $$p && $(1) publish --ci); \
 	done; \
+	echo "== publish v5 genero5 variant"; \
+	(cd v5 && FGLPKG_GENERO_VERSION=5.00.05 $(1) publish --ci); \
 	echo "== install dependencies in D"; \
 	(cd D && $(1) install); \
 	echo "== compile and run D"; \
@@ -70,6 +74,8 @@ modules:
 	cd .build && fglcomp -M a.4gl && fglcomp -M b.4gl && fglcomp -M c.4gl
 	cp .build/a.42m A/ && cp .build/b.42m B/ && cp .build/c.42m C/
 	rm -rf .build
+	cd v5 && fglcomp -M v5.4gl
+	cd v6 && fglcomp -M v6.4gl
 
 # build the Go reference binary on demand
 $(FGLPKG_GO):
@@ -77,6 +83,6 @@ $(FGLPKG_GO):
 
 clean:
 	rm -rf .build .registry-state .fglpkg-home
-	rm -f A/*.42m B/*.42m C/*.42m D/*.42m
+	rm -f A/*.42m B/*.42m C/*.42m D/*.42m v5/*.42m v6/*.42m
 	rm -rf D/.fglpkg
 	rm -f D/fglpkg.lock

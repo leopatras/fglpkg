@@ -4,12 +4,14 @@ Three interdependent BDL packages and a consumer project, wired up to
 demonstrate the full publish → install → build → run cycle with both
 fglpkg implementations (the Go binary and the Genero 4GL port).
 
-| Directory | Package    | Module  | Depends on             |
-|-----------|------------|---------|------------------------|
-| `A/`      | `sample-a` | `a.4gl` | —                      |
-| `B/`      | `sample-b` | `b.4gl` | sample-a, sample-c     |
-| `C/`      | `sample-c` | `c.4gl` | sample-a, sample-b     |
-| `D/`      | `sample-d` | `d.4gl` | sample-a, -b, -c (app) |
+| Directory | Package     | Module   | Depends on / requires       |
+|-----------|-------------|----------|-----------------------------|
+| `A/`      | `sample-a`  | `a.4gl`  | —                           |
+| `B/`      | `sample-b`  | `b.4gl`  | sample-a, sample-c          |
+| `C/`      | `sample-c`  | `c.4gl`  | sample-a, sample-b          |
+| `v5/`     | `sample-v5` | `v5.4gl` | Genero `>=5.00.03` (`base.Channel.getExitStatus`) |
+| `v6/`     | `sample-v6` | `v6.4gl` | Genero `>=6.00` (`prometheus` package) |
+| `D/`      | `sample-d`  | `d.4gl`  | sample-a, -b, -c (app)      |
 
 Each package module exposes `FUNCTION main()` displaying
 `Hello package <X>`; B and C also call into their dependencies
@@ -55,3 +57,22 @@ target finishes.
 - **Publish requirements**: `publish --ci` needs `FGLPKG_TOKEN` and a
   manifest with `repository` set; `--ci` prints the machine-readable
   `fglpkg-published ...` status line.
+- **Genero version constraints and variants** (`v5/`, `v6/`):
+  `sample-v5` requires Genero `>=5.00.03` (it calls
+  `base.Channel.getExitStatus()`, introduced there), `sample-v6`
+  requires `>=6.00` (`IMPORT prometheus`). Artifacts are published per
+  Genero *major* — the demo publishes sample-v5 twice, once natively
+  (genero6 variant) and once with `FGLPKG_GENERO_VERSION=5.00.05`
+  (genero5 variant), so it is installable in both environments;
+  sample-v6 exists only as genero6.
+
+  The `FGLPKG_GENERO_VERSION` override makes version-switch experiments
+  easy. Semantics worth knowing (verified against both implementations):
+  - `fglpkg list` reports what is **on disk** — it scans the
+    `packages/` directory and never consults the Genero version. A
+    package installed under 6.00 stays listed after switching to a
+    5.0x environment.
+  - The Genero version matters at **resolve time**: a fresh
+    `fglpkg install` under 5.00.05 fails with
+    `no version of "sample-v6" is compatible with Genero 5.00.05`,
+    while sample-v5 resolves to its genero5 variant.
