@@ -1,0 +1,6 @@
+*.42m
+.build/
+.registry-state/
+.fglpkg-home/
+D/.fglpkg/
+D/fglpkg.lock

@@ -1,0 +1,15 @@
+{
+  "name": "sample-d",
+  "version": "1.0.0",
+  "description": "fglpkg sample consumer project using packages A, B and C",
+  "author": "fglpkg samples",
+  "license": "MIT",
+  "genero": "*",
+  "dependencies": {
+    "fgl": {
+      "sample-a": "^1.0.0",
+      "sample-b": "^1.0.0",
+      "sample-c": "^1.0.0"
+    }
+  }
+}
