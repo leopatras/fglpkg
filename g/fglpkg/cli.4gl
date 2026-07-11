@@ -18,6 +18,11 @@ IMPORT FGL fglpkg.pack
 IMPORT FGL fglpkg.oauth
 IMPORT FGL fglpkg.publish
 IMPORT FGL fglpkg.outdated
+IMPORT FGL fglpkg.completion
+IMPORT FGL fglpkg.runner
+IMPORT FGL fglpkg.workspace
+IMPORT FGL fglpkg.sbom
+IMPORT FGL fglpkg.audit
 IMPORT FGL fglpkg.templates
 IMPORT FGL fglpkg.commands
 &include "myassert.inc"
@@ -97,11 +102,11 @@ FUNCTION cliExecute() RETURNS INT
     WHEN "outdated"
       RETURN outdated.cmdOutdated(args)
     WHEN "audit"
-      RETURN notImplemented("audit")
+      RETURN audit.cmdAudit(args)
     WHEN "sbom"
-      RETURN notImplemented("sbom")
+      RETURN sbom.cmdSbom(args)
     WHEN "completion"
-      RETURN notImplemented("completion")
+      RETURN completion.cmdCompletion(args)
     WHEN "publish"
       RETURN publish.cmdPublish(args)
     WHEN "login"
@@ -111,15 +116,15 @@ FUNCTION cliExecute() RETURNS INT
     WHEN "whoami"
       RETURN cmdWhoami(args)
     WHEN "workspace"
-      RETURN notImplemented("workspace")
+      RETURN cmdWorkspace(args)
     WHEN "ws"
-      RETURN notImplemented("workspace")
+      RETURN cmdWorkspace(args)
     WHEN "run"
-      RETURN notImplemented("run")
+      RETURN runner.cmdRun(args)
     WHEN "bdl"
-      RETURN notImplemented("bdl")
+      RETURN runner.cmdBdl(args)
     WHEN "docs"
-      RETURN notImplemented("docs")
+      RETURN runner.cmdDocs(args)
     OTHERWISE
       RETURN fail(SFMT('unknown command: "%1"\nRun \'fglpkg help\' for usage',
               cmd))
@@ -155,12 +160,6 @@ END FUNCTION
 PRIVATE FUNCTION fail(msg STRING) RETURNS INT
   CALL fglpkgutils.printStderr(msg)
   RETURN 1
-END FUNCTION
-
-PRIVATE FUNCTION notImplemented(name STRING) RETURNS INT
-  RETURN fail(
-      SFMT("'fglpkg %1' is not implemented yet in the 4GL port — use the Go fglpkg binary for this command",
-          name))
 END FUNCTION
 
 --─── init ───────────────────────────────────────────────────────────────────
@@ -1025,6 +1024,83 @@ PRIVATE FUNCTION requireCleanGitTree() RETURNS STRING
         out)
   END IF
   RETURN NULL
+END FUNCTION
+
+--─── workspace ──────────────────────────────────────────────────────────────
+
+PRIVATE FUNCTION cmdWorkspace(args fglpkgutils.TStringArr) RETURNS INT
+  DEFINE members fglpkgutils.TStringArr
+  DEFINE ok BOOLEAN
+  DEFINE ws workspace.TWorkspace
+  DEFINE err STRING
+  DEFINE i INT
+  IF args.getLength() == 0 THEN
+    RETURN fail("usage: fglpkg workspace <init|add|list|info>")
+  END IF
+  CASE args[1]
+    WHEN "init"
+      IF workspace.workspaceExists(".") THEN
+        RETURN fail(SFMT("%1 already exists in the current directory",
+                workspace.WORKSPACE_FILENAME))
+      END IF
+      FOR i = 2 TO args.getLength()
+        LET members[members.getLength() + 1] = args[i]
+      END FOR
+      LET err = workspace.init(".", members)
+      IF err IS NOT NULL THEN
+        RETURN fail(err)
+      END IF
+      DISPLAY SFMT("%1 Created %2",
+          fglpkgutils.C_CHECK, workspace.WORKSPACE_FILENAME)
+      RETURN 0
+    WHEN "add"
+      IF args.getLength() < 2 THEN
+        RETURN fail("usage: fglpkg workspace add <path>")
+      END IF
+      VAR addRoot = workspace.findRoot(".")
+      IF addRoot IS NULL THEN
+        RETURN fail("not inside a workspace — run 'fglpkg workspace init' first")
+      END IF
+      FOR i = 2 TO args.getLength()
+        LET err = workspace.addMember(addRoot, args[i])
+        IF err IS NOT NULL THEN
+          RETURN fail(err)
+        END IF
+        DISPLAY SFMT('%1 Added "%2" to workspace',
+            fglpkgutils.C_CHECK, args[i])
+      END FOR
+      RETURN 0
+    WHEN "list"
+      VAR listRoot = workspace.findRoot(".")
+      IF listRoot IS NULL THEN
+        RETURN fail("not inside a workspace")
+      END IF
+      CALL workspace.load(listRoot) RETURNING ok, ws, err
+      IF NOT ok THEN
+        RETURN fail(err)
+      END IF
+      DISPLAY SFMT("Workspace: %1", listRoot)
+      FOR i = 1 TO ws.members.getLength()
+        DISPLAY SFMT("  %1 v%2",
+            fglpkgutils.padRight(ws.members[i].m.name, 30),
+            ws.members[i].m.version)
+      END FOR
+      RETURN 0
+    WHEN "info"
+      VAR infoRoot = workspace.findRoot(".")
+      IF infoRoot IS NULL THEN
+        RETURN fail("not inside a workspace")
+      END IF
+      CALL workspace.load(infoRoot) RETURNING ok, ws, err
+      IF NOT ok THEN
+        RETURN fail(err)
+      END IF
+      CALL fglpkgutils.printStdoutNoNL(workspace.summary(ws))
+      RETURN 0
+    OTHERWISE
+      RETURN fail(SFMT('unknown workspace subcommand "%1"', args[1]))
+  END CASE
+  RETURN 0
 END FUNCTION
 
 --─── login / logout / whoami ────────────────────────────────────────────────

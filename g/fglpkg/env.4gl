@@ -5,6 +5,7 @@ PACKAGE fglpkg
 IMPORT os
 IMPORT FGL fglpkg.fglpkgutils
 IMPORT FGL fglpkg.glob
+IMPORT FGL fglpkg.workspace
 &include "myassert.inc"
 
 #+shell export lines suitable for eval; fglpkg-managed paths are prepended
@@ -112,11 +113,21 @@ FUNCTION generateGWA(home STRING) RETURNS fglpkgutils.TStringArr
 END FUNCTION
 
 #+the raw fglpkg-managed FGLLDPATH value (no export prefix);
-#+precedence: local .fglpkg/packages entries, then global packages
-#+(workspace member paths join here in the workspace phase)
+#+precedence: workspace member dirs, then local .fglpkg/packages entries,
+#+then global packages
 FUNCTION buildFGLLDPATH(home STRING) RETURNS STRING
   DEFINE parts fglpkgutils.TStringArr
   DEFINE seen DICTIONARY OF BOOLEAN
+  DEFINE ok BOOLEAN
+  DEFINE ws workspace.TWorkspace
+  DEFINE err STRING
+  VAR wsRoot = workspace.findRoot(".")
+  IF wsRoot IS NOT NULL THEN
+    CALL workspace.load(wsRoot) RETURNING ok, ws, err
+    IF ok THEN
+      CALL addAll(parts, seen, workspace.fglldpathEntries(ws))
+    END IF
+  END IF
   VAR globalPkgs = fglpkgutils.packagesDir(home)
   VAR localPkgs = os.Path.fullPath(os.Path.join(".fglpkg", "packages"))
   IF localPkgs != globalPkgs THEN

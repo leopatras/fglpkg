@@ -175,6 +175,19 @@ class Handler(BaseHTTPRequestHandler):
                                         "expires_in": 3600})
             return self._send(400, {"error": "bad grant"})
 
+        if url.path == "/v1/query":
+            # OSV.dev stand-in: canned vulns per purl from <statedir>/osv.json
+            # ({purl: {vulns: [...]}}); unknown purls get the empty object,
+            # matching the real service. No auth required.
+            payload = json.loads(body)
+            purl = payload.get("package", {}).get("purl", "")
+            canned = {}
+            osv_file = os.path.join(STATEDIR, "osv.json")
+            if os.path.exists(osv_file):
+                with open(osv_file) as f:
+                    canned = json.load(f)
+            return self._send(200, canned.get(purl, {}))
+
         if bearer_of(self) not in VALID_TOKENS:
             return self._send(401, {"error": "unauthorised"})
 

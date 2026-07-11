@@ -263,7 +263,11 @@ PRIVATE FUNCTION initCommands()
       || "EXIT CODES:\n"
       || "  0  no findings at or above --severity\n"
       || "  1  one or more findings at or above --severity\n"
-      || "  2  audit itself failed (missing lockfile, network error, etc.)\n",
+      || "  2  audit itself failed (missing lockfile, network error, etc.)\n"
+      || "\n"
+      || "NOTES:\n"
+      || "  Java JARs are audited against the OSV.dev v1 API (anonymous, free).\n"
+      || "  BDL packages are not scanned in this version (no public advisory feed).\n",
       FALSE)
   CALL addCommand("sbom", "",
       "Emit a CycloneDX SBOM for the project from fglpkg.lock",
@@ -274,7 +278,12 @@ PRIVATE FUNCTION initCommands()
       || "  -o, --output <path>             Write to file instead of stdout\n"
       || "  --pretty                        Indented JSON (default: compact)\n"
       || "  --production, --prod            Skip dev-scoped JARs\n"
-      || "  --format=<cyclonedx|spdx>       Output format. Default: cyclonedx\n",
+      || "  --format=<cyclonedx|spdx>       Output format. Default: cyclonedx\n"
+      || "                                  (spdx is reserved for a future release)\n"
+      || "\n"
+      || "NOTES:\n"
+      || "  v1 emits CycloneDX 1.5 JSON, generated from fglpkg.lock. No network\n"
+      || "  calls — output is deterministic given the lockfile.\n",
       FALSE)
   CALL addCommand("completion", "",
       "Print shell completion script",
@@ -306,7 +315,9 @@ PRIVATE FUNCTION initCommands()
       || "  --ci                     Non-interactive mode for pipelines: requires\n"
       || "                           FGLPKG_TOKEN and prints a machine-readable status line\n"
       || "  --private                Mark the package private on first publish\n"
-      || "  --public                 Mark the package public on first publish (default)\n",
+      || "  --public                 Mark the package public on first publish (default)\n"
+      || "\n"
+      || "Builds the package zip, uploads it, and submits the version for admin review.\n",
       FALSE)
   CALL addCommand("pack", "",
       "Build the publishable zip locally without uploading",
@@ -326,7 +337,9 @@ PRIVATE FUNCTION initCommands()
       "fglpkg login [--token <PAT>]",
       "FLAGS:\n"
       || "  --token <PAT>            Store a Personal Access Token instead of the\n"
-      || "                           browser OAuth flow (for CI / non-interactive use)\n",
+      || "                           browser OAuth flow (for CI / non-interactive use)\n"
+      || "\n"
+      || "With no flags, opens a browser to complete an OAuth (code + PKCE) login.\n",
       FALSE)
   CALL addCommand("logout", "",
       "Remove saved credentials", "",

@@ -17,6 +17,7 @@ IMPORT FGL fglpkg.semver
 IMPORT FGL fglpkg.manifest
 IMPORT FGL fglpkg.genero
 IMPORT FGL fglpkg.registry
+IMPORT FGL fglpkg.workspace
 &include "myassert.inc"
 
 PUBLIC CONSTANT REQUIRED_BY_ROOT = "<root>"
@@ -93,6 +94,8 @@ DEFINE _fetchVersions TVersionFetcher
 DEFINE _fetchInfo TInfoFetcher
 DEFINE _gv genero.TGeneroVersion
 DEFINE _gvSet BOOLEAN
+DEFINE _ws workspace.TWorkspace
+DEFINE _wsSet BOOLEAN
 
 DEFINE _queue DYNAMIC ARRAY OF TWorkItem
 DEFINE _queueHead INT
@@ -106,12 +109,22 @@ DEFINE _conflicted DICTIONARY OF BOOLEAN
 DEFINE _orderSeq INT
 DEFINE _optionalSkipped fglpkgutils.TStringArr
 
-#+injects fetchers and a fixed Genero version (tests)
+#+injects fetchers and a fixed Genero version (tests); also pins an
+#+empty workspace so tests stay hermetic (inject one via setWorkspace)
 FUNCTION setFetchers(fv TVersionFetcher, fi TInfoFetcher, gv genero.TGeneroVersion)
+  DEFINE none workspace.TWorkspace
   LET _fetchVersions = fv
   LET _fetchInfo = fi
   LET _gv = gv
   LET _gvSet = TRUE
+  LET _ws = none
+  LET _wsSet = TRUE
+END FUNCTION
+
+#+attaches a workspace (tests / explicit callers)
+FUNCTION setWorkspace(ws workspace.TWorkspace)
+  LET _ws = ws
+  LET _wsSet = TRUE
 END FUNCTION
 
 #+resets fetchers to the live registry + auto-detection defaults
@@ -156,6 +169,16 @@ FUNCTION resolveWithOptions(
       RETURN FALSE, empty, SFMT("cannot create resolver: %1", err)
     END IF
     LET _gvSet = TRUE
+  END IF
+  IF NOT _wsSet THEN
+    VAR wsRoot = workspace.findRoot(".")
+    IF wsRoot IS NOT NULL THEN
+      CALL workspace.load(wsRoot) RETURNING ok, _ws, err
+      IF NOT ok THEN
+        RETURN FALSE, empty, SFMT("cannot load workspace: %1", err)
+      END IF
+    END IF
+    LET _wsSet = TRUE
   END IF
 
   CALL genero.satisfiesGenero(_gv, root.genero) RETURNING sat, err
@@ -296,10 +319,26 @@ PRIVATE FUNCTION resetState()
   CALL _optionalSkipped.clear()
 END FUNCTION
 
-#+workspace member lookup — Phase 1 stub, the workspace phase fills this in
+#+records a workspace member as a LocalMember and reports the hit;
+#+local members resolve from disk — never from the registry or the lock
 PRIVATE FUNCTION lookupLocalMember(name STRING) RETURNS BOOLEAN
-  UNUSED_VAR(name)
-  RETURN FALSE
+  DEFINE lm TLocalMember
+  VAR mi = memberOf(name)
+  IF mi == 0 THEN
+    RETURN FALSE
+  END IF
+  LET lm.name = _ws.members[mi].m.name
+  LET lm.version = _ws.members[mi].m.version
+  LET lm.path = _ws.members[mi].path
+  LET _localMembers[lm.name] = lm
+  RETURN TRUE
+END FUNCTION
+
+PRIVATE FUNCTION memberOf(name STRING) RETURNS INT
+  IF NOT _ws.loaded THEN
+    RETURN 0
+  END IF
+  RETURN workspace.memberIndex(_ws, name)
 END FUNCTION
 
 PRIVATE FUNCTION enqueueWork(
@@ -312,11 +351,32 @@ PRIVATE FUNCTION enqueueWork(
   LET _queue[_queue.getLength() + 1] = item
 END FUNCTION
 
-#+adds a single scope's root dependencies to the work queue
+#+adds a single scope's root dependencies to the work queue;
+#+workspace-local members short-circuit to disk and their own production
+#+deps are walked with the same root scope (Go parity)
 PRIVATE FUNCTION enqueueRootBucket(deps manifest.TDependencies, scope STRING)
-  DEFINE i INT
+  DEFINE i, j INT
+  DEFINE hit BOOLEAN
   VAR names = deps.fgl.getKeys()
   FOR i = 1 TO names.getLength()
+    VAR mi = memberOf(names[i])
+    IF mi > 0 THEN
+      LET hit = lookupLocalMember(names[i])
+      VAR depNames = _ws.members[mi].m.dependencies.fgl.getKeys()
+      FOR j = 1 TO depNames.getLength()
+        IF memberOf(depNames[j]) > 0 THEN
+          LET hit = lookupLocalMember(depNames[j])
+        ELSE
+          CALL enqueueWork(depNames[j],
+              _ws.members[mi].m.dependencies.fgl[depNames[j]],
+              names[i], scope)
+        END IF
+      END FOR
+      FOR j = 1 TO _ws.members[mi].m.dependencies.java.getLength()
+        CALL addJARScoped(_ws.members[mi].m.dependencies.java[j], scope)
+      END FOR
+      CONTINUE FOR
+    END IF
     CALL enqueueWork(names[i], deps.fgl[names[i]], REQUIRED_BY_ROOT, scope)
   END FOR
   FOR i = 1 TO deps.java.getLength()

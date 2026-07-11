@@ -25,8 +25,12 @@ Phase 2 (publisher + auth): `publish` (incl. `--dry-run`, `--ci`,
 `--token <PAT>`), `logout`, `whoami`, `outdated`, silent OAuth token
 refresh (incl. the registry 401-retry hook).
 
-Not yet ported (the CLI reports this and defers to the Go binary):
-`audit`, `sbom`, `completion`, `workspace`, `run`, `bdl`, `docs`.
+Phase 3 (full parity): `workspace`/`ws` (monorepo members, topo-sorted
+resolver/env integration), `audit` (OSV.dev, exit codes 0/1/2), `sbom`
+(CycloneDX 1.5), `completion` (bash/zsh/fish/powershell), `bdl` (exact
+child exit-code propagation), `run`, `docs`.
+
+Every command of the Go binary is now ported.
 
 ## Module map (4GL ← Go)
 
@@ -53,6 +57,11 @@ Not yet ported (the CLI reports this and defers to the Go binary):
 | `publish.4gl`     | `cmdPublish` + `publish_validation.go` + `readme.go` |
 | `oauth.4gl`       | `internal/oauth` (PKCE, loopback callback, browser) |
 | `outdated.4gl`    | `internal/cli/outdated.go`                     |
+| `completion.4gl`  | `internal/cli/completion.go`                   |
+| `runner.4gl`      | `cmdBdl`/`cmdRun`/`cmdDocs` from `internal/cli/cli.go` |
+| `workspace.4gl`   | `internal/workspace`                           |
+| `sbom.4gl`        | `internal/cli/sbom.go`                         |
+| `audit.4gl`       | `internal/audit` + `internal/cli/audit.go`     |
 | `fglpkgutils.4gl` | shared helpers (modeled on gwa's `gwautils.4gl`) |
 
 ## Deviations from the Go implementation
@@ -68,10 +77,17 @@ Not yet ported (the CLI reports this and defers to the Go binary):
   headless environments) — a 4GL-port extension.
 - Built zips differ byte-wise from the Go binary's (external Info-ZIP vs
   Go's archive/zip); contents and entry lists are identical.
+- The sbom `serialNumber` uses `security.RandomGenerator.CreateUUIDString()`
+  (lowercased) instead of Go's hand-rolled UUIDv4 — still a valid urn:uuid.
+- `fglpkg audit` reproduces the Go binary's pluralization bug
+  ("2 vulnerabilitie found") for byte-parity; fix both sides together.
 
 ## E2E smoke testing
 
 `test/mock_registry.py <port> <statedir>` implements enough of the
 registry + OAuth protocol to exercise publish/login/whoami/outdated
 headlessly (`FGLPKG_REGISTRY=http://127.0.0.1:<port>`, and
-`FGLPKG_BROWSER="curl -sL"` for the browser OAuth flow).
+`FGLPKG_BROWSER="curl -sL"` for the browser OAuth flow). It also serves
+`POST /v1/query` as an OSV.dev stand-in for `fglpkg audit`
+(`FGLPKG_AUDIT_URL=http://127.0.0.1:<port>/v1/query`), with canned
+responses read from `<statedir>/osv.json` (`{purl: {vulns: [...]}}`).

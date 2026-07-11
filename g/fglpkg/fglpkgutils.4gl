@@ -248,6 +248,19 @@ FUNCTION getProgramOutput(cmd STRING) RETURNS STRING
   RETURN result
 END FUNCTION
 
+#+extracts the child exit code from a RUN ... RETURNING value: on Unix
+#+the value is the raw wait status (exit code << 8); a signal death maps
+#+to 1; Windows returns the exit code directly
+FUNCTION childExitCode(runStatus INT) RETURNS INT
+  IF isWin() THEN
+    RETURN runStatus
+  END IF
+  IF runStatus MOD 256 != 0 THEN
+    RETURN 1 --killed by a signal
+  END IF
+  RETURN runStatus / 256
+END FUNCTION
+
 FUNCTION checkRUN(cmd STRING)
   VAR code = 0
   RUN cmd RETURNING code
