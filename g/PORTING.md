@@ -3,7 +3,8 @@
 How the Genero BDL implementation under `g/fglpkg/` was produced from the
 Go sources, and everything a maintainer needs to keep the two in sync.
 See `g/fglpkg/README.md` for the module map, build instructions and the
-condensed deviations list.
+condensed deviations list, and `g/BENCHMARKS.md` for resolver runtime
+measurements against the Go binary (huge dependency graphs).
 
 ## Goal and parity philosophy
 
