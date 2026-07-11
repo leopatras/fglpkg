@@ -33,8 +33,12 @@ go.work.sum
 
 # Directories
 bin/
-.claude/
 .fglpkg/
+
+# Claude: ignore local settings but track the shared knowledge base
+.claude/*
+!.claude/MEMORY.md
+!.claude/memory/
 
 # Mac Files
 .DS_Store
