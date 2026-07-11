@@ -49,6 +49,12 @@ this repo. Compressed checklist:
   fglpkgutils splitters wrap native split(), prettyJSON explodes to a
   char array once via `split("")`. Details: `g/BENCHMARKS.md`.
 
+- Native `MATCHES` is ~140× faster than an interpreted glob matcher but
+  is NOT filepath.Match: its `*` crosses `/`, malformed patterns match
+  leniently (Go: never), and `NULL MATCHES x` is NULL (Go: "" matches
+  "*"). Equivalent ONLY for slashless operands with patterns free of
+  `[` and `\` — glob.pathMatch fast-paths exactly that shape (proven by
+  a 238k-pair differential fuzz; see g/BENCHMARKS.md).
 - Hand-rolled insertion sorts are O(n²) interpreted comparisons — 2min+
   for 10k path strings. Use `DYNAMIC ARRAY.sortByComparisonFunction`
   (since 4.01.03, FGL-5904; first arg = record member or NULL for flat

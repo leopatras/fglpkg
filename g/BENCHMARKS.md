@@ -139,3 +139,26 @@ while Go sorts them by name (`internal/sbom/cyclonedx.go`); invisible
 with fglpkg-written locks (sorted on save), wrong for hand-edited ones.
 Fixed (sorted copies for components + dependency edges) with a
 regression test in testsbom.
+
+## glob.pathMatch: MATCHES fast path (fixed 2026-07-11)
+
+Last char-loop candidate, prompted by Leo: `pathMatch` (the
+`filepath.Match` port) is a recursive backtracking matcher at ~12.7 µs
+per call — noticeable in aggregate because its hot shape is
+ignore-rules × tree-entries during `pack` (200k calls ≈ 2.5 s).
+
+Genero's native `MATCHES` operator is the same glob language and ~140×
+faster, but NOT a drop-in: its `*` crosses `/` (filepath.Match's must
+not), it is lenient with malformed patterns (Go's never match), and
+`NULL MATCHES x` is NULL (Go matches "" against "*"). However, for
+**single-segment operands with simple patterns** the two are
+equivalent — proven by an exhaustive differential test (238 000
+pattern/name pairs over a glob alphabet, zero mismatches under both
+length semantics; collation ranges like `[A-Z]` also agreed byte-wise).
+
+Fix: `pathMatch` now delegates to `MATCHES` when pattern and name
+contain no `/` and the pattern contains no `[` and no `\`; everything
+else keeps the exact slow path. Hot shape: 12.7 µs → 0.36 µs per call
+(35×, guard included). The full pattern language still goes through
+`matchFrom`, so filepath.Match parity is unchanged (testglob's 66
+checks cover classes, escapes, separators and malformed patterns).
