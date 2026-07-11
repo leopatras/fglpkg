@@ -851,22 +851,32 @@ END FUNCTION
 
 #+re-indents a compact JSON string with 2 space indentation
 #+(string-literal aware; matches Go json.MarshalIndent layout)
+#+the input is exploded into a char array once: positional getCharAt/
+#+subString cost O(position) in UTF-8 environments, which would make
+#+a walk-and-peek loop over the raw string quadratic on large documents
 FUNCTION prettyJSON(s STRING) RETURNS STRING
-  DEFINE i, depth INT
+  DEFINE i, len, depth INT
   DEFINE c STRING
   DEFINE inStr BOOLEAN
+  DEFINE chars fglpkgutils.TStringArr
   VAR sb = base.StringBuffer.create()
-  VAR len = s.getLength()
+  VAR exploded = s.split("") --first/last elements are empty
+  FOR i = 1 TO exploded.getLength()
+    IF exploded[i].getLength() > 0 THEN
+      LET chars[chars.getLength() + 1] = exploded[i]
+    END IF
+  END FOR
+  LET len = chars.getLength()
   LET i = 1
   WHILE i <= len
-    LET c = s.getCharAt(i)
+    LET c = chars[i]
     IF inStr THEN
       CALL sb.append(c)
       IF c == "\\" THEN
         --copy the escaped character verbatim
         LET i = i + 1
         IF i <= len THEN
-          CALL sb.append(s.getCharAt(i))
+          CALL sb.append(chars[i])
         END IF
       ELSE
         IF c == '"' THEN
@@ -879,7 +889,7 @@ FUNCTION prettyJSON(s STRING) RETURNS STRING
           LET inStr = TRUE
           CALL sb.append(c)
         WHEN "{"
-          IF i < len AND s.getCharAt(i + 1) == "}" THEN
+          IF i < len AND chars[i + 1] == "}" THEN
             CALL sb.append("{}")
             LET i = i + 1
           ELSE
@@ -888,7 +898,7 @@ FUNCTION prettyJSON(s STRING) RETURNS STRING
             CALL appendNewlineIndent(sb, depth)
           END IF
         WHEN "["
-          IF i < len AND s.getCharAt(i + 1) == "]" THEN
+          IF i < len AND chars[i + 1] == "]" THEN
             CALL sb.append("[]")
             LET i = i + 1
           ELSE

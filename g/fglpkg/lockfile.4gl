@@ -398,45 +398,16 @@ FUNCTION filterForProduction(lf TLockfile) RETURNS TLockfile
 END FUNCTION
 
 --─── sorting helpers ────────────────────────────────────────────────────────
+--native sort driver with the byte-wise comparator (Go sort.Slice parity)
 
 PRIVATE FUNCTION sortPackagesByName(arr TLockedPackages)
-  DEFINE i, j INT
-  DEFINE tmp TLockedPackage
-  FOR i = 2 TO arr.getLength()
-    LET j = i
-    WHILE j > 1 AND fglpkgutils.cmpBytes(arr[j].name, arr[j - 1].name) < 0
-      LET tmp = arr[j]
-      LET arr[j] = arr[j - 1]
-      LET arr[j - 1] = tmp
-      LET j = j - 1
-    END WHILE
-  END FOR
+  CALL arr.sortByComparisonFunction("name", FALSE, FUNCTION fglpkgutils.cmpBytes)
 END FUNCTION
 
 PRIVATE FUNCTION sortWebcomponentsByName(arr TLockedWebcomponents)
-  DEFINE i, j INT
-  DEFINE tmp TLockedWebcomponent
-  FOR i = 2 TO arr.getLength()
-    LET j = i
-    WHILE j > 1 AND fglpkgutils.cmpBytes(arr[j].name, arr[j - 1].name) < 0
-      LET tmp = arr[j]
-      LET arr[j] = arr[j - 1]
-      LET arr[j - 1] = tmp
-      LET j = j - 1
-    END WHILE
-  END FOR
+  CALL arr.sortByComparisonFunction("name", FALSE, FUNCTION fglpkgutils.cmpBytes)
 END FUNCTION
 
 PRIVATE FUNCTION sortJarsByKey(arr TLockedJARs)
-  DEFINE i, j INT
-  DEFINE tmp TLockedJAR
-  FOR i = 2 TO arr.getLength()
-    LET j = i
-    WHILE j > 1 AND fglpkgutils.cmpBytes(arr[j].key, arr[j - 1].key) < 0
-      LET tmp = arr[j]
-      LET arr[j] = arr[j - 1]
-      LET arr[j - 1] = tmp
-      LET j = j - 1
-    END WHILE
-  END FOR
+  CALL arr.sortByComparisonFunction("key", FALSE, FUNCTION fglpkgutils.cmpBytes)
 END FUNCTION

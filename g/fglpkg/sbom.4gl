@@ -132,14 +132,17 @@ FUNCTION buildSbom(lf lockfile.TLockfile, production BOOLEAN,
   CALL doc.put("metadata", metadata)
 
   --sorted copies of the package/jar lists (the lockfile is already
-  --sorted on save, but a hand-written lock may not be)
+  --sorted on save, but a hand-written lock may not be); Go sorts both
+  --in internal/sbom/cyclonedx.go for stable output
+  VAR pkgs lockfile.TLockedPackages
+  CALL lf.packages.copyTo(pkgs)
+  CALL pkgs.sortByComparisonFunction("name", FALSE, FUNCTION fglpkgutils.cmpBytes)
   VAR jars = sortedJars(lf, production)
 
   --components
   VAR components = util.JSONArray.create()
-  FOR i = 1 TO lf.packages.getLength()
-    CALL components.put(components.getLength() + 1,
-        bdlComponent(lf.packages[i]))
+  FOR i = 1 TO pkgs.getLength()
+    CALL components.put(components.getLength() + 1, bdlComponent(pkgs[i]))
   END FOR
   FOR i = 1 TO jars.getLength()
     CALL components.put(components.getLength() + 1, jarComponent(jars[i]))
@@ -149,7 +152,7 @@ FUNCTION buildSbom(lf lockfile.TLockfile, production BOOLEAN,
   END IF
 
   --dependency edges
-  VAR deps = buildDependencyEdges(lf, jars)
+  VAR deps = buildDependencyEdges(pkgs, jars)
   IF deps.getLength() > 0 THEN
     CALL doc.put("dependencies", deps)
   END IF
@@ -236,23 +239,14 @@ END FUNCTION
 PRIVATE FUNCTION sortedJars(lf lockfile.TLockfile, production BOOLEAN)
     RETURNS lockfile.TLockedJARs
   DEFINE out lockfile.TLockedJARs
-  DEFINE tmp lockfile.TLockedJAR
-  DEFINE i, j INT
+  DEFINE i INT
   FOR i = 1 TO lf.jars.getLength()
     IF production AND lf.jars[i].scope == "dev" THEN
       CONTINUE FOR
     END IF
     LET out[out.getLength() + 1] = lf.jars[i]
   END FOR
-  FOR i = 2 TO out.getLength()
-    LET j = i
-    WHILE j > 1 AND fglpkgutils.cmpBytes(out[j].key, out[j - 1].key) < 0
-      LET tmp = out[j]
-      LET out[j] = out[j - 1]
-      LET out[j - 1] = tmp
-      LET j = j - 1
-    END WHILE
-  END FOR
+  CALL out.sortByComparisonFunction("key", FALSE, FUNCTION fglpkgutils.cmpBytes)
   RETURN out
 END FUNCTION
 
@@ -260,24 +254,24 @@ END FUNCTION
 #+unknown parents collapse to root), all JARs under root; edges appear
 #+in first-seen parent order
 PRIVATE FUNCTION buildDependencyEdges(
-    lf lockfile.TLockfile, jars lockfile.TLockedJARs)
+    pkgs lockfile.TLockedPackages, jars lockfile.TLockedJARs)
     RETURNS util.JSONArray
   DEFINE children DICTIONARY OF fglpkgutils.TStringArr
   DEFINE order fglpkgutils.TStringArr
   DEFINE i, j INT
 
-  FOR i = 1 TO lf.packages.getLength()
-    VAR childPurl = bdlPurl(lf.packages[i].name, lf.packages[i].version)
-    IF lf.packages[i].requiredBy.getLength() == 0 THEN
+  FOR i = 1 TO pkgs.getLength()
+    VAR childPurl = bdlPurl(pkgs[i].name, pkgs[i].version)
+    IF pkgs[i].requiredBy.getLength() == 0 THEN
       CALL addEdge(children, order, "root", childPurl)
       CONTINUE FOR
     END IF
-    FOR j = 1 TO lf.packages[i].requiredBy.getLength()
-      VAR parent = lf.packages[i].requiredBy[j]
+    FOR j = 1 TO pkgs[i].requiredBy.getLength()
+      VAR parent = pkgs[i].requiredBy[j]
       IF parent == "<root>" THEN
         CALL addEdge(children, order, "root", childPurl)
       ELSE
-        VAR pv = findPkgVersion(lf, parent)
+        VAR pv = findPkgVersion(pkgs, parent)
         IF pv IS NULL THEN
           CALL addEdge(children, order, "root", childPurl)
         ELSE
@@ -317,12 +311,12 @@ PRIVATE FUNCTION addEdge(
   LET children[parent][children[parent].getLength() + 1] = child
 END FUNCTION
 
-PRIVATE FUNCTION findPkgVersion(lf lockfile.TLockfile, name STRING)
+PRIVATE FUNCTION findPkgVersion(pkgs lockfile.TLockedPackages, name STRING)
     RETURNS STRING
   DEFINE i INT
-  FOR i = 1 TO lf.packages.getLength()
-    IF lf.packages[i].name == name THEN
-      RETURN lf.packages[i].version
+  FOR i = 1 TO pkgs.getLength()
+    IF pkgs[i].name == name THEN
+      RETURN pkgs[i].version
     END IF
   END FOR
   RETURN NULL

@@ -206,18 +206,11 @@ PRIVATE FUNCTION collectFilesInt(
 END FUNCTION
 
 #+sorts a string array byte-wise (deterministic, locale independent)
+#+native sort driver (since 4.01.03, FGL-5904): the previous insertion
+#+sort was O(n^2) interpreted comparisons — 2min+ for a 10k-entry file
+#+list (see g/BENCHMARKS.md)
 FUNCTION sortBytewise(arr fglpkgutils.TStringArr)
-  DEFINE i, j INT
-  DEFINE tmp STRING
-  FOR i = 2 TO arr.getLength()
-    LET j = i
-    WHILE j > 1 AND fglpkgutils.cmpBytes(arr[j], arr[j - 1]) < 0
-      LET tmp = arr[j]
-      LET arr[j] = arr[j - 1]
-      LET arr[j - 1] = tmp
-      LET j = j - 1
-    END WHILE
-  END FOR
+  CALL arr.sortByComparisonFunction(NULL, FALSE, FUNCTION fglpkgutils.cmpBytes)
 END FUNCTION
 
 PRIVATE FUNCTION trimRightChar(s STRING, c STRING) RETURNS STRING

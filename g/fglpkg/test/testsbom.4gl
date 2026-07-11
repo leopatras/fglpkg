@@ -11,8 +11,45 @@ MAIN
   CALL testDocumentShape()
   CALL testProductionFilter()
   CALL testEdges()
+  CALL testUnsortedInput()
   TSUMMARY()
 END MAIN
+
+#+a hand-written lock may not be sorted; components must come out in
+#+byte-wise name/key order like Go (internal/sbom sorts copies on build)
+FUNCTION testUnsortedInput()
+  DEFINE lf lockfile.TLockfile
+  DEFINE doc, comp util.JSONObject
+  DEFINE comps util.JSONArray
+  LET lf.rootManifest.name = "app"
+  LET lf.packages[1].name = "zeta"
+  LET lf.packages[1].version = "1.0.0"
+  LET lf.packages[2].name = "Alpha" --byte-wise: uppercase sorts first
+  LET lf.packages[2].version = "1.0.0"
+  LET lf.jars[1].key = "org.z:zz"
+  LET lf.jars[1].groupId = "org.z"
+  LET lf.jars[1].artifactId = "zz"
+  LET lf.jars[1].version = "1.0"
+  LET lf.jars[2].key = "COM.a:aa"
+  LET lf.jars[2].groupId = "COM.a"
+  LET lf.jars[2].artifactId = "aa"
+  LET lf.jars[2].version = "1.0"
+  VAR js = sbom.buildSbom(lf, FALSE, "9.9.9")
+  LET doc = util.JSONObject.parse(js)
+  LET comps = doc.get("components")
+  TEQ(comps.getLength(), 4)
+  LET comp = comps.get(1)
+  TEQ(comp.get("name"), "Alpha")
+  LET comp = comps.get(2)
+  TEQ(comp.get("name"), "zeta")
+  LET comp = comps.get(3)
+  TEQ(comp.get("purl"), "pkg:maven/COM.a/aa@1.0")
+  LET comp = comps.get(4)
+  TEQ(comp.get("purl"), "pkg:maven/org.z/zz@1.0")
+  --input lockfile must not be mutated (sorted copies only)
+  TEQ(lf.packages[1].name, "zeta")
+  TEQ(lf.jars[1].key, "org.z:zz")
+END FUNCTION
 
 FUNCTION fixtureLock() RETURNS lockfile.TLockfile
   DEFINE lf lockfile.TLockfile

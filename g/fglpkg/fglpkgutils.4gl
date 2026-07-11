@@ -500,71 +500,81 @@ FUNCTION sortStringArray(arr TStringArr)
   CALL arr.sort(NULL, FALSE)
 END FUNCTION
 
-#+splits a string on a single character separator (no regex)
+#+escapes regex metacharacters so STRING.split matches s literally
+#+(like Go regexp.QuoteMeta; split/replaceAll take regex patterns)
+FUNCTION quoteRegexp(s STRING) RETURNS STRING
+  DEFINE i INT
+  CONSTANT metachars = "\\.+*?()|[]{}^$"
+  VAR sb = base.StringBuffer.create()
+  VAR chars = s.split("") --explode to chars (UTF-8 safe, incl. empties)
+  FOR i = 1 TO chars.getLength()
+    IF chars[i].getLength() == 0 THEN
+      CONTINUE FOR
+    END IF
+    IF metachars.getIndexOf(chars[i], 1) > 0 THEN
+      CALL sb.append("\\")
+    END IF
+    CALL sb.append(chars[i])
+  END FOR
+  RETURN sb.toString()
+END FUNCTION
+
+#+splits a string on a literal single-character separator
+#+(native split: getCharAt/subString walk-and-slice loops are O(n^2) —
+#+subString costs O(start) even under byte length semantics)
 FUNCTION splitOnChar(s STRING, sep STRING) RETURNS TStringArr
   DEFINE arr TStringArr
-  DEFINE i, len, start INT
-  LET len = s.getLength()
-  LET start = 1
-  FOR i = 1 TO len
-    IF s.getCharAt(i) == sep THEN
-      LET arr[arr.getLength() + 1] = IIF(i > start, s.subString(start, i - 1), "")
-      LET start = i + 1
+  DEFINE i INT
+  IF sep IS NULL OR s IS NULL THEN
+    --no separator ever matches / NULL input: one (empty) field,
+    --same as the historical hand-rolled loop
+    LET arr[1] = NVL(s, "")
+    RETURN arr
+  END IF
+  LET arr = s.split(quoteRegexp(sep))
+  --split yields empty-but-not-NULL fields; the historical loop yielded
+  --"" (= NULL) — normalize so `IS NULL` checks in callers keep working
+  FOR i = 1 TO arr.getLength()
+    IF arr[i].getLength() == 0 THEN
+      LET arr[i] = ""
     END IF
   END FOR
-  LET arr[arr.getLength() + 1] = IIF(len >= start, s.subString(start, len), "")
   RETURN arr
 END FUNCTION
 
-#+splits a string on a multi-character separator (no regex)
+#+splits a string on a literal multi-character separator
 FUNCTION splitOnString(s STRING, sep STRING) RETURNS TStringArr
-  DEFINE arr TStringArr
-  DEFINE idx, start INT
-  LET start = 1
-  WHILE (idx := s.getIndexOf(sep, start)) > 0
-    LET arr[arr.getLength() + 1]
-        = IIF(idx > start, s.subString(start, idx - 1), "")
-    LET start = idx + sep.getLength()
-  END WHILE
-  LET arr[arr.getLength() + 1]
-      = IIF(s.getLength() >= start, s.subString(start, s.getLength()), "")
-  RETURN arr
+  RETURN splitOnChar(s, sep)
 END FUNCTION
 
-#+splits a string on whitespace runs (like Go strings.Fields)
+#+splits a string on whitespace runs (like Go strings.Fields:
+#+no empty fields, all-whitespace input yields an empty array)
 FUNCTION splitFields(s STRING) RETURNS TStringArr
   DEFINE arr TStringArr
-  DEFINE i, len, start INT
-  DEFINE c STRING
-  LET len = s.getLength()
-  LET start = 0
-  FOR i = 1 TO len
-    LET c = s.getCharAt(i)
-    IF c == " " OR c == "\t" OR c == "\n" OR c == "\r" THEN
-      IF start > 0 THEN
-        LET arr[arr.getLength() + 1] = s.subString(start, i - 1)
-        LET start = 0
-      END IF
-    ELSE
-      IF start == 0 THEN
-        LET start = i
-      END IF
+  DEFINE i INT
+  IF s IS NULL THEN
+    RETURN arr
+  END IF
+  VAR parts = s.split("[ \t\n\r]+")
+  FOR i = 1 TO parts.getLength()
+    IF parts[i].getLength() > 0 THEN
+      LET arr[arr.getLength() + 1] = parts[i]
     END IF
   END FOR
-  IF start > 0 THEN
-    LET arr[arr.getLength() + 1] = s.subString(start, len)
-  END IF
   RETURN arr
 END FUNCTION
 
 #+byte-wise string comparison (like Go strings.Compare, no collation)
-FUNCTION cmpBytes(a STRING, b STRING) RETURNS INT
+#+params are named s1/s2 so this can be passed to
+#+sortByComparisonFunction — function-reference compatibility in Genero
+#+includes the parameter NAMES, not just the types
+FUNCTION cmpBytes(s1 STRING, s2 STRING) RETURNS INTEGER
   DEFINE i, alen, blen, ca, cb INT
-  LET alen = a.getLength()
-  LET blen = b.getLength()
+  LET alen = s1.getLength()
+  LET blen = s2.getLength()
   FOR i = 1 TO IIF(alen < blen, alen, blen)
-    LET ca = ORD(a.getCharAt(i))
-    LET cb = ORD(b.getCharAt(i))
+    LET ca = ORD(s1.getCharAt(i))
+    LET cb = ORD(s2.getCharAt(i))
     IF ca != cb THEN
       RETURN IIF(ca < cb, -1, 1)
     END IF
