@@ -858,14 +858,8 @@ FUNCTION prettyJSON(s STRING) RETURNS STRING
   DEFINE i, len, depth INT
   DEFINE c STRING
   DEFINE inStr BOOLEAN
-  DEFINE chars fglpkgutils.TStringArr
   VAR sb = base.StringBuffer.create()
-  VAR exploded = s.split("") --first/last elements are empty
-  FOR i = 1 TO exploded.getLength()
-    IF exploded[i].getLength() > 0 THEN
-      LET chars[chars.getLength() + 1] = exploded[i]
-    END IF
-  END FOR
+  VAR chars = fglpkgutils.explodeChars(s)
   LET len = chars.getLength()
   LET i = 1
   WHILE i <= len

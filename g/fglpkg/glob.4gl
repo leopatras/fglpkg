@@ -46,7 +46,8 @@ END FUNCTION
 #+reports whether a pattern is well formed (mirrors Go filepath.Match
 #+returning ErrBadPattern when probed against a sample name)
 FUNCTION patternValid(pattern STRING) RETURNS BOOLEAN
-  RETURN matchFrom(pattern, 1, "test", 1) != -1
+  RETURN matchFrom(fglpkgutils.explodeChars(pattern), 1,
+      fglpkgutils.explodeChars("test"), 1) != -1
 END FUNCTION
 
 #+shell style pattern matching like Go filepath.Match:
@@ -70,17 +71,25 @@ FUNCTION pathMatch(pattern STRING, name STRING) RETURNS BOOLEAN
       AND name.getIndexOf("/", 1) == 0 THEN
     RETURN name MATCHES pattern
   END IF
-  RETURN matchFrom(pattern, 1, name, 1) == 1
+  RETURN matchFrom(fglpkgutils.explodeChars(pattern), 1,
+      fglpkgutils.explodeChars(name), 1) == 1
 END FUNCTION
 
 #+returns 1 on match, 0 on mismatch, -1 on malformed pattern
-PRIVATE FUNCTION matchFrom(p STRING, pi INT, s STRING, si INT) RETURNS INT
+#+p/s are pre-decoded character arrays (fglpkgutils.explodeChars), not
+#+raw strings: looping getCharAt corrupts multi-byte UTF-8 content
+#+under BYTE semantics (see g/BENCHMARKS.md) — indexing a decoded array
+#+is correct under either semantics and avoids the getCharAt call
+#+entirely, so the CHAR-semantics O(i)-per-call cost doesn't apply here
+PRIVATE FUNCTION matchFrom(
+    p fglpkgutils.TStringArr, pi INT, s fglpkgutils.TStringArr, si INT)
+    RETURNS INT
   DEFINE c STRING
   DEFINE k, r INT
   VAR plen = p.getLength()
   VAR slen = s.getLength()
   WHILE pi <= plen
-    LET c = p.getCharAt(pi)
+    LET c = p[pi]
     CASE c
       WHEN "*"
         --try every split point; '*' cannot consume a '/'
@@ -89,13 +98,13 @@ PRIVATE FUNCTION matchFrom(p STRING, pi INT, s STRING, si INT) RETURNS INT
           IF r != 0 THEN
             RETURN r
           END IF
-          IF k <= slen AND s.getCharAt(k) == "/" THEN
+          IF k <= slen AND s[k] == "/" THEN
             RETURN 0
           END IF
         END FOR
         RETURN 0
       WHEN "?"
-        IF si > slen OR s.getCharAt(si) == "/" THEN
+        IF si > slen OR s[si] == "/" THEN
           RETURN 0
         END IF
         LET pi = pi + 1
@@ -112,13 +121,13 @@ PRIVATE FUNCTION matchFrom(p STRING, pi INT, s STRING, si INT) RETURNS INT
         IF pi > plen THEN
           RETURN -1
         END IF
-        IF si > slen OR s.getCharAt(si) != p.getCharAt(pi) THEN
+        IF si > slen OR s[si] != p[pi] THEN
           RETURN 0
         END IF
         LET pi = pi + 1
         LET si = si + 1
       OTHERWISE
-        IF si > slen OR s.getCharAt(si) != c THEN
+        IF si > slen OR s[si] != c THEN
           RETURN 0
         END IF
         LET pi = pi + 1
@@ -130,17 +139,20 @@ END FUNCTION
 
 #+matches s[si] against the character class starting at p[pi] (== '[');
 #+returns the pattern index after the closing ']' when the char matches,
-#+0 when it doesn't, -1 for a malformed class
-PRIVATE FUNCTION matchClass(p STRING, pi INT, s STRING, si INT) RETURNS INT
+#+0 when it doesn't, -1 for a malformed class. p/s are pre-decoded
+#+character arrays — see matchFrom.
+PRIVATE FUNCTION matchClass(
+    p fglpkgutils.TStringArr, pi INT, s fglpkgutils.TStringArr, si INT)
+    RETURNS INT
   DEFINE lo, hi, ch STRING
   DEFINE negate, matched, any BOOLEAN
   VAR plen = p.getLength()
   IF si > s.getLength() THEN
     RETURN 0
   END IF
-  LET ch = s.getCharAt(si)
+  LET ch = s[si]
   LET pi = pi + 1
-  IF pi <= plen AND p.getCharAt(pi) == "^" THEN
+  IF pi <= plen AND p[pi] == "^" THEN
     LET negate = TRUE
     LET pi = pi + 1
   END IF
@@ -148,31 +160,31 @@ PRIVATE FUNCTION matchClass(p STRING, pi INT, s STRING, si INT) RETURNS INT
     IF pi > plen THEN
       RETURN -1 --unterminated class
     END IF
-    IF p.getCharAt(pi) == "]" AND any THEN
+    IF p[pi] == "]" AND any THEN
       EXIT WHILE
     END IF
     --lo char (with escape)
-    IF p.getCharAt(pi) == "\\" THEN
+    IF p[pi] == "\\" THEN
       LET pi = pi + 1
       IF pi > plen THEN
         RETURN -1
       END IF
     END IF
-    LET lo = p.getCharAt(pi)
+    LET lo = p[pi]
     LET hi = lo
     LET pi = pi + 1
-    IF pi <= plen AND p.getCharAt(pi) == "-" THEN
+    IF pi <= plen AND p[pi] == "-" THEN
       LET pi = pi + 1
       IF pi > plen THEN
         RETURN -1
       END IF
-      IF p.getCharAt(pi) == "\\" THEN
+      IF p[pi] == "\\" THEN
         LET pi = pi + 1
         IF pi > plen THEN
           RETURN -1
         END IF
       END IF
-      LET hi = p.getCharAt(pi)
+      LET hi = p[pi]
       LET pi = pi + 1
     END IF
     IF ORD(ch) >= ORD(lo) AND ORD(ch) <= ORD(hi) THEN

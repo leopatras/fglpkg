@@ -140,6 +140,57 @@ with fglpkg-written locks (sorted on save), wrong for hand-edited ones.
 Fixed (sorted copies for components + dependency edges) with a
 regression test in testsbom.
 
+## fglpkgutils.sortStringArray: locale collation vs byte order (fixed 2026-07-13)
+
+Audit prompted by Leo, once the Go binary stopped being a required
+parity target: does `sortStringArray` (used by `fglpkg info`'s
+dependency listing, `fglpkg outdated`, and `resolver.buildPlan`'s JAR
+key ordering) need `cmpBytes`, or would the plain built-in
+`arr.sort(NULL, FALSE)` do? It was still using the plain sort — missed
+by the `sortBytewise`/lockfile/sbom pass above because it's a
+separately named function.
+
+Measured: `arr.sort(NULL, FALSE)` applies **locale collation**, not
+byte order — verified with `["zebra","Alpha","alpha","apple","Apple",
+"élan","_underscore","10","9","Zebra"]`: plain sort produced
+`_underscore, 10, 9, alpha, Alpha, apple, Apple, élan, zebra, Zebra`
+(punctuation floated to the front, case interleaved), while
+`sortByComparisonFunction(NULL, FALSE, FUNCTION cmpBytes)` produced
+`10, 9, Alpha, Apple, Zebra, _underscore, alpha, apple, zebra, élan` —
+byte-identical to Go's `sort.Strings` on the same input.
+
+For fglpkg's own package names (registry-constrained to lowercase/
+digit/hyphen) the two happen to agree, so this was invisible in
+practice — but that constraint isn't structural: it's enforced only by
+the *external* registry at publish time, on the package's own name;
+nothing in either client validates `dependencies.fgl` **keys**, so a
+hand-authored `fglpkg.json` or workspace member can carry any-case
+names. Maven JAR coordinates (`groupId:artifactId`, sorted by
+`resolver.buildPlan` for JAR install order) are not case-constrained at
+all, and diverge for realistic input:
+`com.Google.code.gson:gson` / `com.google.code.gson:gson` /
+`org.Apache.poi:poi` / `Zend:foo` sort case-insensitively-grouped
+under collation but byte-ordered (`Zend` first) under `cmpBytes` —
+confirmed against the real `resolver.buildPlan` code path with a fake
+Java-dependency fixture, not just a synthetic array.
+
+Why it matters even without a Go target to match: locale-dependent
+order means the same lockfile-generating input can produce different
+JAR install/display order depending on the machine's `LANG`, which
+undermines the reproducibility a lockfile/sbom-generating tool is
+supposed to provide. Decision: keep byte order as the one sort
+behavior everywhere rather than branch human-display code from
+artifact-writing code — simpler to reason about, and package names in
+practice are lowercase-hyphenated so collation wouldn't even look
+different to a user.
+
+Fix: `sortStringArray` now delegates to
+`arr.sortByComparisonFunction(NULL, FALSE, FUNCTION cmpBytes)`, same
+one-line shape as `glob.sortBytewise`. No import changes needed —
+`cmpBytes` already lives in the same module. All three call sites
+(`cli.4gl`, `outdated.4gl`, `resolver.4gl`) get the fix for free; all
+18 test programs / 1100+ checks still pass.
+
 ## glob.pathMatch: MATCHES fast path (fixed 2026-07-11)
 
 Last char-loop candidate, prompted by Leo: `pathMatch` (the
@@ -162,3 +213,96 @@ else keeps the exact slow path. Hot shape: 12.7 µs → 0.36 µs per call
 (35×, guard included). The full pattern language still goes through
 `matchFrom`, so filepath.Match parity is unchanged (testglob's 66
 checks cover classes, escapes, separators and malformed patterns).
+
+## cmpBytes silently corrupted multi-byte characters (fixed 2026-07-13)
+
+Leo pushed back on the earlier "BYTE semantics is correct and fast,
+CHAR semantics is correct but slow" framing — testing with a genuinely
+multi-byte character proved the first half wrong. Dump for `"aéz"`
+(é = U+00E9, UTF-8 `0xC3 0xA9`):
+
+| | `getLength()` | `getCharAt(1)` | `getCharAt(2)` | `getCharAt(3)` | `getCharAt(4)` |
+|---|---:|---:|---:|---:|---:|
+| BYTE semantics | 4 (bytes) | 97 'a' | 195 (0xC3, é's lead byte) | **32 (SPACE)** | 122 'z' |
+| CHAR semantics | 3 (chars) | 97 'a' | 233 (0xE9, é's real code point) | 122 'z' | — |
+
+Under BYTE semantics, `getCharAt` at a byte offset landing on a
+**continuation byte doesn't return that raw byte — it silently
+substitutes a space** (confirmed via `ORD()`, not a display artifact).
+This is the same failure mode behind an old formatting bug (table
+right-trim eating a multibyte `─`), but it's general: **any
+`getCharAt`-loop over BYTE-semantics content silently corrupts
+multi-byte characters**, including `cmpBytes`. For pure-ASCII input
+(registry package names, Maven coordinates so far) this never showed
+up; for anything with accented/CJK content, `cmpBytes` produced wrong
+order relative to Go's true byte-wise `sort.Strings`.
+
+Per [`ORD()`'s documented contract](https://4js.com/online_documentation/fjs-fgl-manual-html/fgl-topics/c_fgl_operators_ORD.html):
+with UTF-8 + CHAR semantics, `ORD()` returns the full Unicode code
+point of a (possibly multi-byte) character; with BYTE semantics it
+returns only the first byte. Since UTF-8 byte order and code-point
+order are equivalent for valid UTF-8, comparing whole decoded
+characters by code point under CHAR semantics reproduces Go's
+byte-wise order exactly — verified: `["café","cafe","café-2","élan",
+"zebra","Ärger","ärger","日本語","aardvark","über"]` sorted via the new
+`cmpBytes` under forced CHAR semantics is **byte-for-byte identical**
+to Go's `sort.Strings` on the same input.
+
+Fix, two parts:
+
+1. **`fglpkgutils.explodeChars(s)`**: decodes a string into one array
+   element per character via `s.split("")`, which is UTF-8-safe and
+   semantics-independent (unlike `getCharAt`). `split("")` always
+   yields exactly `length+2` elements — an empty leading and trailing
+   element bracketing one element per real character — for *any* input
+   including `""`/NULL (verified: both produce the two empty brackets
+   and nothing else); the fix is to drop exactly the first and last
+   elements, not to filter all empties. Per Jira DOC-6487's documented
+   recipe, this is `arr.deleteElement(arr.getLength())` then
+   `arr.deleteElement(1)` (delete the trailing bracket first — deleting
+   index 1 first would shift every element down by one, moving the
+   last real character into the slot the second `deleteElement` call
+   would then remove instead), not a copy into a second array as
+   originally written. `cmpBytes`, `quoteRegexp` and
+   `manifest.prettyJSON` (previously three separate copies of this
+   explode-and-trim logic) now share this one helper.
+2. **`g/fglpkg/fglpkg`/`fglpkg.bat`**: the launcher scripts now set
+   `FGL_LENGTH_SEMANTICS=CHAR` unconditionally (mirroring gwa's
+   `gwabuildtool` wrapper pattern, including `LANG=.fglutf8` on
+   Windows) — required so `ORD()` inside the rewritten `cmpBytes`
+   resolves full code points. `test/Makefile` now exports the same
+   variable so `make test` exercises production's actual semantics
+   mode instead of the interpreter default.
+
+Cost of correctness: `explodeChars` calls `split("")` twice per
+comparison instead of looping `getCharAt`; measured on the same
+10 000 path-like-string benchmark as the sort fix above, `sortBytewise`
+went from 0.8 s (fast but wrong for non-ASCII) to 2.4 s (correct) —
+still nowhere near the pre-sort-fix insertion sort's 2 min 8 s, and the
+slowdown is identical under BYTE and CHAR semantics (confirming it's
+`explodeChars`'s two `split()` calls, not CHAR semantics' `getCharAt`
+cost, that accounts for it — `split()` itself is semantics-independent
+and fast). Switching to the `deleteElement`-based trim (above) cut
+that further: `sortBytewise` at 10 000 entries **2.4 s → 1.48 s**
+(~40% faster) — mutating the `split()` result in place avoids a second
+full-array copy on every comparison.
+
+All 18 test programs / 1100+ checks pass with `FGL_LENGTH_SEMANTICS=CHAR`
+forced for the whole suite.
+
+**Follow-up resolved 2026-07-13:** `glob.pathMatch`'s slow path
+(`matchFrom`/`matchClass`, hit for patterns containing `[`, `\`, or
+`/` — everything else uses the `MATCHES` fast path above) also now
+takes pre-decoded `explodeChars` arrays instead of looping `getCharAt`
+— the recursive algorithm and index semantics are otherwise unchanged
+(each `getCharAt(i)`/`p.getCharAt(pi)` becomes an array index `s[i]`/
+`p[pi]`). Correctness re-verified with a 182-case differential test
+against Go's real `filepath.Match` (classes, ranges, negation, escapes,
+separators, and multi-byte content in both pattern and name) — zero
+mismatches. Performance, isolated before/after on a slow-path class
+pattern against a 1010-character multi-byte name (2000 calls, forced
+CHAR semantics): **9.61 s → 1.11 s (~8.6×)**, then **→ 0.97 s** after
+switching `explodeChars` to the `deleteElement`-based trim (a smaller
+gain here than for `cmpBytes`, since `pathMatch` decodes once per call
+rather than once per comparison). All 18 test programs / 1100+ checks
+still pass.

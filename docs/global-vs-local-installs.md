@@ -4,6 +4,8 @@
 **Audience:** fglpkg developers and users coming from the npm ecosystem
 **Scope:** what "global" actually means in npm, and the deliberate choices
 in fglpkg's `--global` / `--local` model
+**Related:** [version-switching-and-constraints.md](version-switching-and-constraints.md)
+— what happens to installed packages when the runtime version switches
 
 ---
 

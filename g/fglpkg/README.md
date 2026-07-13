@@ -11,8 +11,14 @@ with `FGLLDPATH=<repo>/g`.
 cd g/fglpkg
 make          # compile all modules (fglcomp -M -Wall)
 make test     # build + run the test programs in test/
-./fglpkg ...  # launcher script (exec fglrun main.42m)
+./fglpkg ...  # launcher script (exec fglrun main.42m; fglpkg.bat on Windows)
 ```
+
+The launcher sets `FGL_LENGTH_SEMANTICS=CHAR` — required for correct
+Unicode handling (see `g/BENCHMARKS.md`, "cmpBytes silently corrupted
+multi-byte characters"). Invoking `fglrun main.42m` directly without
+the launcher runs under the interpreter's BYTE-semantics default and
+is not supported.
 
 ## Scope
 

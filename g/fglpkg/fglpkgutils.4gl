@@ -495,9 +495,30 @@ FUNCTION registryBaseURL() RETURNS STRING
   RETURN url
 END FUNCTION
 
---dynamic arrays are passed by reference: sorts in place
+--dynamic arrays are passed by reference: sorts in place; byte-wise
+--(not locale collation) so output stays deterministic across locales
+--and matches Go's sort.Strings — see g/BENCHMARKS.md
 FUNCTION sortStringArray(arr TStringArr)
-  CALL arr.sort(NULL, FALSE)
+  CALL arr.sortByComparisonFunction(NULL, FALSE, FUNCTION cmpBytes)
+END FUNCTION
+
+#+explodes a string into one array element per character — UTF-8 safe
+#+and correct regardless of FGL_LENGTH_SEMANTICS (unlike getCharAt,
+#+which silently returns a space for byte offsets that land inside a
+#+multi-byte character under BYTE semantics instead of erroring or
+#+decoding it — see g/BENCHMARKS.md). s.split("") always yields exactly
+#+length+2 elements: an empty leading and trailing element bracketing
+#+one element per real character (DOC-6487); NULL/"" input yields the
+#+two empty brackets and nothing else, i.e. a 0-length result here.
+FUNCTION explodeChars(s STRING) RETURNS TStringArr
+  DEFINE out TStringArr
+  LET out = s.split("")
+  --delete the trailing bracket first: deleting index 1 first would
+  --shift every element down by one, moving the last real character
+  --into the slot deleteElement(getLength()) would then remove instead
+  CALL out.deleteElement(out.getLength())
+  CALL out.deleteElement(1)
+  RETURN out
 END FUNCTION
 
 #+escapes regex metacharacters so STRING.split matches s literally
@@ -506,11 +527,8 @@ FUNCTION quoteRegexp(s STRING) RETURNS STRING
   DEFINE i INT
   CONSTANT metachars = "\\.+*?()|[]{}^$"
   VAR sb = base.StringBuffer.create()
-  VAR chars = s.split("") --explode to chars (UTF-8 safe, incl. empties)
+  VAR chars = explodeChars(s)
   FOR i = 1 TO chars.getLength()
-    IF chars[i].getLength() == 0 THEN
-      CONTINUE FOR
-    END IF
     IF metachars.getIndexOf(chars[i], 1) > 0 THEN
       CALL sb.append("\\")
     END IF
@@ -564,17 +582,31 @@ FUNCTION splitFields(s STRING) RETURNS TStringArr
   RETURN arr
 END FUNCTION
 
-#+byte-wise string comparison (like Go strings.Compare, no collation)
+#+deterministic string comparison matching Go's strings.Compare/
+#+sort.Strings (byte-wise on the UTF-8 encoding, no locale collation).
+#+Decodes via explodeChars + ORD() rather than looping getCharAt: under
+#+BYTE semantics getCharAt silently corrupts multi-byte characters
+#+(continuation bytes read back as a space), and comparing raw bytes
+#+would also fail to fully differentiate characters sharing a lead byte
+#+(e.g. all Latin-1 supplement letters start with 0xC3 in UTF-8).
+#+ORD() of a whole decoded character returns its true Unicode code
+#+point under CHAR semantics (see g/BENCHMARKS.md) — and since UTF-8
+#+byte order and code point order are equivalent for valid UTF-8, this
+#+is the same ordering Go's byte-wise compare produces. Requires
+#+FGL_LENGTH_SEMANTICS=CHAR (set by the fglpkg launcher script).
 #+params are named s1/s2 so this can be passed to
 #+sortByComparisonFunction — function-reference compatibility in Genero
-#+includes the parameter NAMES, not just the types
+#+includes the parameter NAMES, not just the types.
 FUNCTION cmpBytes(s1 STRING, s2 STRING) RETURNS INTEGER
   DEFINE i, alen, blen, ca, cb INT
-  LET alen = s1.getLength()
-  LET blen = s2.getLength()
+  DEFINE a1, a2 TStringArr
+  LET a1 = explodeChars(s1)
+  LET a2 = explodeChars(s2)
+  LET alen = a1.getLength()
+  LET blen = a2.getLength()
   FOR i = 1 TO IIF(alen < blen, alen, blen)
-    LET ca = ORD(s1.getCharAt(i))
-    LET cb = ORD(s2.getCharAt(i))
+    LET ca = ORD(a1[i])
+    LET cb = ORD(a2[i])
     IF ca != cb THEN
       RETURN IIF(ca < cb, -1, 1)
     END IF

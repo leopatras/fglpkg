@@ -1,4 +1,7 @@
 export FGLLDPATH=$(CURDIR)/../..
+#the fglpkg launcher forces CHAR semantics (see ../fglpkg); match that
+#here so tests exercise the same ORD()/getCharAt behavior as production
+export FGL_LENGTH_SEMANTICS=CHAR
 
 FGLFLAGS?=
 FGLCOMP=fglcomp -M -Wall $(FGLFLAGS)

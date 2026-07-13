@@ -63,10 +63,44 @@ this repo. Compressed checklist:
   comparator must be declared `(s1 STRING, s2 STRING) RETURNS INTEGER`.
   Arrays nested in records are shared by reference, so sort a `copyTo`
   copy when the input must stay unmodified.
+- The **plain** `DYNAMIC ARRAY.sort(NULL, FALSE)` (no comparator) uses
+  **locale collation**, not byte order — verified: it floats
+  punctuation to the front and interleaves case
+  (`_underscore, 10, 9, alpha, Alpha, ...`), diverging from Go's
+  `sort.Strings` for anything not lowercase-only. Package names happen
+  to be lowercase (registry-enforced at publish time, but NOT for
+  dependency-map keys or Maven `groupId:artifactId`), so this is easy
+  to miss until a mixed-case input shows up. Use
+  `sortByComparisonFunction(NULL, FALSE, FUNCTION cmpBytes)` for any
+  string sort whose output needs to be deterministic across locales
+  (lockfiles, sboms, anything diffed or committed) — see
+  `g/BENCHMARKS.md`.
+
+- Under **BYTE** semantics, `getCharAt(i)` at a byte offset landing
+  **inside** a multi-byte UTF-8 character does NOT return that raw
+  byte — it silently substitutes a space (`ORD` confirmed, not a
+  display artifact). Any `getCharAt`-loop over non-ASCII content is
+  therefore silently wrong, not just slow. Fix: `explodeChars(s)` in
+  `fglpkgutils.4gl` decodes via `s.split("")` (semantics-independent,
+  UTF-8-safe) instead — `split("")` always yields exactly `length+2`
+  elements (empty first/last bracketing one per real character, for
+  any input including `""`/NULL); drop exactly the first and last, not
+  a generic "filter empties". Then run the port under
+  `FGL_LENGTH_SEMANTICS=CHAR` (the `fglpkg`/`fglpkg.bat` launcher
+  scripts set this, mirroring gwa's `gwabuildtool` wrapper) so `ORD()`
+  on each decoded character resolves the full Unicode code point
+  (confirmed by the documented `ORD()` contract) instead of just the
+  first byte — code-point order and UTF-8 byte order are equivalent
+  for valid UTF-8, so this reproduces Go's byte-wise comparison
+  exactly. `test/Makefile` also exports `FGL_LENGTH_SEMANTICS=CHAR` so
+  tests exercise the same mode as production. See `g/BENCHMARKS.md`.
 
 **How to apply:** consult the genero-intelligence MCP skills for any API
 you're not 100% sure about; when a compile fails with -6609 look for a
 mid-function DEFINE or a method call on a function result first. Prefer
 native `split()`/`util.Regexp`/`sortByComparisonFunction` over
 hand-rolled getCharAt/subString loops and insertion sorts on anything
-that can grow beyond a few hundred elements.
+that can grow beyond a few hundred elements. Any new `getCharAt`-loop
+over user-supplied strings needs the same `explodeChars`/CHAR-semantics
+treatment — don't reach for raw `getCharAt` without checking this file
+first.

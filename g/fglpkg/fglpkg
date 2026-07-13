@@ -1,6 +1,12 @@
 #!/bin/sh
 #fglpkg launcher: runs the 4GL implementation via fglrun
+#FGL_LENGTH_SEMANTICS=CHAR is required: fglpkgutils.cmpBytes (and any
+#other per-character loop) relies on ORD() resolving full Unicode code
+#points, not just the first byte of a multi-byte UTF-8 character —
+#see g/BENCHMARKS.md
 dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
 FGLLDPATH="$dir/..${FGLLDPATH:+:$FGLLDPATH}"
 export FGLLDPATH
+FGL_LENGTH_SEMANTICS=CHAR
+export FGL_LENGTH_SEMANTICS
 exec fglrun "$dir/main.42m" "$@"

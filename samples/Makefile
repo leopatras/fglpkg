@@ -29,7 +29,7 @@ export FGLGUI := 0
 TERM ?= xterm
 export TERM
 
-FGLPKG_4GL := FGLLDPATH=$(REPO)/g fglrun $(REPO)/g/fglpkg/main.42m
+FGLPKG_4GL := $(REPO)/g/fglpkg/fglpkg
 FGLPKG_GO := $(REPO)/bin/fglpkg-go
 
 .PHONY: all demo-4gl demo-go modules clean
