@@ -1,7 +1,11 @@
 #+ package download, verification and extraction into the fglpkg home
 #+ port of internal/installer/installer.go — zip handling shells out to
-#+ unzip (Unix) / tar (Windows); downloads run sequentially
-#+ (FGLPKG_INSTALL_CONCURRENCY is read but ignored in the 4GL port)
+#+ unzip (Unix) / tar (Windows); downloads for one phase (BDL packages,
+#+ webcomponents, or JARs) run concurrently, bounded by
+#+ FGLPKG_INSTALL_CONCURRENCY, by shelling out to a single `curl
+#+ --parallel` invocation (falls back to one-at-a-time com.HttpRequest
+#+ downloads when curl isn't on PATH) — see "downloadAllAndVerify"
+#+ below and g/BENCHMARKS.md
 OPTIONS SHORT CIRCUIT
 PACKAGE fglpkg
 IMPORT os
@@ -106,22 +110,37 @@ FUNCTION installAll(
   RETURN ok, err
 END FUNCTION
 
-#+installs every entry of the lock file using pinned URLs and checksums
+#+installs every entry of the lock file using pinned URLs and checksums.
+#+Each phase (packages, webcomponents, jars) downloads as one
+#+concurrent batch, then finalizes+prints every entry in original
+#+order; a hard failure lets its phase-siblings run to completion (only
+#+the first hard error is returned, after the phase finishes) but skips
+#+the phases after it — matching the Go installer's runParallel
+#+semantics (see g/BENCHMARKS.md)
 FUNCTION installFromLock(lf lockfile.TLockfile, home STRING, production BOOLEAN)
     RETURNS(BOOLEAN, STRING)
-  DEFINE i INT
+  DEFINE i, j INT
   DEFINE ok BOOLEAN
-  DEFINE err STRING
+  DEFINE err, firstErr STRING
   DEFINE info registry.TPackageInfo
   DEFINE dep manifest.TJavaDependency
+  DEFINE infos DYNAMIC ARRAY OF registry.TPackageInfo
+  DEFINE tasks TDownloadTasks
+  DEFINE results TDownloadResults
+  DEFINE taskForIndex DYNAMIC ARRAY OF INT --0 = already installed/present
+
   IF production THEN
     LET lf = lockfile.filterForProduction(lf)
   END IF
+  CALL ensureDirs(home)
+
+  --── BDL packages ──────────────────────────────────────────────────────
   FOR i = 1 TO lf.packages.getLength()
     IF os.Path.exists(os.Path.join(fglpkgutils.packagesDir(home),
             lf.packages[i].name)) THEN
       DISPLAY SFMT("  %1 %2@%3 (already installed)",
           fglpkgutils.C_CHECK, lf.packages[i].name, lf.packages[i].version)
+      LET taskForIndex[i] = 0
       CONTINUE FOR
     END IF
     INITIALIZE info TO NULL
@@ -129,12 +148,43 @@ FUNCTION installFromLock(lf lockfile.TLockfile, home STRING, production BOOLEAN)
     LET info.version = lf.packages[i].version
     LET info.downloadUrl = lf.packages[i].downloadUrl
     LET info.checksum = lf.packages[i].checksum
-    CALL installPackage(info, home) RETURNING ok, err
-    IF NOT ok THEN
-      RETURN FALSE, SFMT("failed to install %1: %2", info.name, err)
-    END IF
-    DISPLAY SFMT("  %1 %2@%3", fglpkgutils.C_CHECK, info.name, info.version)
+    LET infos[i] = info
+    LET j = tasks.getLength() + 1
+    LET tasks[j].url = registry.absoluteDownloadURL(info.downloadUrl)
+    LET tasks[j].checksum = info.checksum
+    LET tasks[j].name = info.name
+    LET tasks[j].dest = fglpkgutils.makeTempName() || ".zip"
+    LET taskForIndex[i] = j
   END FOR
+  LET results = downloadAllAndVerify(tasks)
+  LET firstErr = NULL
+  FOR i = 1 TO lf.packages.getLength()
+    IF taskForIndex[i] == 0 THEN
+      CONTINUE FOR
+    END IF
+    LET j = taskForIndex[i]
+    IF results[j].ok THEN
+      CALL finalizeBDL(infos[i], home, tasks[j].dest) RETURNING ok, err
+    ELSE
+      LET ok = FALSE
+      LET err = results[j].err
+    END IF
+    IF NOT ok THEN
+      IF firstErr IS NULL THEN
+        LET firstErr = SFMT("failed to install %1: %2", infos[i].name, err)
+      END IF
+      CONTINUE FOR
+    END IF
+    DISPLAY SFMT("  %1 %2@%3", fglpkgutils.C_CHECK, infos[i].name, infos[i].version)
+  END FOR
+  IF firstErr IS NOT NULL THEN
+    RETURN FALSE, firstErr
+  END IF
+
+  --── webcomponents ─────────────────────────────────────────────────────
+  CALL tasks.clear()
+  CALL results.clear()
+  CALL infos.clear()
   FOR i = 1 TO lf.webcomponents.getLength()
     INITIALIZE info TO NULL
     LET info.name = lf.webcomponents[i].name
@@ -142,14 +192,38 @@ FUNCTION installFromLock(lf lockfile.TLockfile, home STRING, production BOOLEAN)
     LET info.downloadUrl = lf.webcomponents[i].downloadUrl
     LET info.checksum = lf.webcomponents[i].checksum
     LET info.variant = "webcomponent"
-    CALL installPackage(info, home) RETURNING ok, err
+    LET infos[i] = info
+    LET tasks[i].url = registry.absoluteDownloadURL(info.downloadUrl)
+    LET tasks[i].checksum = info.checksum
+    LET tasks[i].name = info.name
+    LET tasks[i].dest = fglpkgutils.makeTempName() || ".zip"
+  END FOR
+  LET results = downloadAllAndVerify(tasks)
+  LET firstErr = NULL
+  FOR i = 1 TO lf.webcomponents.getLength()
+    IF results[i].ok THEN
+      CALL finalizeWebcomponent(home, tasks[i].dest) RETURNING ok, err
+    ELSE
+      LET ok = FALSE
+      LET err = results[i].err
+    END IF
     IF NOT ok THEN
-      RETURN FALSE,
-          SFMT("failed to install webcomponent %1: %2", info.name, err)
+      IF firstErr IS NULL THEN
+        LET firstErr = SFMT("failed to install webcomponent %1: %2", infos[i].name, err)
+      END IF
+      CONTINUE FOR
     END IF
     DISPLAY SFMT("  %1 %2@%3 (webcomponent)",
-        fglpkgutils.C_CHECK, info.name, info.version)
+        fglpkgutils.C_CHECK, infos[i].name, infos[i].version)
   END FOR
+  IF firstErr IS NOT NULL THEN
+    RETURN FALSE, firstErr
+  END IF
+
+  --── JARs ──────────────────────────────────────────────────────────────
+  CALL tasks.clear()
+  CALL results.clear()
+  CALL taskForIndex.clear()
   FOR i = 1 TO lf.jars.getLength()
     INITIALIZE dep TO NULL
     LET dep.groupId = lf.jars[i].groupId
@@ -161,100 +235,156 @@ FUNCTION installFromLock(lf lockfile.TLockfile, home STRING, production BOOLEAN)
             manifest.jarFileName(dep))) THEN
       DISPLAY SFMT("  %1 %2 (already present)",
           fglpkgutils.C_CHECK, lf.jars[i].key)
+      LET taskForIndex[i] = 0
       CONTINUE FOR
     END IF
-    CALL installJar(dep, home) RETURNING ok, err
-    IF NOT ok THEN
-      RETURN FALSE, SFMT("failed to install JAR %1: %2", lf.jars[i].key, err)
+    LET j = tasks.getLength() + 1
+    LET tasks[j].url = manifest.mavenURL(dep)
+    LET tasks[j].checksum = dep.checksum
+    LET tasks[j].name = manifest.jarFileName(dep)
+    LET tasks[j].dest = os.Path.join(fglpkgutils.jarsDir(home), manifest.jarFileName(dep))
+    LET taskForIndex[i] = j
+  END FOR
+  LET results = downloadAllAndVerify(tasks)
+  LET firstErr = NULL
+  FOR i = 1 TO lf.jars.getLength()
+    IF taskForIndex[i] == 0 THEN
+      CONTINUE FOR
+    END IF
+    LET j = taskForIndex[i]
+    IF NOT results[j].ok THEN
+      IF firstErr IS NULL THEN
+        LET firstErr = SFMT("failed to install JAR %1: %2", lf.jars[i].key, results[j].err)
+      END IF
+      CONTINUE FOR
     END IF
     DISPLAY SFMT("  %1 %2", fglpkgutils.C_CHECK, lf.jars[i].key)
   END FOR
+  IF firstErr IS NOT NULL THEN
+    RETURN FALSE, firstErr
+  END IF
   RETURN TRUE, NULL
 END FUNCTION
 
 #+installs every entry of a freshly resolved plan; optional-scope
-#+failures warn and are skipped, hard-scope failures abort
+#+failures warn and are skipped, hard-scope failures let phase-siblings
+#+run to completion before aborting (see installFromLock)
 FUNCTION installFromPlan(plan resolver.TPlan, home STRING)
     RETURNS(BOOLEAN, STRING)
-  DEFINE i INT
+  DEFINE i, j, n INT
   DEFINE ok BOOLEAN
-  DEFINE err STRING
+  DEFINE err, firstErr STRING
   DEFINE info registry.TPackageInfo
-  FOR i = 1 TO plan.packages.getLength()
+  DEFINE infos DYNAMIC ARRAY OF registry.TPackageInfo
+  DEFINE tasks TDownloadTasks
+  DEFINE results TDownloadResults
+  DEFINE taskForIndex DYNAMIC ARRAY OF INT --0 = already on disk (JARs only)
+
+  CALL ensureDirs(home)
+
+  --── BDL packages + webcomponents (one mixed-variant phase) ───────────
+  LET n = plan.packages.getLength()
+  FOR i = 1 TO n
     INITIALIZE info TO NULL
     LET info.name = plan.packages[i].name
     LET info.version = plan.packages[i].version
     LET info.downloadUrl = plan.packages[i].downloadURL
     LET info.checksum = plan.packages[i].checksum
     LET info.variant = plan.packages[i].variant
-    CALL installPackage(info, home) RETURNING ok, err
+    LET infos[i] = info
+    LET tasks[i].url = registry.absoluteDownloadURL(info.downloadUrl)
+    LET tasks[i].checksum = info.checksum
+    LET tasks[i].name = info.name
+    LET tasks[i].dest = fglpkgutils.makeTempName() || ".zip"
+  END FOR
+  LET results = downloadAllAndVerify(tasks)
+  LET firstErr = NULL
+  FOR i = 1 TO n
+    IF results[i].ok THEN
+      IF infos[i].variant == "webcomponent" THEN
+        CALL finalizeWebcomponent(home, tasks[i].dest) RETURNING ok, err
+      ELSE
+        CALL finalizeBDL(infos[i], home, tasks[i].dest) RETURNING ok, err
+      END IF
+    ELSE
+      LET ok = FALSE
+      LET err = results[i].err
+    END IF
     IF NOT ok THEN
       IF plan.packages[i].scope == manifest.SCOPE_OPTIONAL THEN
-        DISPLAY SFMT("  warning: skipping optional package %1: %2",
-            info.name, err)
+        DISPLAY SFMT("  warning: skipping optional package %1: %2", infos[i].name, err)
         CONTINUE FOR
       END IF
-      RETURN FALSE, SFMT("failed to install %1: %2", info.name, err)
+      IF firstErr IS NULL THEN
+        LET firstErr = SFMT("failed to install %1: %2", infos[i].name, err)
+      END IF
+      CONTINUE FOR
     END IF
     VAR kindHint =
-        IIF(resolver.isWebcomponentPackage(plan.packages[i]),
-            " (webcomponent)", "")
+        IIF(resolver.isWebcomponentPackage(plan.packages[i]), " (webcomponent)", "")
     IF plan.packages[i].requiredBy.getLength() > 0 THEN
       DISPLAY SFMT("  %1 %2@%3%4  (required by: %5)",
-          fglpkgutils.C_CHECK, info.name, info.version, kindHint,
+          fglpkgutils.C_CHECK, infos[i].name, infos[i].version, kindHint,
           fglpkgutils.joinArr(plan.packages[i].requiredBy, ", "))
     ELSE
       DISPLAY SFMT("  %1 %2@%3%4",
-          fglpkgutils.C_CHECK, info.name, info.version, kindHint)
+          fglpkgutils.C_CHECK, infos[i].name, infos[i].version, kindHint)
     END IF
   END FOR
-  FOR i = 1 TO plan.jars.getLength()
-    CALL installJar(plan.jars[i], home) RETURNING ok, err
+  IF firstErr IS NOT NULL THEN
+    RETURN FALSE, firstErr
+  END IF
+
+  --── JARs ──────────────────────────────────────────────────────────────
+  CALL tasks.clear()
+  CALL results.clear()
+  LET n = plan.jars.getLength()
+  FOR i = 1 TO n
+    VAR dest = os.Path.join(fglpkgutils.jarsDir(home), manifest.jarFileName(plan.jars[i]))
+    IF os.Path.exists(dest) THEN
+      LET taskForIndex[i] = 0 --already on disk, matches the old installJar's silent skip
+      CONTINUE FOR
+    END IF
+    LET j = tasks.getLength() + 1
+    LET tasks[j].url = manifest.mavenURL(plan.jars[i])
+    LET tasks[j].checksum = plan.jars[i].checksum
+    LET tasks[j].name = manifest.jarFileName(plan.jars[i])
+    LET tasks[j].dest = dest
+    LET taskForIndex[i] = j
+  END FOR
+  LET results = downloadAllAndVerify(tasks)
+  LET firstErr = NULL
+  FOR i = 1 TO n
     VAR key = manifest.javaKey(plan.jars[i])
-    IF NOT ok THEN
+    IF taskForIndex[i] > 0 AND NOT results[taskForIndex[i]].ok THEN
       IF plan.jarScopes.contains(key)
           AND plan.jarScopes[key] == manifest.SCOPE_OPTIONAL THEN
-        DISPLAY SFMT("  warning: skipping optional JAR %1: %2", key, err)
+        DISPLAY SFMT("  warning: skipping optional JAR %1: %2", key, results[taskForIndex[i]].err)
         CONTINUE FOR
       END IF
-      RETURN FALSE, SFMT("failed to install JAR %1: %2", key, err)
+      IF firstErr IS NULL THEN
+        LET firstErr = SFMT("failed to install JAR %1: %2", key, results[taskForIndex[i]].err)
+      END IF
+      CONTINUE FOR
     END IF
-    DISPLAY SFMT("  %1 %2", fglpkgutils.C_CHECK,
-        manifest.jarFileName(plan.jars[i]))
+    DISPLAY SFMT("  %1 %2", fglpkgutils.C_CHECK, manifest.jarFileName(plan.jars[i]))
   END FOR
+  IF firstErr IS NOT NULL THEN
+    RETURN FALSE, firstErr
+  END IF
   RETURN TRUE, NULL
 END FUNCTION
 
-#+downloads, verifies and unpacks a single package — dispatching to the
-#+BDL or webcomponent install layout based on the variant
-FUNCTION installPackage(info registry.TPackageInfo, home STRING)
-    RETURNS(BOOLEAN, STRING)
-  DEFINE ok BOOLEAN
-  DEFINE err STRING
-  IF info.variant == "webcomponent" THEN
-    CALL installWebcomponent(info, home) RETURNING ok, err
-  ELSE
-    CALL installBDL(info, home) RETURNING ok, err
-  END IF
-  RETURN ok, err
-END FUNCTION
-
-PRIVATE FUNCTION installBDL(info registry.TPackageInfo, home STRING)
+#+finalizes an already-downloaded-and-verified BDL package zip: routes
+#+COMPONENTTYPE bundles of mixed packages into webcomponents/, extracts,
+#+makes bin scripts executable
+PRIVATE FUNCTION finalizeBDL(info registry.TPackageInfo, home STRING, tmpName STRING)
     RETURNS(BOOLEAN, STRING)
   DEFINE ok, mok BOOLEAN
   DEFINE err STRING
   DEFINE pkgManifest manifest.TManifest
   DEFINE wcNames fglpkgutils.TStringArr
-  CALL ensureDirs(home)
-  VAR tmpName = fglpkgutils.makeTempName() || ".zip"
-  CALL downloadAndVerify(registry.absoluteDownloadURL(info.downloadUrl),
-          info.checksum, info.name, tmpName)
-      RETURNING ok, err
-  IF NOT ok THEN
-    RETURN FALSE, err
-  END IF
 
-  --route COMPONENTTYPE bundles of mixed packages into webcomponents/
   CALL readWebcomponentsFromZip(tmpName) RETURNING ok, wcNames, err
   IF NOT ok THEN
     CALL os.Path.delete(tmpName) RETURNING status
@@ -271,7 +401,6 @@ PRIVATE FUNCTION installBDL(info registry.TPackageInfo, home STRING)
     RETURN FALSE, err
   END IF
 
-  --make bin scripts executable after extraction
   IF manifest.manifestExists(destDir) THEN
     CALL manifest.load(destDir) RETURNING mok, pkgManifest, err
     IF mok AND pkgManifest.bin.getLength() > 0 THEN
@@ -284,46 +413,18 @@ PRIVATE FUNCTION installBDL(info registry.TPackageInfo, home STRING)
   RETURN TRUE, NULL
 END FUNCTION
 
-#+webcomponent bundles drop straight into webcomponents/<COMPONENTTYPE>/;
-#+the in-zip fglpkg.json is intentionally not extracted (it would collide
-#+between multiple webcomponent packages)
-PRIVATE FUNCTION installWebcomponent(info registry.TPackageInfo, home STRING)
+#+finalizes an already-downloaded-and-verified webcomponent zip: drops
+#+straight into webcomponents/<COMPONENTTYPE>/ — the in-zip fglpkg.json
+#+is intentionally not extracted (it would collide between multiple
+#+webcomponent packages)
+PRIVATE FUNCTION finalizeWebcomponent(home STRING, tmpName STRING)
     RETURNS(BOOLEAN, STRING)
   DEFINE ok BOOLEAN
   DEFINE err STRING
-  CALL ensureDirs(home)
-  VAR tmpName = fglpkgutils.makeTempName() || ".zip"
-  CALL downloadAndVerify(registry.absoluteDownloadURL(info.downloadUrl),
-          info.checksum, info.name, tmpName)
-      RETURNING ok, err
-  IF NOT ok THEN
-    RETURN FALSE, err
-  END IF
   CALL extractWebcomponentZip(tmpName, fglpkgutils.webcomponentsDir(home))
       RETURNING ok, err
   CALL os.Path.delete(tmpName) RETURNING status
   RETURN ok, err
-END FUNCTION
-
-#+downloads and verifies a Java JAR into the jars directory; a missing
-#+checksum skips the integrity check (Maven Central is trusted)
-FUNCTION installJar(dep manifest.TJavaDependency, home STRING)
-    RETURNS(BOOLEAN, STRING)
-  DEFINE ok BOOLEAN
-  DEFINE err STRING
-  CALL ensureDirs(home)
-  VAR dest = os.Path.join(fglpkgutils.jarsDir(home), manifest.jarFileName(dep))
-  IF os.Path.exists(dest) THEN
-    RETURN TRUE, NULL --already on disk
-  END IF
-  CALL downloadAndVerify(manifest.mavenURL(dep), dep.checksum,
-          manifest.jarFileName(dep), dest)
-      RETURNING ok, err
-  IF NOT ok THEN
-    CALL os.Path.delete(dest) RETURNING status
-    RETURN FALSE, err
-  END IF
-  RETURN TRUE, NULL
 END FUNCTION
 
 #+deletes an installed BDL package directory
@@ -385,33 +486,268 @@ FUNCTION ensureDirs(home STRING)
   CALL fglpkgutils.mkdirp(fglpkgutils.webcomponentsDir(home))
 END FUNCTION
 
---─── download + verify ──────────────────────────────────────────────────────
+--─── download + verify (concurrent) ─────────────────────────────────────────
 
-#+fetches url into dest and verifies the SHA256; token selection:
-#+GitHub URL -> github token, otherwise -> registry token
+PUBLIC TYPE TDownloadTask RECORD
+  url STRING,
+  checksum STRING,
+  name STRING, --for error messages
+  dest STRING
+END RECORD
+
+PUBLIC TYPE TDownloadTasks DYNAMIC ARRAY OF TDownloadTask
+
+PUBLIC TYPE TDownloadResult RECORD
+  ok BOOLEAN,
+  err STRING
+END RECORD
+
+PUBLIC TYPE TDownloadResults DYNAMIC ARRAY OF TDownloadResult
+
+#+worker cap for one concurrent download phase; a small fixed pool
+#+keeps the registry and Maven Central honest without flooding the
+#+local network stack (same default as the Go implementation)
+PUBLIC CONSTANT DEFAULT_INSTALL_CONCURRENCY = 4
+
+#+reads FGLPKG_INSTALL_CONCURRENCY each call; a bad/unset value falls
+#+back to the default rather than refusing to install
+FUNCTION installConcurrency() RETURNS INT
+  DEFINE n INT
+  VAR raw = fgl_getenv("FGLPKG_INSTALL_CONCURRENCY")
+  IF raw IS NULL OR raw.trim().getLength() == 0 THEN
+    RETURN DEFAULT_INSTALL_CONCURRENCY
+  END IF
+  LET n = raw
+  IF n IS NULL OR n < 1 THEN
+    RETURN DEFAULT_INSTALL_CONCURRENCY
+  END IF
+  RETURN n
+END FUNCTION
+
+#+fetches url into dest and verifies the SHA256 — single-item
+#+convenience wrapper over the concurrent batch path below
 PRIVATE FUNCTION downloadAndVerify(
     url STRING, expectedChecksum STRING, name STRING, dest STRING)
     RETURNS(BOOLEAN, STRING)
-  DEFINE ok BOOLEAN
-  DEFINE code INT
-  DEFINE err STRING
+  DEFINE tasks TDownloadTasks
+  DEFINE results TDownloadResults
+  LET tasks[1].url = url
+  LET tasks[1].checksum = expectedChecksum
+  LET tasks[1].name = name
+  LET tasks[1].dest = dest
+  LET results = downloadAllAndVerify(tasks)
+  RETURN results[1].ok, results[1].err
+END FUNCTION
+
+DEFINE _curlChecked, _curlAvailable BOOLEAN
+
+#+BDL has no threads, and GWS/core have no sub-second SLEEP either, so
+#+there's no honest way to overlap several com.HttpRequest calls from
+#+the interpreter itself (only a tight busy-poll, and even that just
+#+overlaps within one process — it can't get HTTP/2 multiplexing, since
+#+GWS's HTTP client is HTTP/1.1 only). curl already solves both: `curl
+#+--parallel` runs the transfers in its own process, and negotiates
+#+HTTP/2 with any server that supports it. So the real "catch up to Go"
+#+move is to shell out to curl when it's available, and only fall back
+#+to the original one-at-a-time com.HttpRequest path (via
+#+registry.downloadToFileAuth) when it isn't.
+PRIVATE FUNCTION checkCurlAvailable() RETURNS BOOLEAN
+  DEFINE out, err STRING
+  IF _curlChecked THEN
+    RETURN _curlAvailable
+  END IF
+  LET _curlChecked = TRUE
+  IF fglpkgutils.isWin() THEN
+    CALL fglpkgutils.getProgramOutputWithErr("where curl") RETURNING out, err
+  ELSE
+    CALL fglpkgutils.getProgramOutputWithErr("command -v curl") RETURNING out, err
+  END IF
+  LET _curlAvailable = (err IS NULL)
+  RETURN _curlAvailable
+END FUNCTION
+
+#+downloads and verifies every task, bounded by installConcurrency();
+#+every task gets a result, one task's failure never stops the others
+#+(matching the Go implementation's runParallel). Prefers curl (see
+#+downloadAllViaCurl); falls back to downloadAllSequential when curl
+#+isn't on PATH.
+FUNCTION downloadAllAndVerify(tasks TDownloadTasks) RETURNS TDownloadResults
+  DEFINE results TDownloadResults
+  IF tasks.getLength() == 0 THEN
+    RETURN results
+  END IF
+  IF checkCurlAvailable() THEN
+    RETURN downloadAllViaCurl(tasks)
+  END IF
+  RETURN downloadAllSequential(tasks)
+END FUNCTION
+
+#+one `curl --parallel` process handles every task in this batch: each
+#+task becomes its own `--next` segment (its own URL, auth headers and
+#+-o destination), and `--parallel-max` caps how many curl runs at
+#+once. A single -w format is appended to each segment and all of them
+#+land in one status log, one line per completed transfer, in
+#+completion order (not submission order) — curl already does the
+#+"fire N, harvest as they finish" bookkeeping the Go pool does with
+#+goroutines, so 4GL doesn't need to reimplement it.
+#+
+#+Lines are matched back to their task by filename_effective (the -o
+#+path we chose ourselves), not by URL — GitHub/Maven Central routinely
+#+302 to a signed CDN URL, so url_effective would not match what we
+#+requested.
+PRIVATE FUNCTION downloadAllViaCurl(tasks TDownloadTasks) RETURNS TDownloadResults
+  CONSTANT WRITE_OUT_FMT = "%{filename_effective}\t%{http_code}\t%{exitcode}\t%{errormsg}\n"
+  DEFINE results TDownloadResults
+  DEFINE destIndex DICTIONARY OF INT
+  DEFINE cmd STRING
+  DEFINE statusLog, errLog STRING
+  DEFINE i, cap, code, httpCode, exitCode INT
+  DEFINE lines, fields fglpkgutils.TStringArr
+  DEFINE line, filename STRING
+
+  LET cap = installConcurrency()
+  IF cap > tasks.getLength() THEN
+    LET cap = tasks.getLength()
+  END IF
+  LET statusLog = fglpkgutils.makeTempName()
+  LET errLog = fglpkgutils.makeTempName()
+
+  ----parallel-immediate: without it, curl delays firing the rest of the
+  --batch until it has found out (one round trip in) whether the first
+  --transfer's connection can be multiplexed (HTTP/2) — for plain
+  --HTTP/1.1 registries that's a wasted RTT-sized stall before the other
+  --transfers even start, measured as roughly one extra download's worth
+  --of latency tacked onto the whole batch
+  LET cmd = SFMT("curl --parallel --parallel-immediate --parallel-max %1 -sS", cap)
+  FOR i = 1 TO tasks.getLength()
+    LET destIndex[tasks[i].dest] = i
+    IF i > 1 THEN
+      LET cmd = cmd, " --next"
+    END IF
+    LET cmd = cmd, curlAuthArgs(tasks[i].url)
+    LET cmd = cmd, " -o ", fglpkgutils.quoteForce(tasks[i].dest)
+    LET cmd = cmd, " -w ", fglpkgutils.quoteForce(WRITE_OUT_FMT)
+    LET cmd = cmd, " ", fglpkgutils.quoteUrl(tasks[i].url)
+  END FOR
+  LET cmd = cmd, " > ", fglpkgutils.quoteForce(statusLog),
+      " 2> ", fglpkgutils.quoteForce(errLog)
+  RUN cmd RETURNING code --curl's own exit code is a single scalar for
+      --the whole batch; per-task outcome comes from the status log below
+
+  --every task defaults to "never showed up in the log" until proven
+  --otherwise, so a curl crash mid-batch still yields a result per task
+  FOR i = 1 TO tasks.getLength()
+    LET results[i].ok = FALSE
+    LET results[i].err = SFMT("download failed for %1: curl produced no result (exit %2)",
+        tasks[i].name, code)
+  END FOR
+
+  LET lines = fglpkgutils.splitOnChar(fglpkgutils.readTextFile(statusLog), "\n")
+  FOR i = 1 TO lines.getLength()
+    LET line = lines[i]
+    IF line.getLength() == 0 THEN
+      CONTINUE FOR
+    END IF
+    LET fields = fglpkgutils.splitOnChar(line, "\t")
+    IF fields.getLength() < 4 OR NOT destIndex.contains(fields[1]) THEN
+      CONTINUE FOR
+    END IF
+    LET filename = fields[1]
+    LET httpCode = fields[2]
+    LET exitCode = fields[3]
+    CALL finishCurlResult(tasks[destIndex[filename]], httpCode, exitCode, fields[4])
+        RETURNING results[destIndex[filename]].ok, results[destIndex[filename]].err
+  END FOR
+
+  CALL os.Path.delete(statusLog) RETURNING status
+  CALL os.Path.delete(errLog) RETURNING status
+  RETURN results
+END FUNCTION
+
+#+builds the curl auth args for one URL: bearer token (GitHub or
+#+registry, matching registry.downloadToFileAuth's token selection) and
+#+the Accept header GitHub release assets need to come back as binary
+PRIVATE FUNCTION curlAuthArgs(url STRING) RETURNS STRING
+  DEFINE args STRING
+  LET args = ""
   VAR tok = IIF(glob.isGitHubURL(url), _githubToken, _registryToken)
-  CALL registry.downloadToFileAuth(url, tok, glob.isGitHubURL(url), dest)
-      RETURNING ok, code, err
-  IF NOT ok THEN
-    IF code == 401 THEN
+  IF tok IS NOT NULL AND tok.getLength() > 0 THEN
+    LET args = args, " -H ",
+        fglpkgutils.quoteForce(SFMT("Authorization: Bearer %1", tok))
+  END IF
+  IF glob.isGitHubURL(url) THEN
+    LET args = args, " -H ", fglpkgutils.quoteForce("Accept: application/octet-stream")
+  END IF
+  RETURN args
+END FUNCTION
+
+#+turns one status-log line into a result: status check first (401
+#+gets the friendly "run fglpkg login" hint, matching the pre-curl
+#+behaviour), then checksum verification of the file curl already wrote
+PRIVATE FUNCTION finishCurlResult(
+    task TDownloadTask, httpCode INT, exitCode INT, errMsg STRING)
+    RETURNS(BOOLEAN, STRING)
+  DEFINE ok BOOLEAN
+  DEFINE err STRING
+  CASE
+    WHEN httpCode >= 200 AND httpCode < 300 AND exitCode == 0
+      CALL checksum.verifyFile(task.dest, task.checksum) RETURNING ok, err
+      IF NOT ok THEN
+        CALL os.Path.delete(task.dest) RETURNING status
+        RETURN FALSE, err
+      END IF
+      RETURN TRUE, NULL
+    WHEN httpCode == 401
+      CALL os.Path.delete(task.dest) RETURNING status
       RETURN FALSE,
           SFMT("HTTP 401 downloading %1: Not authorised — run 'fglpkg login' or set FGLPKG_TOKEN",
-              name)
+              task.name)
+    WHEN httpCode >= 400
+      CALL os.Path.delete(task.dest) RETURNING status
+      RETURN FALSE, SFMT("download failed for %1: HTTP %2", task.name, httpCode)
+    OTHERWISE
+      --transport-level failure: no response at all (connect refused,
+      --TLS error, timeout, ...)
+      CALL os.Path.delete(task.dest) RETURNING status
+      RETURN FALSE, SFMT("download failed for %1: %2",
+          task.name, NVL(errMsg, SFMT("curl exit %1", exitCode)))
+  END CASE
+END FUNCTION
+
+#+curl-unavailable fallback: exactly today's pre-batch behaviour, one
+#+request at a time via registry.downloadToFileAuth (com.HttpRequest
+#+under the hood) — no concurrency, but correct and dependency-free
+PRIVATE FUNCTION downloadAllSequential(tasks TDownloadTasks) RETURNS TDownloadResults
+  DEFINE results TDownloadResults
+  DEFINE i, code INT
+  DEFINE ok BOOLEAN
+  DEFINE err STRING
+  FOR i = 1 TO tasks.getLength()
+    VAR tok = IIF(glob.isGitHubURL(tasks[i].url), _githubToken, _registryToken)
+    CALL registry.downloadToFileAuth(tasks[i].url, tok,
+            glob.isGitHubURL(tasks[i].url), tasks[i].dest)
+        RETURNING ok, code, err
+    IF NOT ok THEN
+      IF code == 401 THEN
+        LET results[i].err =
+            SFMT("HTTP 401 downloading %1: Not authorised — run 'fglpkg login' or set FGLPKG_TOKEN",
+                tasks[i].name)
+      ELSE
+        LET results[i].err = SFMT("download failed for %1: %2", tasks[i].name, err)
+      END IF
+      LET results[i].ok = FALSE
+      CONTINUE FOR
     END IF
-    RETURN FALSE, SFMT("download failed for %1: %2", name, err)
-  END IF
-  CALL checksum.verifyFile(dest, expectedChecksum) RETURNING ok, err
-  IF NOT ok THEN
-    CALL os.Path.delete(dest) RETURNING status
-    RETURN FALSE, err
-  END IF
-  RETURN TRUE, NULL
+    CALL checksum.verifyFile(tasks[i].dest, tasks[i].checksum) RETURNING ok, err
+    IF NOT ok THEN
+      CALL os.Path.delete(tasks[i].dest) RETURNING status
+      LET results[i].ok = FALSE
+      LET results[i].err = err
+      CONTINUE FOR
+    END IF
+    LET results[i].ok = TRUE
+  END FOR
+  RETURN results
 END FUNCTION
 
 --─── zip handling (shell based) ─────────────────────────────────────────────

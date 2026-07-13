@@ -74,7 +74,11 @@ Every command of the Go binary is now ported.
 
 - Zip handling shells out to `unzip`/`zip` (Unix) or `tar` (Windows)
   instead of `archive/zip`; entries are pre-scanned for zip-slip.
-- Downloads run sequentially (`FGLPKG_INSTALL_CONCURRENCY` is ignored).
+- Downloads for one phase (BDL packages, webcomponents, or JARs) run
+  concurrently, bounded by `FGLPKG_INSTALL_CONCURRENCY`, by shelling
+  out to a single `curl --parallel` invocation — falls back to the
+  original one-request-at-a-time `com.HttpRequest` path when `curl`
+  isn't on PATH. See [BENCHMARKS.md](../BENCHMARKS.md#parallel-packagejar-downloads--4gl-port-vs-go-implementation).
 - JSON whitespace of written files matches Go's 2-space
   `MarshalIndent` layout; key order and omission rules are identical.
 - The OAuth loopback callback binds a scanned port range (9101-9300 on

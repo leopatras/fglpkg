@@ -306,3 +306,112 @@ switching `explodeChars` to the `deleteElement`-based trim (a smaller
 gain here than for `cmpBytes`, since `pathMatch` decodes once per call
 rather than once per comparison). All 18 test programs / 1100+ checks
 still pass.
+
+## Parallel package/JAR downloads — 4GL port vs Go implementation
+
+Measured 2026-07-13 on an Apple-silicon Mac (curl 8.7.1/nghttp2, Genero
+6.00.02). Go's installer parallelizes downloads with goroutines
+(`internal/installer/parallel.go`, `runParallel`, spec in
+[specs/parallel-downloads.md](../specs/parallel-downloads.md)). BDL has
+no threads, and neither core BDL nor GWS has a sub-second `SLEEP` (both
+are integer-seconds-only; `util.Channels.selectWithTimeout` is also
+integer-seconds and selects on `base.Channel` sockets, not
+`com.HttpRequest`, anyway) — so a busy-poll over several
+`com.HttpRequest.doRequest()`/`getAsyncResponse()` objects was
+prototyped first and confirmed to genuinely overlap (8×0.5 s requests:
+4.0 s sequential vs 0.54 s polled, cap 8), but it (a) still runs the
+poll loop in the single BDL interpreter thread, cannot get HTTP/2
+multiplexing (GWS's HTTP client is HTTP/1.1 only), and (b) has no
+sleep/backoff, so it spins.
+
+**Decision: shell out to `curl --parallel` instead**, falling back to
+the original one-request-at-a-time `com.HttpRequest` path
+(`registry.downloadToFileAuth`, unchanged) when `curl` isn't on PATH.
+One `curl` process handles an entire phase (all BDL packages, all
+webcomponents, or all JARs): each download becomes its own `--next`
+segment with its own URL, auth headers and `-o` destination;
+`--parallel-max` (from `FGLPKG_INSTALL_CONCURRENCY`, default 4, same as
+Go) caps concurrency; a `-w` format
+(`%{filename_effective}\t%{http_code}\t%{exitcode}\t%{errormsg}`)
+appends one line per completed transfer to a shared status log, parsed
+back into per-task results after the single blocking `RUN`. Lines are
+matched to tasks by `filename_effective` (the `-o` path chosen
+ourselves), not by URL — GitHub/Maven Central routinely 302 to a
+signed CDN URL, so `url_effective` would not match what was requested.
+This moves all the "fire N, harvest as they finish" bookkeeping into
+curl's own process — 4GL doesn't reimplement a scheduler, and gets real
+HTTP/2 multiplexing for free against any server that supports it.
+Implementation: `installer.4gl` — `downloadAllAndVerify`,
+`downloadAllViaCurl`, `downloadAllSequential`, `checkCurlAvailable`.
+
+### Pitfall: `--parallel` alone doesn't fire everything immediately
+
+curl's `--parallel` defaults to waiting to discover whether the first
+transfer's connection can be multiplexed (HTTP/2) before committing the
+rest of the batch — for a plain HTTP/1.1 registry that's a wasted
+round-trip's worth of stall before the other transfers even start.
+Measured directly (3 concurrent 0.5 s-delayed requests to a
+`ThreadingHTTPServer`, `--parallel --parallel-max 3`, no other
+options): **1.03 s** — almost exactly 2× the expected ~0.5 s, i.e. only
+effectively one "round" of overlap instead of three-way concurrency.
+Adding `--parallel-immediate` (skip the multiplexing probe) fixed it:
+**0.52 s**, genuine N-way overlap. `downloadAllViaCurl` always passes
+`--parallel-immediate`.
+
+### Related latent bug found and fixed: `fglpkgutils.makeTempName()`
+
+Building a batch of download destinations calls `makeTempName()`
+several times back to back, before any of the returned paths are
+actually created on disk. The old implementation picked its numeric
+suffix by re-running a fresh "does `<base><i>.tmp>` already exist"
+probe on every call — with nothing yet created, every call in the same
+process/second passed that probe identically at `i=1` and returned the
+**same path**. Invisible before this change (nothing had ever called
+it more than once without creating the file in between); with 3
+packages downloading in parallel it surfaced immediately as "file
+doesn't exist" during checksum verification (two of the three curl
+`-o` targets silently collided, and the last writer won). Fixed by
+switching to a monotonic in-process counter (`_tempNameSeq`) for the
+suffix instead of re-deriving it from disk state each call — still
+verifies the chosen name doesn't exist on disk (defensive), but never
+repeats within a process regardless of timestamp granularity.
+
+### Results
+
+Real `fglpkg install` against the mock registry
+(`test/mock_registry.py`, `FGLPKG_MOCK_DOWNLOAD_DELAY=0.5` — an opt-in
+artificial per-artifact-download delay added for this measurement,
+0 by default) installing 3 BDL packages, 4GL (curl) vs Go (goroutines,
+`bin/fglpkg-go`, built from a working tree that already had
+`internal/installer/parallel.go`):
+
+| Concurrency | 4GL (curl) | Go (goroutines) |
+|---|---:|---:|
+| default (cap 4 → all 3 parallel) | **0.70 s** | **0.52 s** |
+| `FGLPKG_INSTALL_CONCURRENCY=1` (serialized) | 1.70 s | 1.54 s |
+
+Both show the expected ~1×delay (parallel) vs ~N×delay (serial) shape.
+Go is consistently ~0.15-0.2 s faster at both settings — plausible
+fixed overhead from shelling out to a `curl` subprocess per phase vs.
+Go's in-process goroutines + native HTTP client, not a scaling
+difference (the parallel/serial *ratio* is comparable: 4GL 2.4×, Go
+2.9×). Not investigated further — sub-second CLI installs, not a hot
+loop.
+
+Matches the expected ~1×delay (parallel) vs ~N×delay (serial) shape.
+The curl-unavailable fallback (`downloadAllSequential`) was verified by
+forcing `checkCurlAvailable()` to return false for one run — same
+install, same output, just no concurrency.
+
+### Failure semantics, verified against a real hard failure
+
+One package's artifact was corrupted post-publish (checksum mismatch)
+among 3. Confirmed matching Go's `runParallel` contract: the other two
+packages still finalized and printed their `✓` lines (phase-siblings
+run to completion regardless of a sibling's hard failure), and only
+after the whole phase finished did `installFromPlan` return the first
+hard error — which, one level up, skips the JARs phase entirely
+(mirrors Go's `installFromPlan`/`installFromLock`, where each
+`runParallel` call is followed by `if err != nil { return err }`
+before the next phase). Optional-scope failures still warn and are
+skipped without affecting this; unchanged from before this change.

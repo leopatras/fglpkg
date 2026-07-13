@@ -2,7 +2,7 @@
 name: bdl-porting-traps
 description: Genero BDL language/runtime traps that actually bit during the Go→4GL port — scan before touching g/fglpkg modules
 type: project
-last-updated: 2026-07-11
+last-updated: 2026-07-13
 ---
 
 # BDL traps hit during the port
@@ -94,6 +94,39 @@ this repo. Compressed checklist:
   for valid UTF-8, so this reproduces Go's byte-wise comparison
   exactly. `test/Makefile` also exports `FGL_LENGTH_SEMANTICS=CHAR` so
   tests exercise the same mode as production. See `g/BENCHMARKS.md`.
+
+- Neither core BDL nor GWS has a sub-second `SLEEP` — the syntax
+  requires an INTEGER seconds expression, and `SLEEP 0.01` silently
+  truncates to 0 (measured: 0.000 s elapsed vs `SLEEP 1`'s 1.005 s).
+  `util.Channels.selectWithTimeout` is the closest GWS analog but is
+  ALSO integer-seconds-only and selects on `base.Channel` server
+  sockets, not `com.HttpRequest`. There is no fine-grained wait
+  primitive anywhere in BDL/GWS — a tight busy-poll is the only option
+  if you need one (acceptable for a short-lived CLI, not for a
+  long-running server).
+- `fglpkgutils.makeTempName()`'s uniqueness check re-probed disk
+  existence on every call instead of tracking what it had already
+  issued — calling it several times back-to-back (e.g. building N
+  download destinations up front) before any of the returned paths
+  were created on disk made every call pass the same "doesn't exist
+  yet" probe and return the **identical path**. Invisible until
+  something called it more than once without creating the file in
+  between. Fixed with an in-process monotonic counter for the suffix
+  (see `g/BENCHMARKS.md` "parallel downloads"). Any function whose
+  contract is "return N distinct not-yet-existing names/paths" needs
+  to guarantee uniqueness by construction, not by re-checking disk
+  state each time — the disk isn't a reliable "already issued" ledger
+  until the caller actually writes there.
+- `curl --parallel` does NOT fire every transfer immediately by
+  default: it first waits to find out whether the initial connection
+  can be HTTP/2-multiplexed before committing the rest of the batch —
+  against a plain HTTP/1.1 server that's a wasted round-trip's stall
+  (measured: 3 concurrent 0.5 s-delayed requests via `--parallel
+  --parallel-max 3` took 1.03 s, ~2× the expected ~0.5 s). Add
+  `--parallel-immediate` to skip that probe and get true N-way overlap
+  (same test: 0.52 s). Relevant any time BDL shells out to curl for
+  concurrent transfers instead of trying to parallelize inside the
+  single-threaded interpreter.
 
 **How to apply:** consult the genero-intelligence MCP skills for any API
 you're not 100% sure about; when a compile fails with -6609 look for a

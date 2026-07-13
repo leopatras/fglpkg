@@ -270,7 +270,16 @@ FUNCTION checkRUN(cmd STRING)
   END IF
 END FUNCTION
 
-#+computes a temporary file name
+DEFINE _tempNameSeq INT
+
+#+computes a temporary file name — guaranteed unique across repeated
+#+calls within this same process even when called several times back
+#+to back before any of the returned names are actually created on
+#+disk (e.g. building a batch of download destinations up front): the
+#+suffix comes from a monotonic in-process counter, not from re-running
+#+the same "does this already exist" probe every time, which previously
+#+returned the same name for every call made inside the same CURRENT
+#+second (nothing had been created yet, so each probe passed identically)
 FUNCTION makeTempName() RETURNS STRING
   DEFINE tmpDir, tmpName, sbase, curr STRING
   DEFINE sb base.StringBuffer
@@ -293,7 +302,8 @@ FUNCTION makeTempName() RETURNS STRING
   LET sbase = SFMT("fglpkg_%1_%2", fgl_getpid(), sb.toString())
   LET sbase = os.Path.join(tmpDir, sbase)
   FOR i = 1 TO 10000
-    LET tmpName = SFMT("%1%2.tmp", sbase, i)
+    LET _tempNameSeq = _tempNameSeq + 1
+    LET tmpName = SFMT("%1%2.tmp", sbase, _tempNameSeq)
     IF NOT os.Path.exists(tmpName) THEN
       RETURN tmpName
     END IF

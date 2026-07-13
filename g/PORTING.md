@@ -26,9 +26,11 @@ Consequences of "parity first":
   sides together.
 - Deviations are allowed only where the platform forces them, and each
   one is documented (README "Deviations" section). Highlights: shell-out
-  zip handling, sequential downloads, loopback OAuth port scanning
-  (9101–9300), `CreateUUIDString()` for the sbom serialNumber, byte-level
-  zip differences (Info-ZIP vs archive/zip).
+  zip handling, shell-out `curl --parallel` for concurrent downloads
+  (falls back to sequential `com.HttpRequest` if curl is absent),
+  loopback OAuth port scanning (9101–9300), `CreateUUIDString()` for
+  the sbom serialNumber, byte-level zip differences (Info-ZIP vs
+  archive/zip).
 
 ## Layout and style decisions (confirmed by Leo)
 

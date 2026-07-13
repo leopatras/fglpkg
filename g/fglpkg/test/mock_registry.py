@@ -12,12 +12,17 @@ import hashlib
 import json
 import os
 import sys
+import time
 import urllib.parse
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 18800
 STATEDIR = sys.argv[2] if len(sys.argv) > 2 else "/tmp/fglpkg-mock"
 VALID_TOKENS = {"gpr_e2e_pat", "at_oauth_1", "at_oauth_2"}
+# opt-in artificial per-artifact-download delay, for proving concurrent
+# downloads actually overlap (see FGLPKG_INSTALL_CONCURRENCY tests);
+# 0 by default so it never affects the normal E2E suite
+ARTIFACT_DELAY = float(os.environ.get("FGLPKG_MOCK_DOWNLOAD_DELAY", "0"))
 
 os.makedirs(STATEDIR, exist_ok=True)
 
@@ -135,6 +140,8 @@ class Handler(BaseHTTPRequestHandler):
                 .get("artifacts", {}).get(variant)
             if not art:
                 return self._send(404, {"error": "no artifact"})
+            if ARTIFACT_DELAY:
+                time.sleep(ARTIFACT_DELAY)
             with open(art["path"], "rb") as f:
                 return self._send(200, f.read(), ctype="application/zip")
 
@@ -247,4 +254,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    HTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
+    # threaded: a delayed artifact download must not block other
+    # concurrent requests server-side, or a concurrency test against
+    # this mock would be measuring the mock, not the client
+    ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
