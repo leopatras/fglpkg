@@ -222,15 +222,22 @@ Arguments after the module name are passed to the program unchanged.
 		ListDetail: "\n(--dry-run prints what would happen without calling out;\n" +
 			" --ci for non-interactive pipelines: requires FGLPKG_TOKEN,\n" +
 			" prints a machine-readable status line)",
-		Usage: "fglpkg publish [--dry-run] [--ci] [--private|--public]",
+		Usage: "fglpkg publish [--dry-run] [--ci] [--private|--public] [--changelog <text>]",
 		Long: `FLAGS:
   --dry-run, -n            Print what would happen without any network calls
   --ci                     Non-interactive mode for pipelines: requires
                            FGLPKG_TOKEN and prints a machine-readable status line
   --private                Mark the package private on first publish
   --public                 Mark the package public on first publish (default)
+  --changelog <text>       Changelog text for this version (overrides CHANGELOG.md)
 
 Builds the package zip, uploads it, and submits the version for admin review.
+
+CHANGELOG:
+  When --changelog is not given, publish looks for a CHANGELOG.md in the project
+  root and sends the section whose heading names the version being published
+  (Keep a Changelog format, e.g. "## [1.2.0]"). If the file exists but has no
+  entry for the version, the changelog is sent empty and a warning is printed.
 `,
 	},
 	{

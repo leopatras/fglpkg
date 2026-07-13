@@ -419,6 +419,34 @@ The publish flow:
 2. Creates a GitHub Release tagged `{name}-v{version}` and uploads the zip as an asset
 3. Registers the metadata (including the GitHub download URL) with the registry server
 
+### Version Changelog
+
+Each published version can carry a changelog that the registry stores and the
+portals display. Publish resolves it in this order:
+
+1. `--changelog "<text>"` — inline text, useful in CI.
+2. **Automatic** (default): a `CHANGELOG.md` in the project root, in
+   [Keep a Changelog](https://keepachangelog.com) format. Publish sends only the
+   section whose heading names the version being published:
+
+   ```markdown
+   ## [1.2.0] - 2026-07-13
+
+   ### Added
+   - The thing you added.
+
+   ## [1.1.0] - 2026-06-01
+   - Older entry (not sent when publishing 1.2.0).
+   ```
+
+Headings may be bracketed (`## [1.2.0]`) or bare (`## 1.2.0`), with an optional
+`v` prefix and a trailing ` - date`. Only the entry for the version being
+published is sent — not the whole history.
+
+If `CHANGELOG.md` exists but has no entry for the version, publish prints a
+warning and sends an empty changelog (it does not block the publish). Use
+`fglpkg publish --dry-run` to preview the resolved changelog size before pushing.
+
 ### Unpublishing a Version
 
 To remove a published version from both the registry and GitHub:

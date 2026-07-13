@@ -54,6 +54,7 @@ func TestPublishPackageDryRunNoNetwork(t *testing.T) {
 		"6",                  // generoMajor
 		true,                 // dryRun
 		"",                   // visibilityOverride — use manifest default
+		"",                   // changelogText
 	)
 	if err != nil {
 		t.Fatalf("dry-run publishPackage returned error: %v", err)
@@ -115,7 +116,7 @@ func TestPublishPackageDryRunListsMetadata(t *testing.T) {
 	old := os.Stdout
 	r, w, _ := os.Pipe()
 	os.Stdout = w
-	runErr := publishPackage(m, "http://127.0.0.1:1", "6", true, "")
+	runErr := publishPackage(m, "http://127.0.0.1:1", "6", true, "", "")
 	_ = w.Close()
 	os.Stdout = old
 	var buf bytes.Buffer
@@ -133,7 +134,7 @@ func TestPublishPackageDryRunListsMetadata(t *testing.T) {
 		"license:      MIT",
 		"genero:       ^6.0.0",
 		"dependencies: 1 fgl, 1 java",
-		"readme:       0.0 KB", // "# Meta Test" is well under 1 KB
+		"readme:       11 B", // "# Meta Test" is 11 bytes, shown in bytes not KB
 		"userguide:",           // size line present
 		"(truncated)",          // oversized USERGUIDE flagged
 	}
@@ -142,4 +143,110 @@ func TestPublishPackageDryRunListsMetadata(t *testing.T) {
 			t.Errorf("dry-run output missing %q\n---output---\n%s", want, out)
 		}
 	}
+}
+
+// TestPublishPackageDryRunChangelog verifies that a CHANGELOG.md section for
+// the version being published shows a non-empty changelog size in the dry-run
+// preview.
+func TestPublishPackageDryRunChangelog(t *testing.T) {
+	dir := t.TempDir()
+	write := func(rel, content string) {
+		full := filepath.Join(dir, rel)
+		if err := os.WriteFile(full, []byte(content), 0644); err != nil {
+			t.Fatalf("write %s: %v", rel, err)
+		}
+	}
+	write("fglpkg.json", `{
+  "name": "cl-test",
+  "version": "1.2.0",
+  "description": "test",
+  "author": "me",
+  "license": "MIT",
+  "dependencies": { "fgl": {} }
+}`)
+	write("Main.42m", "MAIN\nEND MAIN\n")
+	write("CHANGELOG.md", "## [1.2.0] - 2026-07-13\n\n### Added\n- The changelog feature.\n\n## [1.1.0]\n\n- Older.\n")
+
+	origDir, _ := os.Getwd()
+	t.Cleanup(func() { _ = os.Chdir(origDir) })
+	if err := os.Chdir(dir); err != nil {
+		t.Fatalf("chdir: %v", err)
+	}
+	m, err := manifest.Load(".")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	out, runErr := captureDryRun(t, func() error {
+		return publishPackage(m, "http://127.0.0.1:1", "6", true, "", "")
+	})
+	if runErr != nil {
+		t.Fatalf("dry-run publishPackage returned error: %v", runErr)
+	}
+	if !strings.Contains(out, "changelog:") {
+		t.Errorf("dry-run output missing changelog line\n---output---\n%s", out)
+	}
+	// "## [1.1.0]" section must NOT leak into the 1.2.0 changelog.
+	if strings.Contains(out, "Older") {
+		t.Errorf("dry-run changelog leaked a different version's section\n---output---\n%s", out)
+	}
+	if strings.Contains(out, "changelog:(none)") || strings.Contains(out, "changelog:0.0 KB (none)") {
+		t.Errorf("expected a non-empty changelog size, got:\n%s", out)
+	}
+}
+
+// TestPublishPackageDryRunChangelogMissingSection verifies the soft warning
+// when CHANGELOG.md exists but has no entry for the published version.
+func TestPublishPackageDryRunChangelogMissingSection(t *testing.T) {
+	dir := t.TempDir()
+	write := func(rel, content string) {
+		if err := os.WriteFile(filepath.Join(dir, rel), []byte(content), 0644); err != nil {
+			t.Fatalf("write %s: %v", rel, err)
+		}
+	}
+	write("fglpkg.json", `{
+  "name": "cl-miss",
+  "version": "2.0.0",
+  "description": "test",
+  "author": "me",
+  "license": "MIT",
+  "dependencies": { "fgl": {} }
+}`)
+	write("Main.42m", "MAIN\nEND MAIN\n")
+	write("CHANGELOG.md", "## [1.0.0]\n\n- Only the old one.\n")
+
+	origDir, _ := os.Getwd()
+	t.Cleanup(func() { _ = os.Chdir(origDir) })
+	if err := os.Chdir(dir); err != nil {
+		t.Fatalf("chdir: %v", err)
+	}
+	m, err := manifest.Load(".")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	out, runErr := captureDryRun(t, func() error {
+		return publishPackage(m, "http://127.0.0.1:1", "6", true, "", "")
+	})
+	if runErr != nil {
+		t.Fatalf("dry-run publishPackage returned error: %v", runErr)
+	}
+	if !strings.Contains(out, "no entry for 2.0.0") {
+		t.Errorf("expected missing-section warning\n---output---\n%s", out)
+	}
+}
+
+// captureDryRun redirects os.Stdout for the duration of fn and returns what
+// it printed.
+func captureDryRun(t *testing.T, fn func() error) (string, error) {
+	t.Helper()
+	old := os.Stdout
+	r, w, _ := os.Pipe()
+	os.Stdout = w
+	err := fn()
+	_ = w.Close()
+	os.Stdout = old
+	var buf bytes.Buffer
+	_, _ = io.Copy(&buf, r)
+	return buf.String(), err
 }

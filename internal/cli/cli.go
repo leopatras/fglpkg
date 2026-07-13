@@ -974,11 +974,23 @@ func joinWithAnd(items []string) string {
 }
 
 // parsePublishFlags reads the publish flags: --dry-run/-n (preview, no
-// network), --ci (non-interactive pipeline mode), and --private/--public
-// (visibility override on first publish).
-func parsePublishFlags(args []string) (dryRun, ci bool, visibilityOverride string, err error) {
+// network), --ci (non-interactive pipeline mode), --private/--public
+// (visibility override on first publish), and --changelog <text> (inline
+// changelog for this version, overriding the auto CHANGELOG.md extraction
+// done at publish time).
+func parsePublishFlags(args []string) (dryRun, ci bool, visibilityOverride, changelogText string, err error) {
+	fail := func(format string, a ...any) (bool, bool, string, string, error) {
+		return false, false, "", "", fmt.Errorf(format, a...)
+	}
 	var wantPrivate, wantPublic bool
-	for _, a := range args {
+	// Loop by index so --changelog can consume the following argument. Both
+	// "--changelog value" and "--changelog=value" forms are accepted.
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if val, ok := strings.CutPrefix(a, "--changelog="); ok {
+			changelogText = val
+			continue
+		}
 		switch a {
 		case "--dry-run", "-n":
 			dryRun = true
@@ -988,23 +1000,29 @@ func parsePublishFlags(args []string) (dryRun, ci bool, visibilityOverride strin
 			wantPrivate = true
 		case "--public":
 			wantPublic = true
+		case "--changelog":
+			if i+1 >= len(args) {
+				return fail("%s requires a value", a)
+			}
+			i++
+			changelogText = args[i]
 		default:
-			return false, false, "", fmt.Errorf("unexpected argument %q", a)
+			return fail("unexpected argument %q", a)
 		}
 	}
 	if wantPrivate && wantPublic {
-		return false, false, "", fmt.Errorf("--private and --public are mutually exclusive")
+		return fail("--private and --public are mutually exclusive")
 	}
 	if wantPrivate {
 		visibilityOverride = "private"
 	} else if wantPublic {
 		visibilityOverride = "public"
 	}
-	return dryRun, ci, visibilityOverride, nil
+	return dryRun, ci, visibilityOverride, changelogText, nil
 }
 
 func cmdPublish(args []string) error {
-	dryRun, ci, visibilityOverride, err := parsePublishFlags(args)
+	dryRun, ci, visibilityOverride, changelogText, err := parsePublishFlags(args)
 	if err != nil {
 		return err
 	}
@@ -1065,7 +1083,7 @@ func cmdPublish(args []string) error {
 	if err := runHook(m, manifest.HookPrePublish, projectDir); err != nil {
 		return err
 	}
-	if err := publishPackage(m, registryURL, generoMajor, dryRun, visibilityOverride); err != nil {
+	if err := publishPackage(m, registryURL, generoMajor, dryRun, visibilityOverride, changelogText); err != nil {
 		return fmt.Errorf("publish failed: %w", err)
 	}
 	if dryRun {
@@ -1099,7 +1117,7 @@ func cmdPublish(args []string) error {
 //     streams the zip body. Server computes size + sha256 and stores in R2.
 //  5. POST /registry/packages/:slug/versions/:version/submit — marks the
 //     version pending so an admin reviews and approves.
-func publishPackage(m *manifest.Manifest, registryURL, generoMajor string, dryRun bool, visibilityOverride string) error {
+func publishPackage(m *manifest.Manifest, registryURL, generoMajor string, dryRun bool, visibilityOverride, changelogText string) error {
 	// 1. Build the zip.
 	zipData, checksum, err := buildPackageZip(m)
 	if err != nil {
@@ -1137,6 +1155,24 @@ func publishPackage(m *manifest.Manifest, registryURL, generoMajor string, dryRu
 	if err != nil {
 		return err
 	}
+
+	// Resolve the per-version changelog. An inline --changelog overrides
+	// everything; otherwise take the auto path — extract the CHANGELOG.md
+	// section matching this version. If a CHANGELOG exists but has no entry
+	// for m.Version, warn and send an empty changelog (publishing is not
+	// blocked) so the author knows to add one.
+	changelog := changelogText
+	if changelog == "" {
+		var found bool
+		changelog, found, err = collectChangelog(docRoot, m.Version)
+		if err != nil {
+			return err
+		}
+		if found && changelog == "" {
+			fmt.Printf("  ⚠ CHANGELOG found but has no entry for %s — publishing with an empty changelog\n", m.Version)
+		}
+	}
+
 	meta := registry.VersionMeta{
 		Repository:   m.Repository,
 		Author:       m.Author,
@@ -1152,7 +1188,8 @@ func publishPackage(m *manifest.Manifest, registryURL, generoMajor string, dryRu
 		fmt.Printf("            body: {slug:%q, name:%q, description:%q, visibility:%q}\n",
 			slug, m.Name, m.Description, visibility)
 		fmt.Printf("  [dry-run] would POST   %s/registry/packages/%s/versions\n", registryURL, slug)
-		fmt.Printf("            body: {version:%q, changelog:\"\"}\n", m.Version)
+		fmt.Printf("            body: {version:%q, changelog:%s}\n",
+			m.Version, docSizeLabel(changelog, changelogTruncationMarker))
 		fmt.Printf("            metadata:\n")
 		fmt.Printf("              repository:   %s\n", dryRunScalar(meta.Repository))
 		fmt.Printf("              author:       %s\n", dryRunScalar(meta.Author))
@@ -1179,7 +1216,7 @@ func publishPackage(m *manifest.Manifest, registryURL, generoMajor string, dryRu
 	// 3. Create version. 409 (already exists) is fine — caller is adding
 	//    a new variant to an existing version.
 	fmt.Println("  → POST   /registry/packages/" + slug + "/versions")
-	if err := registry.PublishCreateVersion(slug, m.Version, "", nil, meta); err != nil {
+	if err := registry.PublishCreateVersion(slug, m.Version, changelog, nil, meta); err != nil {
 		if !errors.Is(err, registry.ErrVersionExists) {
 			return err
 		}
@@ -1207,14 +1244,21 @@ func dryRunScalar(v string) string {
 	return v
 }
 
-// docSizeLabel renders a README/USERGUIDE body for the dry-run preview as a
-// human size, "(none)" when empty, and flags "(truncated)" when the cap
-// marker was appended.
+// docSizeLabel renders a README/USERGUIDE/changelog body for the dry-run
+// preview as a human size, "(none)" when empty, and flags "(truncated)" when
+// the cap marker was appended. Sub-kilobyte content is shown in bytes so a
+// short-but-present body reads as e.g. "48 B" rather than a misleading
+// "0.0 KB".
 func docSizeLabel(content, marker string) string {
 	if content == "" {
 		return "(none)"
 	}
-	label := fmt.Sprintf("%.1f KB", float64(len(content))/1024)
+	var label string
+	if n := len(content); n < 1024 {
+		label = fmt.Sprintf("%d B", n)
+	} else {
+		label = fmt.Sprintf("%.1f KB", float64(n)/1024)
+	}
 	if strings.HasSuffix(content, marker) {
 		label += " (truncated)"
 	}
