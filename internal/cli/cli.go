@@ -725,6 +725,254 @@ func parseSearchArgs(args []string) (term string, all bool, err error) {
 
 // ─── publish ──────────────────────────────────────────────────────────────────
 
+// isValidYesNo reports whether s begins with a "y" or "n" (case-insensitive),
+// i.e. whether it is a recognizable yes/no answer. The caller guarantees s is
+// non-empty.
+func isValidYesNo(s string) bool {
+	return strings.ToLower(string(s[0])) == "y" || strings.ToLower(string(s[0])) == "n"
+}
+
+// promptYesNo asks a yes/no question and returns the answer. A bare enter
+// accepts yesDefault (rendered as [Y/n] or [y/N]); an unrecognized answer
+// re-prompts. A closed or interrupted stdin (e.g. Ctrl+C) returns false
+// regardless of the default — a broken stream can never be affirmative consent,
+// so an interrupted confirmation must not be treated as a yes.
+func promptYesNo(prompt string, yesDefault bool) bool {
+	defaultRes := "y"
+	fullPrompt := prompt + " [Y/n]"
+	if !yesDefault {
+		defaultRes = "n"
+		fullPrompt = prompt + " [y/N]"
+	}
+
+	for {
+		fmt.Printf("%s: ", fullPrompt)
+		res, err := reader.ReadString('\n')
+		// Trim CR and LF to handle both Unix (\n) and Windows (\r\n) endings.
+		res = strings.TrimRight(res, "\r\n")
+		switch {
+		case err != nil && res == "":
+			// stdin closed or interrupted (e.g. Ctrl+C): treat as "not
+			// confirmed" and return false regardless of the default. A
+			// broken/closed stream can never be affirmative consent, so honoring
+			// a yes-default here would let an interrupted publish proceed. This
+			// also avoids re-prompting a stream that only ever returns EOF.
+			return false
+		case res == "":
+			// Bare enter accepts the default.
+			return defaultRes == "y"
+		case isValidYesNo(res):
+			return strings.ToLower(string(res[0])) == "y"
+		}
+		// Anything else was a typo at an interactive prompt: ask again.
+	}
+}
+
+// binaryToSourceExt maps each compiled binary extension to the source
+// extension it is produced from. checkForRecompile pairs a packaged binary
+// with the source it must be newer than, to warn when a binary looks stale.
+var binaryToSourceExt = map[string]string{
+	".42m": ".4gl",
+	".42f": ".per",
+	".42s": ".str",
+}
+
+// checkForRecompile warns when a compiled file about to be published looks
+// older than the source it was built from — a common "forgot to recompile"
+// mistake. Binaries come from the package zip (so nested paths are covered);
+// their sources are located anywhere in the project via a one-pass index, so
+// split src/ vs build/ layouts are handled, not just compile-in-place.
+func checkForRecompile(m *manifest.Manifest) {
+	zipData, _, err := buildPackageZip(m)
+	if err != nil {
+		return
+	}
+	entries, err := listZipEntries(zipData)
+	if err != nil {
+		return
+	}
+
+	ignore, err := loadIgnore(".")
+	if err != nil {
+		ignore = &ignoreSet{}
+	}
+	index := buildSourceIndex(ignore)
+
+	var stale []string
+	seen := make(map[string]bool)
+	for _, e := range entries {
+		binPath := e.name
+		if _, known := binaryToSourceExt[path.Ext(binPath)]; !known {
+			continue
+		}
+		binInfo, err := os.Stat(filepath.FromSlash(binPath))
+		if err != nil {
+			continue
+		}
+		binMTime := binInfo.ModTime()
+
+		sources, ok := resolveSource(binPath, index)
+		if !ok {
+			continue
+		}
+		// Compare against every plausible source: if any is newer than the
+		// binary, the binary may be stale. When the match is ambiguous this
+		// errs toward warning, which is the safer failure for a publish guard.
+		for _, src := range sources {
+			srcInfo, statErr := os.Stat(filepath.FromSlash(src))
+			if statErr != nil {
+				continue
+			}
+			if srcInfo.ModTime().After(binMTime) && !seen[src] {
+				seen[src] = true
+				stale = append(stale, src)
+				break
+			}
+		}
+	}
+
+	if len(stale) == 0 {
+		return
+	}
+	fmt.Printf("warning: %s may not have been recompiled\n", joinWithAnd(stale))
+	if !promptYesNo("Continue?", true) {
+		os.Exit(1)
+	}
+}
+
+// buildSourceIndex walks the project tree once and indexes every source file
+// (any extension appearing as a value in binaryToSourceExt) by its basename.
+// Paths are project-relative and slash-normalized so they compare cleanly
+// against zip entry names. The .fglpkg artifact dir and any files matched by
+// .fglpkgignore are skipped, so vendored/installed packages and deliberately
+// excluded files don't produce phantom source matches.
+func buildSourceIndex(ignore *ignoreSet) map[string][]string {
+	sourceExts := make(map[string]bool, len(binaryToSourceExt))
+	for _, ext := range binaryToSourceExt {
+		sourceExts[ext] = true
+	}
+
+	index := make(map[string][]string)
+	_ = filepath.Walk(".", func(p string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil // best-effort: skip unreadable subtrees
+		}
+		if info.IsDir() {
+			if isPackArtifactDir(p) {
+				return filepath.SkipDir
+			}
+			// Prune whole ignored subtrees (e.g. a "test/" rule) so their
+			// sources never enter the index.
+			if rel, relErr := filepath.Rel(".", p); relErr == nil && rel != "." {
+				if ignore.shouldExclude(filepath.ToSlash(rel), true) {
+					return filepath.SkipDir
+				}
+			}
+			return nil
+		}
+		if !sourceExts[filepath.Ext(p)] {
+			return nil
+		}
+		rel, relErr := filepath.Rel(".", p)
+		if relErr != nil {
+			rel = p
+		}
+		rel = filepath.ToSlash(rel)
+		if ignore.shouldExclude(rel, false) {
+			return nil
+		}
+		base := path.Base(rel)
+		index[base] = append(index[base], rel)
+		return nil
+	})
+	return index
+}
+
+// resolveSource picks the source file(s) most likely to have produced the
+// binary at binPath (a slash-separated, project-relative zip entry name),
+// choosing from the sources indexed by buildSourceIndex. It tries, in order:
+//  1. an exact sibling — a source at the identical relative path (compile-in-place);
+//  2. the candidate(s) sharing the longest trailing path-segment run with the
+//     binary — handles split layouts like src/… compiled to lib/…;
+//  3. a lone basename match anywhere in the tree — handles a flattened build dir.
+// When several candidates tie on the best path-suffix score, all tied paths are
+// returned so the caller can compare against each. ok is false when the binary
+// extension is unknown or no source with the expected basename exists.
+func resolveSource(binPath string, index map[string][]string) (sources []string, ok bool) {
+	binExt := path.Ext(binPath)
+	sourceExt, known := binaryToSourceExt[binExt]
+	if !known {
+		return nil, false
+	}
+	wantBase := strings.TrimSuffix(path.Base(binPath), binExt) + sourceExt
+	candidates := index[wantBase]
+	if len(candidates) == 0 {
+		return nil, false
+	}
+
+	binDir := path.Dir(binPath)
+
+	// Tier 1: exact sibling path (compile-in-place). Unambiguous, so return it.
+	sibling := path.Join(binDir, wantBase)
+	for _, c := range candidates {
+		if c == sibling {
+			return []string{c}, true
+		}
+	}
+
+	// Tier 2/3: rank by longest shared trailing path segments. A single
+	// candidate naturally wins (tier 3); genuine ties are all returned.
+	bestScore := -1
+	var best []string
+	for _, c := range candidates {
+		score := commonSuffixSegments(path.Dir(c), binDir)
+		switch {
+		case score > bestScore:
+			bestScore = score
+			best = []string{c}
+		case score == bestScore:
+			best = append(best, c)
+		}
+	}
+	return best, true
+}
+
+// commonSuffixSegments counts how many trailing path segments two
+// slash-separated directory paths share. "src/com/foo" and "lib/com/foo"
+// share 2 ("com", "foo"). Empty or "." dirs contribute no segments.
+func commonSuffixSegments(a, b string) int {
+	as, bs := splitDirSegments(a), splitDirSegments(b)
+	n := 0
+	for n < len(as) && n < len(bs) && as[len(as)-1-n] == bs[len(bs)-1-n] {
+		n++
+	}
+	return n
+}
+
+// splitDirSegments splits a slash-separated directory path into its segments,
+// treating an empty path or "." as having none.
+func splitDirSegments(p string) []string {
+	if p == "" || p == "." {
+		return nil
+	}
+	return strings.Split(p, "/")
+}
+
+// joinWithAnd renders a slice as a human list: "a", "a and b",
+// "a, b, and c".
+func joinWithAnd(items []string) string {
+	switch len(items) {
+	case 0:
+		return ""
+	case 1:
+		return items[0]
+	case 2:
+		return items[0] + " and " + items[1]
+	default:
+		return strings.Join(items[:len(items)-1], ", ") + ", and " + items[len(items)-1]
+	}
+}
+
 // parsePublishFlags reads the publish flags: --dry-run/-n (preview, no
 // network), --ci (non-interactive pipeline mode), and --private/--public
 // (visibility override on first publish).
@@ -807,6 +1055,9 @@ func cmdPublish(args []string) error {
 
 	if dryRun {
 		fmt.Printf("DRY RUN — no network calls will be made\n\n")
+	}
+	if !ci {
+		checkForRecompile(m)
 	}
 	variant := artifactVariant(m, generoMajor)
 	fmt.Printf("Publishing %s@%s (%s) to %s...\n", m.Name, m.Version, variantDescription(variant), registryURL)
