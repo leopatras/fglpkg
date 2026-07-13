@@ -993,14 +993,21 @@ func dryRunScalar(v string) string {
 	return v
 }
 
-// docSizeLabel renders a README/USERGUIDE body for the dry-run preview as a
-// human size, "(none)" when empty, and flags "(truncated)" when the cap
-// marker was appended.
+// docSizeLabel renders a README/USERGUIDE/changelog body for the dry-run
+// preview as a human size, "(none)" when empty, and flags "(truncated)" when
+// the cap marker was appended. Sub-kilobyte content is shown in bytes so a
+// short-but-present body reads as e.g. "48 B" rather than a misleading
+// "0.0 KB".
 func docSizeLabel(content, marker string) string {
 	if content == "" {
 		return "(none)"
 	}
-	label := fmt.Sprintf("%.1f KB", float64(len(content))/1024)
+	var label string
+	if n := len(content); n < 1024 {
+		label = fmt.Sprintf("%d B", n)
+	} else {
+		label = fmt.Sprintf("%.1f KB", float64(n)/1024)
+	}
 	if strings.HasSuffix(content, marker) {
 		label += " (truncated)"
 	}

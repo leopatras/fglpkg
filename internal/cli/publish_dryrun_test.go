@@ -134,7 +134,7 @@ func TestPublishPackageDryRunListsMetadata(t *testing.T) {
 		"license:      MIT",
 		"genero:       ^6.0.0",
 		"dependencies: 1 fgl, 1 java",
-		"readme:       0.0 KB", // "# Meta Test" is well under 1 KB
+		"readme:       11 B", // "# Meta Test" is 11 bytes, shown in bytes not KB
 		"userguide:",           // size line present
 		"(truncated)",          // oversized USERGUIDE flagged
 	}
