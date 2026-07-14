@@ -139,7 +139,7 @@ is kept. New steps, inserted **after** the build and **before** checksums:
           for b in bin/fglpkg-darwin-arm64 bin/fglpkg-darwin-amd64; do
             rcodesign sign \
               --p12-file cert.p12 --p12-password-file cert.pw \
-              --code-signature-flags runtime \
+              --for-notarization \
               "$b"
           done
 
@@ -155,9 +155,9 @@ is kept. New steps, inserted **after** the build and **before** checksums:
 ```
 
 Notes:
-- **Hardened runtime** (`--code-signature-flags runtime`) and a **secure timestamp** are both
-  required for notarization; `rcodesign` applies an Apple timestamp by default. Verify against the
-  pinned `rcodesign` version.
+- **`--for-notarization`** sets all the notarization prerequisites in one flag — hardened runtime,
+  a Developer ID certificate, and a secure timestamp; `rcodesign` applies an Apple timestamp by
+  default. Verify against the pinned `rcodesign` version.
 - `--p12-password-file` (not `--p12-password`) keeps the password out of the process argument list.
 - `--wait` blocks until Apple returns *accepted*/*rejected*; a rejection must **fail the job** so a
   bad release never publishes. On rejection, `rcodesign notary-log` prints Apple's reasons.
