@@ -144,7 +144,9 @@ content, entry order)** — a fact the staging design leans on for reproducibili
    `CreateHeader(FileInfoHeader(...))`, which would stamp the staged copies' mtimes into the archive
    and break reproducibility.
 8. **Validation:** `importRoot` must be a clean relative path (not absolute, no `..`); when `root` is
-   set, `root` must lie within `importRoot`. Each `include` entry must name an existing file; basename
+   set, `root` and `importRoot` must lie on the same branch — one must contain the other (root under
+   importRoot to scope the walk, or importRoot under root, e.g. the `fglpkg init` default `root: "."`);
+   a disjoint pair is rejected. Each `include` entry must name an existing file; basename
    collisions (with another entry, a rebased file, or the manifest) are rejected at pack time.
 
 ## Determinism & reproducibility
@@ -243,7 +245,7 @@ func (m *Manifest) PublishCopy() *Manifest {
 ### 5. Validation (`Validate`, `internal/manifest/manifest.go`)
 
 In [`Validate`](../internal/manifest/manifest.go#L589), enforce Decision 8: `importRoot` clean-relative
-and (if `root` set) `root` within `importRoot`. The `include`-existence and basename-collision checks
+and (if `root` set) `root`/`importRoot` on the same branch (one contains the other; `pathWithin`). The `include`-existence and basename-collision checks
 run at pack time (they need disk/stat access and the full computed layout), not during ordinary loads.
 
 ### 6. Docs (`docs/user-guide.md`)

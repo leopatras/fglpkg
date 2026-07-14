@@ -343,6 +343,38 @@ poiapi/
 
 When published, the zip preserves the full directory structure (`com/fourjs/poiapi/PoiApi.42m`). When installed, it extracts to `~/.fglpkg/packages/poiapi/com/fourjs/poiapi/PoiApi.42m`. Since `~/.fglpkg/packages/poiapi` is on the `FGLLDPATH`, Genero resolves `com.fourjs.poiapi` correctly.
 
+**Example: Compiled output under a build directory (`importRoot`)**
+
+Many projects compile into a build-output directory such as `lib/`, so the package files end up at `lib/com/fourjs/fglpkgtest/…`. Publishing that as-is would ship the `lib/` prefix, and `IMPORT FGL com.fourjs.fglpkgtest.*` would not resolve after install. Set `importRoot` to the directory whose *contents* should become the archive root:
+
+```
+fglpkgtest/
+├── fglpkg.json
+├── dist/
+│   └── app.4st
+└── lib/
+    └── com/
+        └── fourjs/
+            └── fglpkgtest/
+                ├── ModuleA.42m
+                └── ModuleB.42m
+```
+
+```json
+{
+  "name": "fglpkgtest",
+  "version": "1.0.0",
+  "root": "lib/com/fourjs/fglpkgtest",
+  "importRoot": "lib",
+  "files": ["*.42m"],
+  "include": ["dist/app.4st"]
+}
+```
+
+With `importRoot: "lib"`, packaged files are stored relative to `lib/`, so `lib/com/fourjs/fglpkgtest/ModuleA.42m` ships as `com/fourjs/fglpkgtest/ModuleA.42m` — the `lib/` prefix is stripped and imports resolve after install. Set `root` to the directory that directly holds your program modules (`fglpkg run` relies on it); `importRoot` must be a prefix of `root`.
+
+Use `include` for loose files that live outside `importRoot` but should sit at the archive root: each listed file is copied to the top of the archive under its **basename** (so `dist/app.4st` ships as `app.4st`). A file that must be namespaced (`com/fourjs/…`) belongs under `importRoot` in the source, not in `include`.
+
 ### File Selection
 
 By default, fglpkg collects files matching `*.42m`, `*.42f`, and `*.sch`. To customize this, use the `files` field:

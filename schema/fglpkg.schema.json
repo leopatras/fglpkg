@@ -66,9 +66,19 @@
       "type": "string",
       "description": "Base directory for package files, relative to this manifest. Defaults to \".\"."
     },
+    "importRoot": {
+      "type": "string",
+      "description": "Directory whose contents become the archive root. Packaged files under it are stored relative to it (e.g. lib/com/fourjs/x/M.42m -> com/fourjs/x/M.42m), so the package namespace sits at the FGLLDPATH root after install. importRoot and root must lie on the same path (one contains the other, e.g. root \".\" with importRoot \"lib\"); defaults to \".\" (no rebasing)."
+    },
     "files": {
       "type": "array",
       "description": "Glob patterns of files to include in the published zip. Defaults to [\"*.42m\", \"*.42f\", \"*.sch\"] when omitted.",
+      "items": { "type": "string" },
+      "uniqueItems": true
+    },
+    "include": {
+      "type": "array",
+      "description": "Extra project files folded into the archive root (top of importRoot), each stored under its basename.",
       "items": { "type": "string" },
       "uniqueItems": true
     },

@@ -895,6 +895,7 @@ func buildSourceIndex(ignore *ignoreSet) map[string][]string {
 //  2. the candidate(s) sharing the longest trailing path-segment run with the
 //     binary — handles split layouts like src/… compiled to lib/…;
 //  3. a lone basename match anywhere in the tree — handles a flattened build dir.
+//
 // When several candidates tie on the best path-suffix score, all tied paths are
 // returned so the caller can compare against each. ok is false when the binary
 // extension is unknown or no source with the expected basename exists.
@@ -1294,79 +1295,93 @@ func variantDescription(variant string) string {
 }
 
 func buildPackageZip(m *manifest.Manifest) ([]byte, string, error) {
-	var buf bytes.Buffer
-	h := sha256.New()
-	zw := zip.NewWriter(io.MultiWriter(&buf, h))
+	// Package by staging the exact archive layout in a throwaway temp
+	// directory and zipping that — the publisher's source tree is never
+	// written to. See specs/import-root.md.
+	stageDir, err := os.MkdirTemp("", "fglpkg-pack-")
+	if err != nil {
+		return nil, "", fmt.Errorf("cannot create staging directory: %w", err)
+	}
+	defer os.RemoveAll(stageDir)
 
+	if err := stagePackage(stageDir, m); err != nil {
+		return nil, "", err
+	}
+	return zipStageDir(stageDir)
+}
+
+// stagePackage materializes the full publishable layout under stageDir:
+// rebased BDL/bin files, webcomponents (with their "webcomponents/" strip),
+// docs at the archive root, explicit include files folded into the root by
+// basename, and the publish-safe manifest.
+func stagePackage(stageDir string, m *manifest.Manifest) error {
 	// Load .fglpkgignore from the project root (current directory). The
-	// manifest field is never excluded; everything else can be filtered.
+	// manifest is never excluded; everything else can be filtered.
 	ignore, err := loadIgnore(".")
 	if err != nil {
-		return nil, "", fmt.Errorf("cannot read %s: %w", ignoreFilename, err)
+		return fmt.Errorf("cannot read %s: %w", ignoreFilename, err)
 	}
 
-	added := make(map[string]bool)
+	// staged maps an archive path to the source it came from, so a second
+	// distinct source claiming the same path is reported as a collision
+	// (while the same source matched twice is a harmless no-op).
+	staged := make(map[string]string)
 
-	// Mixed packages run BOTH walkers — BDL files go in at project-relative
-	// paths; webcomponents go in at <COMPONENTTYPE>/<file> with the
-	// "webcomponents/" prefix stripped. A pure-WC manifest skips the BDL
-	// walk (HasBDLContent returns false); a pure-BDL manifest skips the
-	// webcomponent walk (HasWebcomponents returns false).
+	// include entries are folded in explicitly (below) and skipped by the
+	// BDL walk so they are not also picked up at a rebased path.
+	includeSet := make(map[string]bool)
+	for _, inc := range m.Include {
+		includeSet[filepath.Clean(inc)] = true
+	}
+
+	// Mixed packages run BOTH walkers. A pure-WC manifest skips the BDL walk
+	// (HasBDLContent returns false); a pure-BDL manifest skips the webcomponent
+	// walk (HasWebcomponents returns false).
 	if m.HasBDLContent() || !m.HasWebcomponents() {
-		if err := collectBDLFiles(zw, m, ignore, added); err != nil {
-			return nil, "", err
+		if err := stageBDLFiles(stageDir, m, ignore, staged, includeSet); err != nil {
+			return err
 		}
 	}
 	if m.HasWebcomponents() {
-		if err := collectWebcomponentFiles(zw, m, ignore, added); err != nil {
-			return nil, "", err
+		if err := stageWebcomponentFiles(stageDir, m, ignore, staged); err != nil {
+			return err
 		}
+	}
+	if err := stageDocFiles(stageDir, m, ignore, staged); err != nil {
+		return err
+	}
+	if err := stageIncludeFiles(stageDir, m, staged); err != nil {
+		return err
 	}
 
-	// Include doc files matching the docs glob patterns (kind-agnostic).
-	if err := addDocFilesToZip(zw, m, ignore, added); err != nil {
-		return nil, "", err
+	// Always write the manifest last, using a publish-safe copy so the shipped
+	// fglpkg.json omits devDependencies and reflects the post-strip layout.
+	// This is authoritative — it overwrites any file already staged at
+	// fglpkg.json rather than colliding.
+	mfData, err := json.MarshalIndent(m.PublishCopy(), "", "  ")
+	if err != nil {
+		return fmt.Errorf("cannot serialize publishable %s: %w", manifest.Filename, err)
 	}
-
-	// Always include the manifest, but use a publish-safe copy so the
-	// shipped fglpkg.json does not advertise devDependencies.
-	if !added[manifest.Filename] {
-		mfData, err := json.MarshalIndent(m.PublishCopy(), "", "  ")
-		if err != nil {
-			return nil, "", fmt.Errorf("cannot serialize publishable %s: %w", manifest.Filename, err)
-		}
-		fw, err := zw.Create(manifest.Filename)
-		if err != nil {
-			return nil, "", fmt.Errorf("cannot add %s to zip: %w", manifest.Filename, err)
-		}
-		if _, err := fw.Write(append(mfData, '\n')); err != nil {
-			return nil, "", fmt.Errorf("cannot write %s to zip: %w", manifest.Filename, err)
-		}
+	if err := os.WriteFile(filepath.Join(stageDir, manifest.Filename), append(mfData, '\n'), 0o644); err != nil {
+		return fmt.Errorf("cannot stage %s: %w", manifest.Filename, err)
 	}
-
-	if err := zw.Close(); err != nil {
-		return nil, "", err
-	}
-	return buf.Bytes(), hex.EncodeToString(h.Sum(nil)), nil
+	return nil
 }
 
-// collectBDLFiles walks the BDL package source tree, applying the manifest's
-// `files` patterns (defaulting to *.42m/*.42f/*.sch), and includes declared
-// `bin` scripts. The walked tree is m.Root (default ".").
-func collectBDLFiles(zw *zip.Writer, m *manifest.Manifest, ignore *ignoreSet, added map[string]bool) error {
-	// Determine the root directory for package files.
+// stageBDLFiles walks the BDL source tree (m.Root, default "."), applying the
+// manifest's `files` patterns (defaulting to *.42m/*.42f/*.sch) and declared
+// `bin` scripts, and stages each match at its path rebased under importRoot.
+// Files listed in `include` are skipped here — they are folded in separately.
+func stageBDLFiles(stageDir string, m *manifest.Manifest, ignore *ignoreSet, staged map[string]string, includeSet map[string]bool) error {
 	root := m.Root
 	if root == "" {
 		root = "."
 	}
-
-	// Use manifest's files list if specified, otherwise use defaults.
 	patterns := m.Files
 	if len(patterns) == 0 {
 		patterns = []string{"*.42m", "*.42f", "*.sch"}
 	}
 
-	// Walk the root directory tree and collect files matching the patterns.
 	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
@@ -1380,23 +1395,24 @@ func collectBDLFiles(zw *zip.Writer, m *manifest.Manifest, ignore *ignoreSet, ad
 		base := filepath.Base(path)
 		for _, pattern := range patterns {
 			matched, _ := filepath.Match(pattern, base)
-			if matched && !added[path] {
-				// Keep the path relative to the project directory (not
-				// root) so the full directory structure is preserved in
-				// the zip.  When extracted into ~/.fglpkg/packages/<name>/,
-				// files like com/fourjs/poiapi/Module.42m stay intact.
-				relPath, relErr := filepath.Rel(".", path)
-				if relErr != nil {
-					relPath = path
-				}
-				if ignore.shouldExclude(relPath, false) {
-					continue
-				}
-				added[path] = true
-				if err := addFileToZip(zw, path, relPath); err != nil {
-					return fmt.Errorf("cannot add %s to zip: %w", path, err)
-				}
+			if !matched {
+				continue
 			}
+			relPath, relErr := filepath.Rel(".", path)
+			if relErr != nil {
+				relPath = path
+			}
+			if includeSet[filepath.Clean(relPath)] {
+				return nil // folded in explicitly at the archive root
+			}
+			if ignore.shouldExclude(relPath, false) {
+				return nil
+			}
+			archivePath, err := stagePathFor(m.ImportRoot, relPath)
+			if err != nil {
+				return err
+			}
+			return stageFile(stageDir, archivePath, path, staged)
 		}
 		return nil
 	})
@@ -1404,14 +1420,10 @@ func collectBDLFiles(zw *zip.Writer, m *manifest.Manifest, ignore *ignoreSet, ad
 		return fmt.Errorf("error walking root %q: %w", root, err)
 	}
 
-	// Include bin script files so they are present in the installed package.
-	// Bin scripts named in the manifest take precedence over .fglpkgignore —
-	// dropping a declared `bin` script would silently break the package.
+	// Bin scripts are always shipped, even if .fglpkgignore would exclude them
+	// — dropping a declared `bin` script would silently break the package.
 	for _, scriptPath := range m.BinFiles() {
 		fullPath := filepath.Join(root, scriptPath)
-		if added[fullPath] {
-			continue
-		}
 		info, err := os.Stat(fullPath)
 		if err != nil {
 			return fmt.Errorf("bin script %q not found: %w", scriptPath, err)
@@ -1423,20 +1435,22 @@ func collectBDLFiles(zw *zip.Writer, m *manifest.Manifest, ignore *ignoreSet, ad
 		if relErr != nil {
 			relPath = fullPath
 		}
-		if err := addFileToZip(zw, fullPath, relPath); err != nil {
-			return fmt.Errorf("cannot add bin script %s to zip: %w", scriptPath, err)
+		archivePath, err := stagePathFor(m.ImportRoot, relPath)
+		if err != nil {
+			return err
 		}
-		added[fullPath] = true
+		if err := stageFile(stageDir, archivePath, fullPath, staged); err != nil {
+			return err
+		}
 	}
 	return nil
 }
 
-// collectWebcomponentFiles walks each declared webcomponents/<COMPONENTTYPE>/
-// directory and adds its contents to the zip with the leading "webcomponents/"
-// prefix stripped — so a source file at webcomponents/3DChart/3DChart.html
-// is stored in the zip as 3DChart/3DChart.html. Each declared COMPONENTTYPE
-// must have a directory and a <COMPONENTTYPE>.html entry point.
-func collectWebcomponentFiles(zw *zip.Writer, m *manifest.Manifest, ignore *ignoreSet, added map[string]bool) error {
+// stageWebcomponentFiles stages each declared webcomponents/<COMPONENTTYPE>/
+// tree with the leading "webcomponents/" prefix stripped — so a source file at
+// webcomponents/3DChart/3DChart.html is stored as 3DChart/3DChart.html. Each
+// declared COMPONENTTYPE must have a directory and a <COMPONENTTYPE>.html entry.
+func stageWebcomponentFiles(stageDir string, m *manifest.Manifest, ignore *ignoreSet, staged map[string]string) error {
 	for _, name := range m.Webcomponents {
 		srcDir := filepath.Join("webcomponents", name)
 		info, err := os.Stat(srcDir)
@@ -1456,9 +1470,6 @@ func collectWebcomponentFiles(zw *zip.Writer, m *manifest.Manifest, ignore *igno
 			if info.IsDir() {
 				return nil
 			}
-			if added[path] {
-				return nil
-			}
 			relPath, relErr := filepath.Rel(".", path)
 			if relErr != nil {
 				relPath = path
@@ -1466,20 +1477,14 @@ func collectWebcomponentFiles(zw *zip.Writer, m *manifest.Manifest, ignore *igno
 			if ignore.shouldExclude(relPath, false) {
 				return nil
 			}
-			// Strip the leading "webcomponents/" so the in-zip path is
+			// Strip the leading "webcomponents/" so the archive path is
 			// <COMPONENTTYPE>/<file> — matching the layout the installer
 			// extracts directly into .fglpkg/webcomponents/.
 			zipPath, relErr := filepath.Rel("webcomponents", relPath)
 			if relErr != nil {
-				return fmt.Errorf("cannot compute zip path for %s: %w", relPath, relErr)
+				return fmt.Errorf("cannot compute archive path for %s: %w", relPath, relErr)
 			}
-			// Zip paths use forward slashes regardless of host OS.
-			zipPath = filepath.ToSlash(zipPath)
-			if err := addFileToZip(zw, path, zipPath); err != nil {
-				return fmt.Errorf("cannot add %s to zip: %w", path, err)
-			}
-			added[path] = true
-			return nil
+			return stageFile(stageDir, filepath.ToSlash(zipPath), path, staged)
 		})
 		if err != nil {
 			return fmt.Errorf("error walking webcomponent %q: %w", name, err)
@@ -1488,10 +1493,9 @@ func collectWebcomponentFiles(zw *zip.Writer, m *manifest.Manifest, ignore *igno
 	return nil
 }
 
-// addDocFilesToZip adds files matching the manifest's Docs globs at their
-// project-relative paths (no prefix stripping; docs live at the zip root).
-// Kind-agnostic — applies to both BDL and webcomponent packages.
-func addDocFilesToZip(zw *zip.Writer, m *manifest.Manifest, ignore *ignoreSet, added map[string]bool) error {
+// stageDocFiles stages files matching the manifest's Docs globs at their
+// project-relative path (no rebasing; docs live at the archive root).
+func stageDocFiles(stageDir string, m *manifest.Manifest, ignore *ignoreSet, staged map[string]string) error {
 	if len(m.Docs) == 0 {
 		return nil
 	}
@@ -1505,9 +1509,6 @@ func addDocFilesToZip(zw *zip.Writer, m *manifest.Manifest, ignore *ignoreSet, a
 			}
 			return nil
 		}
-		if added[path] {
-			return nil
-		}
 		relPath, relErr := filepath.Rel(".", path)
 		if relErr != nil {
 			relPath = path
@@ -1517,15 +1518,134 @@ func addDocFilesToZip(zw *zip.Writer, m *manifest.Manifest, ignore *ignoreSet, a
 				if ignore.shouldExclude(relPath, false) {
 					break
 				}
-				if err := addFileToZip(zw, path, relPath); err != nil {
-					return fmt.Errorf("cannot add doc file %s to zip: %w", path, err)
+				if err := stageFile(stageDir, relPath, path, staged); err != nil {
+					return err
 				}
-				added[path] = true
 				break
 			}
 		}
 		return nil
 	})
+}
+
+// stageIncludeFiles folds each `include` entry into the archive root under its
+// basename ("copy into the top of importRoot"). A basename that collides with
+// another staged file is reported by stageFile.
+func stageIncludeFiles(stageDir string, m *manifest.Manifest, staged map[string]string) error {
+	for _, inc := range m.Include {
+		info, err := os.Stat(inc)
+		if err != nil {
+			return fmt.Errorf("include %q not found: %w", inc, err)
+		}
+		if info.IsDir() {
+			return fmt.Errorf("include %q is a directory, not a file", inc)
+		}
+		if err := stageFile(stageDir, filepath.Base(inc), inc, staged); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// stagePathFor returns the archive path for a packaged file, rebased under
+// importRoot when set. It errors if the file lies outside importRoot (which
+// would otherwise produce a "../" escape) — the caller must fix root/importRoot
+// or fold the file in via `include`.
+func stagePathFor(importRoot, relPath string) (string, error) {
+	base := importRoot
+	if base == "" {
+		base = "."
+	}
+	rel, err := filepath.Rel(base, relPath)
+	if err != nil {
+		return "", fmt.Errorf("cannot place %q under importRoot %q: %w", relPath, importRoot, err)
+	}
+	rel = filepath.ToSlash(rel)
+	if rel == ".." || strings.HasPrefix(rel, "../") {
+		return "", fmt.Errorf("file %q is outside importRoot %q — fix root/importRoot/files or add it to include", relPath, importRoot)
+	}
+	return rel, nil
+}
+
+// stageFile copies srcDiskPath into stageDir at archivePath, creating parent
+// directories. Staging two distinct sources at the same archive path is a
+// collision (hard error); staging the same source twice is a no-op.
+func stageFile(stageDir, archivePath, srcDiskPath string, staged map[string]string) error {
+	archivePath = filepath.ToSlash(archivePath)
+	if prev, ok := staged[archivePath]; ok {
+		if filepath.Clean(prev) == filepath.Clean(srcDiskPath) {
+			return nil
+		}
+		return fmt.Errorf("archive path %q is claimed by both %q and %q", archivePath, prev, srcDiskPath)
+	}
+	dest := filepath.Join(stageDir, filepath.FromSlash(archivePath))
+	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+		return err
+	}
+	if err := copyFile(srcDiskPath, dest); err != nil {
+		return fmt.Errorf("cannot stage %s: %w", srcDiskPath, err)
+	}
+	staged[archivePath] = srcDiskPath
+	return nil
+}
+
+// copyFile copies the contents of src into dst (created/truncated).
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		return err
+	}
+	return out.Close()
+}
+
+// zipStageDir walks the staged tree, adds every file to a deterministic zip in
+// sorted archive-path order, and returns the zip bytes and their SHA256.
+// Entries are written with zip.Writer.Create (constant metadata) so the archive
+// is reproducible — do NOT switch to a FileInfo-derived header, which would
+// stamp the staged copies' mtimes into the archive.
+func zipStageDir(stageDir string) ([]byte, string, error) {
+	type stagedEntry struct{ archivePath, diskPath string }
+	var entries []stagedEntry
+	err := filepath.Walk(stageDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			return nil
+		}
+		rel, err := filepath.Rel(stageDir, path)
+		if err != nil {
+			return err
+		}
+		entries = append(entries, stagedEntry{filepath.ToSlash(rel), path})
+		return nil
+	})
+	if err != nil {
+		return nil, "", fmt.Errorf("cannot read staging directory: %w", err)
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].archivePath < entries[j].archivePath })
+
+	var buf bytes.Buffer
+	h := sha256.New()
+	zw := zip.NewWriter(io.MultiWriter(&buf, h))
+	for _, e := range entries {
+		if err := addFileToZip(zw, e.diskPath, e.archivePath); err != nil {
+			return nil, "", fmt.Errorf("cannot add %s to zip: %w", e.archivePath, err)
+		}
+	}
+	if err := zw.Close(); err != nil {
+		return nil, "", err
+	}
+	return buf.Bytes(), hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // isPackArtifactDir reports whether a directory should never appear in

@@ -64,11 +64,13 @@ type Manifest struct {
 	// to resolve or download one only emits a warning rather than aborting
 	// the install. Their transitive deps inherit the optional tolerance.
 	OptionalDependencies Dependencies      `json:"optionalDependencies,omitempty"`
-	Root                 string            `json:"root,omitempty"`     // base directory for package files (default ".")
-	Files                []string          `json:"files,omitempty"`    // glob patterns for package zip
-	Bin                  map[string]string `json:"bin,omitempty"`      // command name -> script path
-	Docs                 []string          `json:"docs,omitempty"`     // glob patterns for doc files
-	Programs             []string          `json:"programs,omitempty"` // modules with MAIN blocks (e.g. "PoiConvert")
+	Root                 string            `json:"root,omitempty"`       // base directory for package files (default ".")
+	ImportRoot           string            `json:"importRoot,omitempty"` // dir whose contents become the archive root (prefix stripped)
+	Files                []string          `json:"files,omitempty"`      // glob patterns for package zip
+	Include              []string          `json:"include,omitempty"`    // extra files folded into the archive root by basename
+	Bin                  map[string]string `json:"bin,omitempty"`        // command name -> script path
+	Docs                 []string          `json:"docs,omitempty"`       // glob patterns for doc files
+	Programs             []string          `json:"programs,omitempty"`   // modules with MAIN blocks (e.g. "PoiConvert")
 	// Webcomponents lists the COMPONENTTYPE names this package provides.
 	// Required (and non-empty) when Type is KindWebcomponent; forbidden
 	// otherwise. Each name matches Genero's COMPONENTTYPE lexical rule and
@@ -472,6 +474,25 @@ func (m *Manifest) MarshalJSON() ([]byte, error) {
 func (m *Manifest) PublishCopy() *Manifest {
 	clone := *m
 	clone.DevDependencies = Dependencies{}
+	// importRoot rebases the archive to strip a build-output prefix, so the
+	// shipped manifest must describe the post-strip layout: rewrite root to its
+	// path relative to importRoot (so `fglpkg run` and FGLLDPATH resolve against
+	// the installed tree) and drop importRoot/include, which have already been
+	// applied to the staged archive.
+	if clone.ImportRoot != "" {
+		base := clone.Root
+		if base == "" {
+			base = "."
+		}
+		if rebased, err := filepath.Rel(clone.ImportRoot, base); err == nil {
+			rebased = filepath.ToSlash(rebased)
+			if rebased != ".." && !strings.HasPrefix(rebased, "../") {
+				clone.Root = rebased
+			}
+		}
+		clone.ImportRoot = ""
+	}
+	clone.Include = nil
 	return &clone
 }
 
@@ -623,6 +644,27 @@ func (m *Manifest) Validate() error {
 			return err
 		}
 	}
+	if m.ImportRoot != "" {
+		if err := safeRelPath("importRoot", m.ImportRoot); err != nil {
+			return err
+		}
+		if m.Root != "" {
+			// root and importRoot must lie on the same branch — one must
+			// contain the other. root under importRoot scopes the walk
+			// (root "lib/com/x", importRoot "lib"); importRoot under root
+			// covers the `fglpkg init` default (root ".", importRoot "lib").
+			// A disjoint pair can never rebase any file, so it is rejected.
+			ir, rt := filepath.Clean(m.ImportRoot), filepath.Clean(m.Root)
+			if !pathWithin(ir, rt) && !pathWithin(rt, ir) {
+				return fmt.Errorf("root %q and importRoot %q are on different paths; one must contain the other", m.Root, m.ImportRoot)
+			}
+		}
+	}
+	for i, inc := range m.Include {
+		if err := safeRelPath(fmt.Sprintf("include[%d]", i), inc); err != nil {
+			return err
+		}
+	}
 	for _, pattern := range m.Docs {
 		// Strip doublestar segments for validation since filepath.Match
 		// doesn't support "**", but the rest of the pattern must be valid.
@@ -758,4 +800,16 @@ func safeRelPath(field, p string) error {
 		return fmt.Errorf("%s %q must not escape the package root with ..", field, p)
 	}
 	return nil
+}
+
+// pathWithin reports whether target is base or a descendant of base, comparing
+// cleaned relative paths (no "../" escape). Both paths are treated as relative
+// to the package root.
+func pathWithin(base, target string) bool {
+	rel, err := filepath.Rel(base, target)
+	if err != nil {
+		return false
+	}
+	rel = filepath.ToSlash(rel)
+	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, "../"))
 }
