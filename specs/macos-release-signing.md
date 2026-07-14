@@ -216,17 +216,27 @@ are the signed ones, and `checksums.txt` reflects their post-sign hashes.
 - **In-pipeline:** `rcodesign notary-submit --wait` gates the release — a non-accepted result fails
   the job. Optionally add `rcodesign print-signature-info bin/fglpkg-darwin-arm64` to log the
   Developer-ID authority for the build record.
-- **Manual, on a Mac (the real test):** on a machine that has never run the binary, **download the
-  release asset via a browser** and run it — it must launch with **no Gatekeeper prompt**. Then
-  verify:
+- **The real test — run a quarantined copy.** For a **bare CLI binary** the definitive check is
+  whether a quarantined copy *runs*: a signed-but-not-notarized quarantined Mach-O is killed by
+  Gatekeeper on execution, while a notarized one passes Gatekeeper's online cdhash check and runs.
+  Download the release asset **via a browser** (which sets `com.apple.quarantine`) and run it — it
+  must print its version with **no Gatekeeper prompt**:
   ```bash
-  codesign -dvv --verbose=4 fglpkg-darwin-arm64   # Authority = Developer ID Application: Four Js…
-  spctl -a -t exec -vv fglpkg-darwin-arm64        # → "accepted", source=Notarized Developer ID
+  xattr -p com.apple.quarantine fglpkg-darwin-arm64   # confirm it IS quarantined (browser download)
+  ./fglpkg-darwin-arm64 version                        # must run; pre-fix a quarantined copy is blocked
   ```
-- **Simulating quarantine without a browser** (for CI-adjacent testing on a mac):
+- **⚠️ `spctl` is not a valid check for bare binaries.** `spctl -a -t exec -vv fglpkg-darwin-arm64`
+  reports `rejected (the code is valid but does not seem to be an app)` **whether or not** the binary
+  is notarized — its `exec` assessment only understands `.app` bundles, not standalone executables.
+  Do **not** read that "rejected" as a signing/notarization failure; use the run-while-quarantined
+  test above. `codesign -dvv --verbose=4 fglpkg-darwin-arm64` is still useful for the **signature**
+  (`Authority = Developer ID Application: …`, `flags=…(runtime)`, a `Timestamp`) — just not notarization.
+- **Clean-room reassessment** (rules out a cached "Open Anyway"): copy to a new path, apply a fresh
+  quarantine, and run — a notarized binary still runs:
   ```bash
-  xattr -w com.apple.quarantine "0081;00000000;Safari;" fglpkg-darwin-arm64
-  ./fglpkg-darwin-arm64 version   # must run; pre-fix this is blocked
+  cp fglpkg-darwin-arm64 /tmp/gk && xattr -c /tmp/gk
+  xattr -w com.apple.quarantine "0001;$(printf '%x' "$(date +%s)");Safari;$(uuidgen)" /tmp/gk
+  /tmp/gk version   # must run
   ```
 - **Both architectures** (`arm64`, `amd64`) validated. amd64 can be exercised on Apple Silicon via
   Rosetta or on an Intel Mac.
