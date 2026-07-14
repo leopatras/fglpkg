@@ -10,6 +10,7 @@ import (
 	"github.com/4js-mikefolcher/fglpkg/internal/config"
 	"github.com/4js-mikefolcher/fglpkg/internal/registry"
 	"github.com/4js-mikefolcher/fglpkg/internal/resolver"
+	"github.com/4js-mikefolcher/fglpkg/internal/semver"
 )
 
 // RepositorySet fronts one or more providers and implements the routing +
@@ -26,11 +27,12 @@ import (
 type RepositorySet struct {
 	providers   []Provider                 // priority order (lowest priority value first)
 	descriptors map[string]config.Registry // provider name → descriptor (for Admits)
-	pins        map[string]string          // package name → required registry name
+	pins        map[string]string          // package name → required registry name (root manifest / explicit)
 	restrictTo  string                     // if set, resolution is limited to this provider
 
-	mu     sync.Mutex
-	routes map[string]routeDecision
+	mu           sync.Mutex
+	declaredPins map[string]string // package name → registry declared by a depending package's manifest
+	routes       map[string]routeDecision
 }
 
 type routeDecision struct {
@@ -53,11 +55,47 @@ func NewRepositorySet(providers []Provider, descriptors []config.Registry, pins 
 		pins = map[string]string{}
 	}
 	return &RepositorySet{
-		providers:   ordered,
-		descriptors: dmap,
-		pins:        pins,
-		routes:      map[string]routeDecision{},
+		providers:    ordered,
+		descriptors:  dmap,
+		pins:         pins,
+		declaredPins: map[string]string{},
+		routes:       map[string]routeDecision{},
 	}
+}
+
+// DeclarePin records that a depending package's manifest pinned name to a
+// registry. An explicit root/manifest pin (rs.pins) always wins and silently
+// overrides. Two packages pinning the same name to different registries is an
+// unresolvable ambiguity and returns an error. Must be called before the name
+// is first routed (the resolver declares pins as it discovers each package's
+// dependencies, before enqueuing them).
+func (rs *RepositorySet) DeclarePin(name, registry string) error {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	if _, isRoot := rs.pins[name]; isRoot {
+		return nil // consumer's explicit pin wins
+	}
+	if existing, ok := rs.declaredPins[name]; ok {
+		if existing != registry {
+			return fmt.Errorf(
+				"dependency %q is pinned to different repositories by different packages (%q vs %q); "+
+					"pin it explicitly in fglpkg.json to break the tie:\n"+
+					"      \"dependencies\": { \"fgl\": { %q: { \"version\": \"…\", \"registry\": %q } } }",
+				name, existing, registry, name, existing)
+		}
+		return nil
+	}
+	rs.declaredPins[name] = registry
+	return nil
+}
+
+// pinFor returns the effective pin for name — an explicit root/manifest pin
+// takes precedence over a pin declared by a depending package.
+func (rs *RepositorySet) pinFor(name string) string {
+	if p := rs.pins[name]; p != "" {
+		return p
+	}
+	return rs.declaredPins[name]
 }
 
 // Restrict limits resolution to the single named provider (the --registry flag).
@@ -82,6 +120,41 @@ func (rs *RepositorySet) Info(name, version, generoMajor string) (*registry.Pack
 		return nil, err
 	}
 	return d.provider.FetchInfo(name, version, generoMajor)
+}
+
+// Resolve picks the highest version of name satisfying constraint and returns
+// its full metadata, routed through the same routing + collision guard as the
+// resolver's fetchers. It is the multi-provider analog of registry.Resolve,
+// used by `fglpkg install <pkg>` to add a package that may live in a secondary
+// repository (an Artifactory repo, not just GI).
+func (rs *RepositorySet) Resolve(name, constraint, generoMajor string) (*registry.PackageInfo, error) {
+	d, err := rs.route(name)
+	if err != nil {
+		return nil, err
+	}
+	candidates := make([]semver.Version, 0, len(d.versions))
+	for _, cv := range d.versions {
+		candidates = append(candidates, cv.Version)
+	}
+	c, err := semver.ParseConstraint(constraint)
+	if err != nil {
+		return nil, fmt.Errorf("invalid version constraint %q: %w", constraint, err)
+	}
+	best, err := c.Latest(candidates)
+	if err != nil {
+		return nil, fmt.Errorf("no version of %q satisfies constraint %q", name, constraint)
+	}
+	return d.provider.FetchInfo(name, best.String(), generoMajor)
+}
+
+// configuredNames returns the provider names in priority order, for use in
+// diagnostics (e.g. an unknown-registry pin error).
+func (rs *RepositorySet) configuredNames() string {
+	names := make([]string, 0, len(rs.providers))
+	for _, p := range rs.providers {
+		names = append(names, p.Name())
+	}
+	return strings.Join(names, ", ")
 }
 
 func (rs *RepositorySet) byName(name string) Provider {
@@ -123,12 +196,16 @@ func (rs *RepositorySet) route(name string) (routeDecision, error) {
 		return d, nil
 	}
 
-	// Pinned name → that provider only (deterministic short-circuit).
-	if pin := rs.pins[name]; pin != "" {
+	// Pinned name → that provider only (deterministic short-circuit). Covers an
+	// explicit root-manifest pin and a pin declared by a depending package.
+	if pin := rs.pinFor(name); pin != "" {
 		p := rs.byName(pin)
 		if p == nil {
 			return routeDecision{}, fmt.Errorf(
-				"package %q is pinned to registry %q, which is not configured", name, pin)
+				"package %q is pinned to registry %q, which is not configured.\n"+
+					"  Configured registries: %s\n"+
+					"  Fix the name in fglpkg.json, or add %q to fglpkg.json / ~/.fglpkg/config.json.",
+				name, pin, rs.configuredNames(), pin)
 		}
 		vs, err := p.FetchVersions(name)
 		if err != nil {

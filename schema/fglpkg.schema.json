@@ -137,6 +137,10 @@
       "type": "array",
       "description": "Additional package repositories (e.g. a JFrog Artifactory instance) consulted alongside the built-in Genero Intelligence registry. Committed with the project; credentials stay per-developer in ~/.fglpkg/credentials.json.",
       "items": { "$ref": "#/definitions/registry" }
+    },
+    "defaultRegistry": {
+      "type": "string",
+      "description": "Name of the repository that `fglpkg publish` targets when no --registry flag is given (and FGLPKG_PUBLISH_REGISTRY is unset). Lets a team that publishes to their own Artifactory avoid passing --registry every time. Omit (or use \"gi\") to publish to the Genero Intelligence registry. Publish-only: does not affect which repository packages are consumed from."
     }
   },
   "definitions": {

@@ -72,23 +72,48 @@ func BuiltinGI(fglpkgRegistry string) Registry {
 // LoadGlobal reads {home}/config.json and returns its registries. A missing
 // file is not an error (returns nil). Unknown fields are rejected to catch typos.
 func LoadGlobal(home string) ([]Registry, error) {
+	g, err := loadGlobalFile(home)
+	return g.Registries, err
+}
+
+// GlobalFile is the parsed shape of ~/.fglpkg/config.json.
+type GlobalFile struct {
+	Registries      []Registry `json:"registries"`
+	DefaultRegistry string     `json:"defaultRegistry"` // logical name of the default publish target
+}
+
+// loadGlobalFile reads and parses the global config file. A missing or
+// blank/whitespace-only file yields a zero GlobalFile (not an error). Unknown
+// fields are rejected to catch typos.
+func loadGlobalFile(home string) (GlobalFile, error) {
 	p := filepath.Join(home, GlobalFilename)
 	data, err := os.ReadFile(p)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, nil
+			return GlobalFile{}, nil
 		}
-		return nil, err
+		return GlobalFile{}, err
 	}
-	var f struct {
-		Registries []Registry `json:"registries"`
+	// A blank or whitespace-only file is treated as "no config", the same as a
+	// missing file — an empty file is morally identical to absence, and an
+	// editor leaving a 0-byte file should not hard-fail every command.
+	if len(bytes.TrimSpace(data)) == 0 {
+		return GlobalFile{}, nil
 	}
+	var f GlobalFile
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&f); err != nil {
-		return nil, fmt.Errorf("invalid %s: %w", p, err)
+		return GlobalFile{}, fmt.Errorf("invalid %s: %w", p, err)
 	}
-	return f.Registries, nil
+	return f, nil
+}
+
+// GlobalDefaultRegistry returns the defaultRegistry declared in the global
+// config file, or "" if none (or no file). Errors mirror LoadGlobal.
+func GlobalDefaultRegistry(home string) (string, error) {
+	g, err := loadGlobalFile(home)
+	return g.DefaultRegistry, err
 }
 
 // Load resolves the effective registry set: built-in GI (honoring

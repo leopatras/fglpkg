@@ -80,7 +80,39 @@ var (
 	genero320 = genero.MustParse("3.20.05")
 )
 
+// recordingPinDeclarer captures the per-dependency registry pins the resolver
+// discovers, to assert they are threaded from a package's FGLDepPins.
+type recordingPinDeclarer struct{ pins map[string]string }
+
+func (r *recordingPinDeclarer) DeclarePin(name, registry string) error {
+	r.pins[name] = registry
+	return nil
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────────
+
+// TestResolveThreadsDeclaredPin verifies that a registry pin declared in a
+// resolved package's manifest (FGLDepPins) is handed to the PinDeclarer for its
+// transitive dependency, so routing can honour the author's stated source.
+func TestResolveThreadsDeclaredPin(t *testing.T) {
+	a := pkg("a", "1.0.0", map[string]string{"b": "^1.0.0"})
+	a.FGLDepPins = map[string]string{"b": "acme"}
+	db := packageDB{
+		"a": {"1.0.0": entry("", a)},
+		"b": {"1.0.0": entry("", pkg("b", "1.0.0", nil))},
+	}
+	root := manifest.New("myapp", "1.0.0", "", "")
+	root.AddFGLDependency("a", "^1.0.0")
+
+	pd := &recordingPinDeclarer{pins: map[string]string{}}
+	_, err := db.newResolver(genero401).WithPinDeclarer(pd).Resolve(root)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if pd.pins["b"] != "acme" {
+		t.Fatalf("declared pin not threaded to declarer: %+v", pd.pins)
+	}
+}
 
 func TestNoDeps(t *testing.T) {
 	db := packageDB{}

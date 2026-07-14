@@ -185,6 +185,7 @@ func (a *ArtifactoryProvider) FetchInfo(name, version, generoMajor string) (*reg
 		info.License = side.License
 		info.GeneroConstraint = side.GeneroConstraint
 		info.FGLDeps = side.Dependencies.FGL
+		info.FGLDepPins = side.Dependencies.FGLPins
 		info.JavaDeps = side.Dependencies.Java
 	} else if err != ErrNotFound {
 		return nil, err

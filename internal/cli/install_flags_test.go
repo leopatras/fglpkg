@@ -115,6 +115,38 @@ func TestParseInstallFlagsConflicting(t *testing.T) {
 	}
 }
 
+func TestParseInstallFlagsRegistry(t *testing.T) {
+	// Both the space form and the =form parse the registry and keep the package.
+	for _, args := range [][]string{
+		{"--registry", "acme", "pkg"},
+		{"pkg", "--registry=acme"},
+	} {
+		f, err := parseInstallFlags(args)
+		if err != nil {
+			t.Fatalf("args %v: %v", args, err)
+		}
+		if f.registry != "acme" {
+			t.Errorf("args %v: registry got %q, want %q", args, f.registry, "acme")
+		}
+		if len(f.pkgs) != 1 || f.pkgs[0] != "pkg" {
+			t.Errorf("args %v: pkgs %v", args, f.pkgs)
+		}
+	}
+}
+
+func TestParseInstallFlagsRegistryErrors(t *testing.T) {
+	// --registry needs a value.
+	if _, err := parseInstallFlags([]string{"pkg", "--registry"}); err == nil {
+		t.Error("--registry with no value: expected error")
+	}
+	// --registry only makes sense when adding a package (it pins that package).
+	if _, err := parseInstallFlags([]string{"--registry", "acme"}); err == nil {
+		t.Error("--registry with no package: expected error")
+	} else if !strings.Contains(err.Error(), "requires a package") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
 // Local/global/force flags continue to parse the same way through the install
 // parser, so existing callers keep working.
 func TestParseInstallFlagsKeepsLocalGlobalForce(t *testing.T) {

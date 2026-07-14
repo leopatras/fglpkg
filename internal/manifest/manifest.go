@@ -87,6 +87,12 @@ type Manifest struct {
 	// on clone; credentials stay per-developer in ~/.fglpkg/credentials.json.
 	// See specs/artifactory-secondary-repository.md.
 	Registries []config.Registry `json:"registries,omitempty"`
+	// DefaultRegistry names the repository that `fglpkg publish` targets when no
+	// --registry flag is given (and FGLPKG_PUBLISH_REGISTRY is unset). Lets a
+	// team that publishes to their own Artifactory avoid typing --registry every
+	// time. Empty ("" or "gi") preserves the default of publishing to GI. This
+	// is a publish-only default; it does not bias consume-side routing.
+	DefaultRegistry string `json:"defaultRegistry,omitempty"`
 }
 
 // HasWebcomponents reports whether the manifest declares one or more
@@ -568,6 +574,9 @@ func (m *Manifest) PublishCopy() *Manifest {
 		clone.ImportRoot = ""
 	}
 	clone.Include = nil
+	// defaultRegistry is a publisher-side convenience (where THIS project
+	// publishes); it is meaningless to a consumer reading the sidecar.
+	clone.DefaultRegistry = ""
 	return &clone
 }
 
@@ -606,6 +615,22 @@ func (m *Manifest) AddFGLDependencyScoped(name, version string, scope Scope) {
 	b.FGL[name] = version
 	// A plain add carries no registry pin; drop any stale one.
 	delete(b.FGLPins, name)
+}
+
+// AddFGLDependencyPinned adds or updates a BDL package dependency pinned to a
+// specific repository (the inline `{ "version": …, "registry": … }` form). An
+// empty registry falls back to the unpinned add. Like AddFGLDependencyScoped,
+// any declaration in a different scope is removed first.
+func (m *Manifest) AddFGLDependencyPinned(name, version, registry string, scope Scope) {
+	m.AddFGLDependencyScoped(name, version, scope)
+	if registry == "" {
+		return
+	}
+	b := m.bucket(scope)
+	if b.FGLPins == nil {
+		b.FGLPins = map[string]string{}
+	}
+	b.FGLPins[name] = registry
 }
 
 // RemoveFGLDependency removes a BDL package dependency from whichever scope

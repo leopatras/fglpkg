@@ -38,5 +38,8 @@ bin/
 .fglpkg/
 .private/
 
+# Local manual-test scratch (BDL fixtures, throwaway projects) — not part of the tool
+/test/
+
 # Mac Files
 .DS_Store

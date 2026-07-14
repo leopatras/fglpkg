@@ -108,6 +108,81 @@ func TestRoute_PinResolvesToOne(t *testing.T) {
 	}
 }
 
+func TestDeclarePin_HonouredOverCollision(t *testing.T) {
+	// qrcode exists in BOTH repos — normally a collision — but a depending
+	// package declared it comes from acme, so it must resolve from acme.
+	gi := &fakeProvider{name: "gi", versions: map[string][]string{"qrcode": {"1.0.0"}}}
+	acme := &fakeProvider{name: "acme", versions: map[string][]string{"qrcode": {"0.2.0"}}}
+	rs := NewRepositorySet([]Provider{gi, acme}, descriptors(), nil)
+
+	if err := rs.DeclarePin("qrcode", "acme"); err != nil {
+		t.Fatalf("DeclarePin: %v", err)
+	}
+	info, err := rs.Info("qrcode", "0.2.0", "")
+	if err != nil {
+		t.Fatalf("Info: %v", err)
+	}
+	if info.Source != "acme" {
+		t.Fatalf("declared pin ignored: source = %q, want acme", info.Source)
+	}
+}
+
+func TestDeclarePin_RootPinWins(t *testing.T) {
+	// The consumer's explicit root pin (gi) overrides a package's declared pin (acme).
+	gi := &fakeProvider{name: "gi", versions: map[string][]string{"qrcode": {"1.0.0"}}}
+	acme := &fakeProvider{name: "acme", versions: map[string][]string{"qrcode": {"0.2.0"}}}
+	rs := NewRepositorySet([]Provider{gi, acme}, descriptors(), map[string]string{"qrcode": "gi"})
+
+	if err := rs.DeclarePin("qrcode", "acme"); err != nil {
+		t.Fatalf("DeclarePin should defer to root pin, got %v", err)
+	}
+	info, err := rs.Info("qrcode", "1.0.0", "")
+	if err != nil {
+		t.Fatalf("Info: %v", err)
+	}
+	if info.Source != "gi" {
+		t.Fatalf("root pin lost: source = %q, want gi", info.Source)
+	}
+}
+
+func TestDeclarePin_ConflictErrors(t *testing.T) {
+	gi := &fakeProvider{name: "gi", versions: map[string][]string{"qrcode": {"1.0.0"}}}
+	acme := &fakeProvider{name: "acme", versions: map[string][]string{"qrcode": {"0.2.0"}}}
+	rs := NewRepositorySet([]Provider{gi, acme}, descriptors(), nil)
+
+	if err := rs.DeclarePin("qrcode", "acme"); err != nil {
+		t.Fatalf("first DeclarePin: %v", err)
+	}
+	// Same value is idempotent.
+	if err := rs.DeclarePin("qrcode", "acme"); err != nil {
+		t.Fatalf("idempotent DeclarePin: %v", err)
+	}
+	// A conflicting declaration is a hard error.
+	err := rs.DeclarePin("qrcode", "gi")
+	if err == nil || !strings.Contains(err.Error(), "different repositories") {
+		t.Fatalf("want conflict error, got %v", err)
+	}
+}
+
+func TestDeclarePin_UnknownRegistryErrorLists(t *testing.T) {
+	gi := &fakeProvider{name: "gi", versions: map[string][]string{"qrcode": {"1.0.0"}}}
+	acme := &fakeProvider{name: "acme", versions: map[string][]string{"qrcode": {"0.2.0"}}}
+	rs := NewRepositorySet([]Provider{gi, acme}, descriptors(), nil)
+
+	if err := rs.DeclarePin("qrcode", "ghost"); err != nil {
+		t.Fatalf("DeclarePin stores the pin regardless: %v", err)
+	}
+	_, err := rs.Versions("qrcode")
+	if err == nil {
+		t.Fatal("expected unknown-registry error")
+	}
+	msg := err.Error()
+	// Lists configured registries and gives actionable advice.
+	if !strings.Contains(msg, "not configured") || !strings.Contains(msg, "gi, acme") {
+		t.Fatalf("error should list configured registries: %q", msg)
+	}
+}
+
 func TestRoute_PinToUnknownRegistryErrors(t *testing.T) {
 	gi := &fakeProvider{name: "gi", versions: map[string][]string{"utils": {"1.2.0"}}}
 	rs := NewRepositorySet([]Provider{gi}, descriptors(), map[string]string{"utils": "ghost"})

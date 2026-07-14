@@ -156,12 +156,22 @@ type VersionFetcher func(name string) ([]CandidateVersion, error)
 // (e.g. "4", "6"). Pass "" for legacy packages without variants.
 type InfoFetcher func(name, version, generoMajor string) (*registry.PackageInfo, error)
 
+// PinDeclarer receives per-dependency repository pins discovered in a resolved
+// package's manifest, so the routing layer can honour a package author's stated
+// source for its transitive deps. Implemented by provider.RepositorySet; nil in
+// the single-registry path. DeclarePin errors when two packages pin the same
+// name to different registries (an unresolvable ambiguity the user must break).
+type PinDeclarer interface {
+	DeclarePin(name, registry string) error
+}
+
 // Resolver resolves the full transitive dependency graph.
 type Resolver struct {
 	fetchVersions VersionFetcher
 	fetchInfo     InfoFetcher
 	generoVersion genero.Version
 	ws            *workspace.Workspace // nil when not in a workspace
+	pinDeclarer   PinDeclarer          // nil in the single-registry path
 }
 
 // New creates a Resolver that auto-detects the Genero version, detects any
@@ -195,6 +205,13 @@ func NewWithFetchers(gv genero.Version, fv VersionFetcher, fi InfoFetcher) *Reso
 // WithWorkspace attaches a workspace to an existing Resolver.
 func (r *Resolver) WithWorkspace(ws *workspace.Workspace) *Resolver {
 	r.ws = ws
+	return r
+}
+
+// WithPinDeclarer attaches a PinDeclarer so per-dependency registry pins found
+// in resolved packages' manifests are honoured during routing.
+func (r *Resolver) WithPinDeclarer(pd PinDeclarer) *Resolver {
+	r.pinDeclarer = pd
 	return r
 }
 
@@ -317,6 +334,15 @@ func (r *Resolver) ResolveWithOptions(root *manifest.Manifest, opts ResolveOptio
 		state.markResolved(item.name, chosen, info, item.scope)
 
 		for depName, depConstraint := range info.FGLDeps {
+			// Honour the registry this package's manifest pinned for depName, so
+			// a transitive dep resolves from the author's stated source even when
+			// the name also exists elsewhere. Declared before the dep is enqueued
+			// (hence before it is routed), so the pin is in effect at route time.
+			if pin := info.FGLDepPins[depName]; pin != "" && r.pinDeclarer != nil {
+				if err := r.pinDeclarer.DeclarePin(depName, pin); err != nil {
+					return nil, fmt.Errorf("resolving dependencies of %s@%s: %w", item.name, chosen, err)
+				}
+			}
 			if r.ws != nil && r.ws.IsLocal(depName) {
 				member := r.ws.Member(depName)
 				state.addLocalMember(LocalMember{
@@ -475,10 +501,10 @@ func (s *state) skipOptional(name, reason string) {
 	fmt.Fprintf(os.Stderr, "warning: skipping optional dependency %s: %s\n", name, reason)
 }
 
-func (s *state) enqueue(item workItem)        { s.queue = append(s.queue, item) }
-func (s *state) dequeue() workItem            { item := s.queue[0]; s.queue = s.queue[1:]; return item }
-func (s *state) hasWork() bool                { return len(s.queue) > 0 }
-func (s *state) isResolved(n string) bool     { _, ok := s.resolved[n]; return ok }
+func (s *state) enqueue(item workItem)         { s.queue = append(s.queue, item) }
+func (s *state) dequeue() workItem             { item := s.queue[0]; s.queue = s.queue[1:]; return item }
+func (s *state) hasWork() bool                 { return len(s.queue) > 0 }
+func (s *state) isResolved(n string) bool      { _, ok := s.resolved[n]; return ok }
 func (s *state) addLocalMember(lm LocalMember) { s.localMembers[lm.Name] = lm }
 
 func (s *state) addConstraint(name, constraint, requiredBy string) error {

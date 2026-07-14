@@ -16,6 +16,7 @@ This guide covers the day-to-day usage of fglpkg, the package manager for Genero
 - [Lifecycle Hooks](#lifecycle-hooks)
 - [Package Documentation](#package-documentation)
 - [Registry Authentication](#registry-authentication)
+- [Secondary Repositories (JFrog Artifactory)](#secondary-repositories-jfrog-artifactory)
 - [Workspaces (Monorepos)](#workspaces-monorepos)
 - [Lock Files](#lock-files)
 - [Package Ownership](#package-ownership)
@@ -1036,6 +1037,138 @@ fglpkg token revoke jdeveloper
 # Rotate your own token
 fglpkg token rotate
 ```
+
+## Secondary Repositories (JFrog Artifactory)
+
+By default fglpkg draws every BDL package from the Genero Intelligence (GI)
+registry. If your team hosts **internal** packages in a **JFrog Artifactory**
+instance, you can add it as a secondary repository: fglpkg will consume and
+publish your internal packages there while still pulling public packages from GI.
+This is entirely client-side — nothing changes on the GI side. (Java JARs are not
+routed through Artifactory; they stay on Maven Central.)
+
+### 1. Declare the repository
+
+Repositories are listed in a `registries` array. It contains **no secrets** —
+credentials are stored separately by `fglpkg login`. Declare it in your project's
+`fglpkg.json` (committed, so teammates get the URL on clone):
+
+```json
+{
+  "name": "myapp",
+  "version": "1.0.0",
+  "dependencies": { "fgl": { "acme-utils": "^1.0.0" } },
+  "registries": [
+    {
+      "name": "acme",
+      "type": "artifactory",
+      "url": "https://artifactory.acme.example/artifactory",
+      "repoKey": "fgl-internal-generic",
+      "priority": 2,
+      "auth": "bearer",
+      "packages": ["acme-*"]
+    }
+  ]
+}
+```
+
+Or provision it once for every project on the machine in `~/.fglpkg/config.json`
+(same shape) — useful for an ops team:
+
+```json
+{ "registries": [ { "name": "acme", "type": "artifactory", "url": "…", "repoKey": "…", "priority": 2, "auth": "bearer" } ] }
+```
+
+Descriptor fields:
+
+| Field | Required | Meaning |
+|---|---|---|
+| `name` | Yes | Logical id used in `--registry`, credentials, and dependency pins |
+| `type` | Yes | `"genero"` or `"artifactory"` |
+| `url` | Yes | Base URL, including any context path (e.g. `…/artifactory`) |
+| `repoKey` | For `artifactory` | The Artifactory **generic** repository key |
+| `priority` | Yes | Lower is tried first; must be unique. Ordering only — not a precedence tiebreak |
+| `auth` | No | `bearer` (default) \| `basic` \| `apikey` \| `anonymous` |
+| `packages` | No | Glob allow-list (e.g. `["acme-*"]`); names outside it are never queried against this repo |
+
+Check the effective configuration and login status any time:
+
+```bash
+fglpkg registry list
+# NAME   TYPE         PRIO  AUTH    LOGIN  URL
+# gi     genero       1     bearer  env    https://service.generointelligence.ai
+# acme   artifactory  2     bearer  no     https://artifactory.acme.example/artifactory
+```
+
+The `LOGIN` column shows `yes` (stored credentials), `env` (GI authenticated by
+`FGLPKG_TOKEN`), `no` (none), or `anon` (no auth needed).
+
+### 2. Log in
+
+Credentials are per-repository, so you stay logged into GI and every secondary
+repo simultaneously. Use the flag matching the repo's `auth` scheme:
+
+```bash
+fglpkg login --registry acme --token <access-token>           # bearer (recommended)
+fglpkg login --registry acme --user <u> --password <p|token>  # basic
+fglpkg login --registry acme --api-key <key>                  # apikey
+fglpkg logout --registry acme
+```
+
+A JFrog access token can be used as the `bearer` token or as the `basic`
+password. `FGLPKG_TOKEN` authenticates GI only — it has no effect on secondary
+repos.
+
+### 3. Consume packages
+
+`fglpkg install` resolves each dependency to the repository that owns its name and
+records the source in `fglpkg.lock` (`"registry": "acme"`), so installs are
+reproducible. If a name exists in **more than one** repository, fglpkg stops with
+a collision error rather than guessing — this is the dependency-confusion
+safeguard. Resolve it by pinning the source:
+
+```json
+"dependencies": { "fgl": { "utils": { "version": "^1.0.0", "registry": "acme" } } }
+```
+
+or add + pin in one step:
+
+```bash
+fglpkg install utils --registry acme     # resolves from acme and writes the pin
+```
+
+A `packages` allow-list (e.g. `"packages": ["acme-*"]`) makes the split
+structural, so those names are only ever looked for in your Artifactory and never
+collide with GI.
+
+**Transitive dependencies** of an Artifactory package carry the pins their author
+declared, so they resolve from the intended repository automatically. A pin in
+your own `fglpkg.json` always overrides a package's declared pin.
+
+`fglpkg search <term>` fans out to every configured repository and tags each
+result with its source repo.
+
+### 4. Publish packages
+
+```bash
+fglpkg publish --registry acme            # deploy the built zip + sidecar manifest
+fglpkg publish --registry acme --dry-run  # preview the PUT URLs, no network
+fglpkg publish --registry acme --force    # overwrite an existing variant (refused by default)
+```
+
+To stop typing `--registry`, set a default publish target — resolved as
+`FGLPKG_PUBLISH_REGISTRY` → project `defaultRegistry` → global `defaultRegistry` →
+GI:
+
+```json
+{ "defaultRegistry": "acme", "registries": [ … ] }
+```
+
+A bare `fglpkg publish` then deploys to `acme`; `fglpkg publish --registry gi`
+still targets GI when you need it.
+
+For the complete design, see
+[specs/artifactory-secondary-repository.md](../specs/artifactory-secondary-repository.md).
 
 ## Workspaces (Monorepos)
 

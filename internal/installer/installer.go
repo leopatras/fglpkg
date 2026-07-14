@@ -39,6 +39,10 @@ type Installer struct {
 	// registry fetchers with a multi-provider routing layer (RepositorySet).
 	versionFetcher resolver.VersionFetcher
 	infoFetcher    resolver.InfoFetcher
+	// pinDeclarer, when non-nil, receives per-dependency registry pins found in
+	// resolved packages' manifests so transitive deps route to the author's
+	// stated source. Set alongside the multi-provider fetchers.
+	pinDeclarer resolver.PinDeclarer
 }
 
 // RepoAuth maps a repository URL prefix to the HTTP headers that authenticate
@@ -83,11 +87,22 @@ func (i *Installer) WithFetchers(fv resolver.VersionFetcher, fi resolver.InfoFet
 	return i
 }
 
+// WithPinDeclarer attaches a PinDeclarer (typically the same RepositorySet
+// backing the fetchers) so declared per-dependency registry pins are honoured
+// during resolution. Returns the installer for chaining.
+func (i *Installer) WithPinDeclarer(pd resolver.PinDeclarer) *Installer {
+	i.pinDeclarer = pd
+	return i
+}
+
 // newResolver builds the resolver, using injected multi-provider fetchers when
 // configured (still honouring any workspace), else the default live resolver.
 func (i *Installer) newResolver(gv genero.Version) (*resolver.Resolver, error) {
 	if i.versionFetcher != nil && i.infoFetcher != nil {
 		r := resolver.NewWithFetchers(gv, i.versionFetcher, i.infoFetcher)
+		if i.pinDeclarer != nil {
+			r = r.WithPinDeclarer(i.pinDeclarer)
+		}
 		if err := r.DetectWorkspace(); err != nil {
 			return nil, err
 		}

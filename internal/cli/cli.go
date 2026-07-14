@@ -309,6 +309,34 @@ func cmdInstall(args []string) error {
 	}
 	generoMajor := gv.MajorString()
 
+	// Engage multi-provider routing for the add-package resolve when repositories
+	// beyond the built-in GI registry are configured; otherwise fall back to the
+	// GI-only client. Without this, `install <pkg>` could only ever add packages
+	// from GI even though search/install-from-lock route to secondary repos.
+	globalHome, err := fglpkgHome()
+	if err != nil {
+		globalHome = home
+	}
+	rs, _, rsErr := buildRepositorySet(globalHome, m)
+	if rsErr != nil {
+		fmt.Fprintf(os.Stderr, "warning: ignoring registries config: %v\n", rsErr)
+	}
+
+	// --registry <name> disambiguates a package available from more than one
+	// repository: it restricts this resolve to the named repo and pins that
+	// choice in the manifest so subsequent installs stay deterministic.
+	if flags.registry != "" {
+		if rs == nil {
+			// Only the built-in GI registry is configured. --registry gi is a
+			// harmless no-op; any other name cannot be honoured.
+			if flags.registry != config.GIName {
+				return fmt.Errorf("--registry %q: no repository named %q is configured (add it to fglpkg.json or ~/.fglpkg/config.json)", flags.registry, flags.registry)
+			}
+		} else {
+			rs.Restrict(flags.registry)
+		}
+	}
+
 	scopeLabel := scopeDisplayName(flags.scope)
 	for _, pkg := range flags.pkgs {
 		name, version, err := parsePackageArg(pkg)
@@ -316,7 +344,12 @@ func cmdInstall(args []string) error {
 			return err
 		}
 		fmt.Printf("Resolving %s@%s (Genero %s)...\n", name, version, gv)
-		info, err := registry.Resolve(name, version, generoMajor)
+		var info *registry.PackageInfo
+		if rs != nil {
+			info, err = rs.Resolve(name, version, generoMajor)
+		} else {
+			info, err = registry.Resolve(name, version, generoMajor)
+		}
 		if err != nil {
 			return fmt.Errorf("failed to resolve %s@%s: %w", name, version, privateHint(err, name))
 		}
@@ -326,12 +359,16 @@ func cmdInstall(args []string) error {
 		if info.Name == "" {
 			info.Name = name
 		}
-		m.AddFGLDependencyScoped(info.Name, info.Version, flags.scope)
+		m.AddFGLDependencyPinned(info.Name, info.Version, flags.registry, flags.scope)
 		fmt.Printf("✓ Added %s@%s to %s [%s]\n", info.Name, info.Version, manifest.Filename, scopeLabel)
 	}
 	if err := m.Save("."); err != nil {
 		return err
 	}
+	// Rebuild the installer from the saved manifest so its routing picks up any
+	// freshly-written registry pin — otherwise a pinned (collision) package
+	// would fail the graph install, which was resolved from the pre-add manifest.
+	inst = newInstaller(home, m)
 	fmt.Println()
 	if err := runHook(m, manifest.HookPreInstall, projectDir); err != nil {
 		return err
@@ -462,6 +499,7 @@ type installFlags struct {
 	production         bool
 	noManifestFallback bool
 	scope              manifest.Scope
+	registry           string // --registry <name>: restrict resolution to one repo and pin it
 	pkgs               []string
 }
 
@@ -470,7 +508,12 @@ type installFlags struct {
 func parseInstallFlags(args []string) (installFlags, error) {
 	f := installFlags{scope: manifest.ScopeProd}
 	devSeen, optSeen := false, false
-	for _, a := range args {
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if val, ok := strings.CutPrefix(a, "--registry="); ok {
+			f.registry = val
+			continue
+		}
 		switch a {
 		case "--local", "-l":
 			f.local = true
@@ -490,6 +533,12 @@ func parseInstallFlags(args []string) (installFlags, error) {
 			f.scope = manifest.ScopeOptional
 		case "--save-prod", "-P":
 			f.scope = manifest.ScopeProd
+		case "--registry":
+			if i+1 >= len(args) {
+				return f, fmt.Errorf("--registry requires a value")
+			}
+			i++
+			f.registry = args[i]
 		default:
 			f.pkgs = append(f.pkgs, a)
 		}
@@ -499,6 +548,9 @@ func parseInstallFlags(args []string) (installFlags, error) {
 	}
 	if f.production && (devSeen || optSeen) {
 		return f, fmt.Errorf("--production cannot be combined with --save-dev or --save-optional")
+	}
+	if f.registry != "" && len(f.pkgs) == 0 {
+		return f, fmt.Errorf("--registry requires a package to install (it pins that package's source repository)")
 	}
 	return f, nil
 }
@@ -1122,6 +1174,15 @@ func cmdPublish(args []string) error {
 		return fmt.Errorf("cannot detect Genero version: %w", err)
 	}
 	generoMajor := gv.MajorString()
+
+	// With no explicit --registry, fall back to the configured default publish
+	// target (FGLPKG_PUBLISH_REGISTRY, then the project/global defaultRegistry),
+	// so a team publishing to their own Artifactory need not pass --registry
+	// every time. An empty result keeps the historical default of publishing to
+	// GI. --registry, when given, always wins (it is already in pf.registry).
+	if pf.registry == "" {
+		pf.registry = resolveDefaultPublishRegistry(home, m)
+	}
 
 	// Publishing to a secondary (Artifactory) repository takes a distinct,
 	// direct-PUT path — no GI variant pre-check, no submit/approval step.
@@ -2029,6 +2090,13 @@ func cmdLogin(args []string) error {
 	}
 
 	registryURL := defaultRegistry()
+	// FGLPKG_TOKEN is resolved ahead of stored credentials, so a login to GI has
+	// no visible effect until the env var is unset. Warn rather than silently
+	// storing credentials the user won't see take effect.
+	if credentials.ConsumerEnvBearer() != "" {
+		fmt.Fprintln(os.Stderr, "  Warning: FGLPKG_TOKEN is set and overrides stored credentials;")
+		fmt.Fprintln(os.Stderr, "           this login will not take effect until you unset FGLPKG_TOKEN.")
+	}
 	if la.token != "" {
 		pat := la.token
 		if !strings.HasPrefix(pat, "gpr_") {
@@ -2216,15 +2284,26 @@ func cmdLogout(args []string) error {
 		return err
 	}
 	registryURL := defaultRegistry()
-	if la.registry != "" && la.registry != config.GIName {
+	isGI := la.registry == "" || la.registry == config.GIName
+	if !isGI {
 		reg, err := resolveRegistry(home, la.registry)
 		if err != nil {
 			return err
 		}
 		registryURL = reg.URL
 	}
+	// FGLPKG_TOKEN authenticates GI ahead of stored credentials and cannot be
+	// removed by fglpkg (it lives in the environment). Warn so the user isn't
+	// surprised that whoami still works after logging out.
+	envNote := func() {
+		if isGI && credentials.ConsumerEnvBearer() != "" {
+			fmt.Fprintln(os.Stderr, "  Note: FGLPKG_TOKEN is set in your environment and still authenticates you.")
+			fmt.Fprintln(os.Stderr, "        Unset FGLPKG_TOKEN to fully log out.")
+		}
+	}
 	if _, ok := creds.Get(registryURL); !ok {
 		fmt.Printf("Not logged in to %s\n", registryURL)
+		envNote()
 		return nil
 	}
 	creds.Delete(registryURL)
@@ -2232,6 +2311,7 @@ func cmdLogout(args []string) error {
 		return err
 	}
 	fmt.Printf("✓ Logged out from %s\n", registryURL)
+	envNote()
 	return nil
 }
 
@@ -2256,6 +2336,13 @@ func cmdWhoami(_ []string) error {
 	}
 	fmt.Printf("Registry: %s\n", registryURL)
 	fmt.Printf("User:     %s\n", whoamiSubject(who))
+	// Report where the active credential came from — the env var overrides
+	// stored login, which is why logout/login can appear to have no effect.
+	if credentials.ConsumerEnvBearer() != "" {
+		fmt.Println("Auth:     FGLPKG_TOKEN (environment variable)")
+	} else {
+		fmt.Println("Auth:     stored login (~/.fglpkg/credentials.json)")
+	}
 	if who.Partner != nil {
 		fmt.Printf("Partner:  %s\n", who.Partner.Name)
 	} else {
@@ -2313,6 +2400,12 @@ func cmdRegistryList() error {
 func registryLoginStatus(creds *credentials.File, r config.Registry) string {
 	if r.Auth == config.AuthAnonymous {
 		return "anon"
+	}
+	// FGLPKG_TOKEN is the GI/consumer bearer honoured first by ActiveBearer, so
+	// a genero registry is authenticated by it even with no stored credentials.
+	// It does not apply to Artifactory repos (those auth via stored headers).
+	if r.Type == config.TypeGenero && credentials.ConsumerEnvBearer() != "" {
+		return "env"
 	}
 	if creds == nil {
 		return "no"
@@ -2871,9 +2964,12 @@ Run 'fglpkg <command> --help' for command-specific options.
 
 ENVIRONMENT:
   FGLPKG_HOME              Override ~/.fglpkg
-  FGLPKG_REGISTRY          Registry URL for install/search/audit/whoami/publish.
+  FGLPKG_REGISTRY          GI registry URL for install/search/audit/whoami/publish.
                            Default: https://service.generointelligence.ai
-  FGLPKG_TOKEN             Bearer token for the registry (overrides stored OAuth)
+  FGLPKG_TOKEN             Bearer token for the GI registry. Takes precedence over
+                           stored login; cannot be cleared by 'fglpkg logout'.
+  FGLPKG_PUBLISH_REGISTRY  Name of the repository 'fglpkg publish' targets when no
+                           --registry is given (overrides fglpkg.json defaultRegistry)
   FGLPKG_GENERO_VERSION    Override Genero version detection
   FGLPKG_INSTALL_CONCURRENCY  Cap parallel downloads during install (default 4)
 
@@ -2921,7 +3017,7 @@ func newInstaller(home string, m *manifest.Manifest) *installer.Installer {
 	if rs, repoAuth, err := buildRepositorySet(globalHome, m); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: ignoring registries config: %v\n", err)
 	} else if rs != nil {
-		inst = inst.WithFetchers(rs.Versions, rs.Info).WithRepoAuth(repoAuth)
+		inst = inst.WithFetchers(rs.Versions, rs.Info).WithRepoAuth(repoAuth).WithPinDeclarer(rs)
 	}
 	return inst
 }
@@ -3001,6 +3097,25 @@ func defaultRegistry() string {
 
 func defaultPublishRegistry() string {
 	return defaultRegistry()
+}
+
+// resolveDefaultPublishRegistry returns the logical name of the repository
+// `fglpkg publish` should target when no --registry flag is given, in
+// decreasing precedence: FGLPKG_PUBLISH_REGISTRY, the project manifest's
+// defaultRegistry, then the global config's defaultRegistry. Returns "" when
+// none is set — the caller then publishes to GI as before. This is a
+// publish-only default and never influences consume-side routing.
+func resolveDefaultPublishRegistry(home string, m *manifest.Manifest) string {
+	if v := strings.TrimSpace(os.Getenv("FGLPKG_PUBLISH_REGISTRY")); v != "" {
+		return v
+	}
+	if m != nil && m.DefaultRegistry != "" {
+		return m.DefaultRegistry
+	}
+	if v, err := config.GlobalDefaultRegistry(home); err == nil && v != "" {
+		return v
+	}
+	return ""
 }
 
 func parsePackageArg(arg string) (name, version string, err error) {

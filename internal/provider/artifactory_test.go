@@ -41,7 +41,7 @@ func mockArtifactory(t *testing.T) *httptest.Server {
 	})
 	// Sidecar manifest.
 	mux.HandleFunc("/GeneroBDL/jfrog-test/1.0.0/fglpkg.json", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, `{"name":"jfrog-test","version":"1.0.0","description":"a test","genero":"^6.0.0","dependencies":{"fgl":{"logft":"^2.0.0"}}}`)
+		writeJSON(w, `{"name":"jfrog-test","version":"1.0.0","description":"a test","genero":"^6.0.0","dependencies":{"fgl":{"logft":"^2.0.0","qrcode":{"version":"0.2.0","registry":"acme"}}}}`)
 	})
 	// other-lib versions (for search LatestVersion).
 	mux.HandleFunc("/api/storage/GeneroBDL/other-lib", func(w http.ResponseWriter, r *http.Request) {
@@ -112,8 +112,13 @@ func TestArtifactory_FetchInfo_SelectsVariantAndReadsSidecar(t *testing.T) {
 	if info.GeneroConstraint != "^6.0.0" {
 		t.Fatalf("genero constraint = %q", info.GeneroConstraint)
 	}
-	if info.FGLDeps["logft"] != "^2.0.0" {
+	if info.FGLDeps["logft"] != "^2.0.0" || info.FGLDeps["qrcode"] != "0.2.0" {
 		t.Fatalf("fgl deps = %+v", info.FGLDeps)
+	}
+	// The object-form dep's registry pin must survive into FGLDepPins so the
+	// resolver can route qrcode to acme even when the name also exists elsewhere.
+	if info.FGLDepPins["qrcode"] != "acme" {
+		t.Fatalf("fgl dep pins = %+v, want qrcode→acme", info.FGLDepPins)
 	}
 }
 

@@ -121,6 +121,42 @@ func TestLoadGlobal_MissingIsEmpty(t *testing.T) {
 	}
 }
 
+func TestGlobalDefaultRegistry(t *testing.T) {
+	// No file → empty, no error.
+	if v, err := GlobalDefaultRegistry(t.TempDir()); err != nil || v != "" {
+		t.Fatalf("missing file: got (%q, %v), want (\"\", nil)", v, err)
+	}
+	// File with defaultRegistry → returned.
+	home := t.TempDir()
+	body := `{"defaultRegistry":"acme","registries":[{"name":"acme","type":"artifactory","url":"https://a","repoKey":"k","priority":2}]}`
+	if err := os.WriteFile(filepath.Join(home, GlobalFilename), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if v, err := GlobalDefaultRegistry(home); err != nil || v != "acme" {
+		t.Fatalf("got (%q, %v), want (\"acme\", nil)", v, err)
+	}
+	// LoadGlobal still returns the registries from the same file.
+	if regs, err := LoadGlobal(home); err != nil || len(regs) != 1 || regs[0].Name != "acme" {
+		t.Fatalf("LoadGlobal: regs=%+v err=%v", regs, err)
+	}
+}
+
+func TestLoadGlobal_BlankIsEmpty(t *testing.T) {
+	for _, body := range []string{"", "   ", "\n\t \r\n"} {
+		home := t.TempDir()
+		if err := os.WriteFile(filepath.Join(home, GlobalFilename), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		regs, err := LoadGlobal(home)
+		if err != nil {
+			t.Fatalf("LoadGlobal(%q): %v", body, err)
+		}
+		if regs != nil {
+			t.Fatalf("LoadGlobal(%q): want nil, got %+v", body, regs)
+		}
+	}
+}
+
 func TestLoadGlobal_ReadsFile(t *testing.T) {
 	home := t.TempDir()
 	body := `{"registries":[{"name":"acme","type":"artifactory","url":"https://a","repoKey":"k","priority":2}]}`
