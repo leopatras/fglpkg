@@ -61,6 +61,13 @@ type PackageInfo struct {
 	Checksum         string                    `json:"checksum"`
 	GeneroConstraint string                    `json:"genero,omitempty"`
 	FGLDeps          map[string]string         `json:"fglDeps,omitempty"`
+	// FGLDepPins carries the per-dependency repository pin this package's own
+	// manifest declared (dep name → registry name), e.g. {"qrcode":"acme"}.
+	// The multi-provider resolver honours these so a package's transitive deps
+	// resolve from the repository the author pinned, even when the name also
+	// exists in another repository. Populated from an Artifactory sidecar's
+	// object-form deps; the GI registry does not carry pins yet (see resolver).
+	FGLDepPins       map[string]string         `json:"fglDepPins,omitempty"`
 	JavaDeps         []manifest.JavaDependency `json:"javaDeps,omitempty"`
 	// Variant is the artifact variant tag selected by the registry client
 	// when fetching this version — "genero<N>" for BDL packages or
@@ -69,6 +76,12 @@ type PackageInfo struct {
 	Variant  string        `json:"variant,omitempty"`
 	Variants []VariantInfo `json:"variants,omitempty"`
 	Readme   string        `json:"readme,omitempty"`
+	// Source is the logical name of the repository this info was resolved
+	// from ("gi", "acme-internal", …). Set by the multi-provider routing
+	// layer; empty means the default GI registry. Threaded into the lockfile
+	// as the dependency-confusion pin. See
+	// specs/artifactory-secondary-repository.md §9.
+	Source string `json:"source,omitempty"`
 }
 
 // VariantInfo describes a Genero-major-version-specific build.
@@ -98,6 +111,9 @@ type SearchResult struct {
 	LatestVersion string `json:"latestVersion"`
 	Description   string `json:"description"`
 	Author        string `json:"author"`
+	// Source is the logical repository this result came from, set by the
+	// multi-provider search fan-out. Empty for single-registry results.
+	Source string `json:"source,omitempty"`
 }
 
 // RegistryConfig is returned by the publisher registry's /config endpoint.

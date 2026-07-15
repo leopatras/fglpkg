@@ -57,6 +57,9 @@ Prompts for name, version, description, and author, then writes fglpkg.json.
   --save-optional, -O      Record added packages under "optionalDependencies"
   --save-prod, -P          Record added packages under "dependencies" (default)
   --production, --prod     Skip devDependencies when installing
+  --registry <name>        When adding a package, resolve it only from the named
+                           repository and pin that choice in fglpkg.json. Use to
+                           disambiguate a name available from more than one repo.
   --no-manifest-fallback   Do not install Java dependencies a package's bundled
                            manifest declares but its registry record omits; the
                            divergence is still reported
@@ -129,6 +132,10 @@ Prints shell export lines. Evaluate the output to load them, e.g.
 		Usage:      "fglpkg search <term>\nfglpkg search --all",
 		Long: `FLAGS:
   --all                    List every package in the registry (no term)
+
+When secondary repositories are configured, search fans out to every repository
+and tags each result with its source repo. A repository that fails to respond
+is reported as a warning without failing the whole search.
 `,
 	},
 	{
@@ -222,7 +229,7 @@ Arguments after the module name are passed to the program unchanged.
 		ListDetail: "\n(--dry-run prints what would happen without calling out;\n" +
 			" --ci for non-interactive pipelines: requires FGLPKG_TOKEN,\n" +
 			" prints a machine-readable status line)",
-		Usage: "fglpkg publish [--dry-run] [--ci] [--private|--public] [--changelog <text>]",
+		Usage: "fglpkg publish [--dry-run] [--ci] [--private|--public] [--changelog <text>] [--registry <name>] [--force]",
 		Long: `FLAGS:
   --dry-run, -n            Print what would happen without any network calls
   --ci                     Non-interactive mode for pipelines: requires
@@ -230,8 +237,22 @@ Arguments after the module name are passed to the program unchanged.
   --private                Mark the package private on first publish
   --public                 Mark the package public on first publish (default)
   --changelog <text>       Changelog text for this version (overrides CHANGELOG.md)
+  --registry <name>        Publish to a configured repository (e.g. a JFrog
+                           Artifactory repo) instead of the GI registry
+  --force, -f              When publishing to Artifactory, overwrite an existing
+                           variant instead of refusing
 
 Builds the package zip, uploads it, and submits the version for admin review.
+When --registry names an Artifactory repository, the zip and its sidecar
+fglpkg.json are deployed directly (no submit/approval step).
+
+DEFAULT TARGET:
+  With no --registry, publish targets the default repository, resolved in
+  decreasing precedence: the FGLPKG_PUBLISH_REGISTRY environment variable, the
+  project's "defaultRegistry" field in fglpkg.json, then the global
+  ~/.fglpkg/config.json "defaultRegistry". If none is set, publish goes to the
+  GI registry (the historical default). A team publishing to their own
+  Artifactory can set "defaultRegistry" once and omit --registry thereafter.
 
 CHANGELOG:
   When --changelog is not given, publish looks for a CHANGELOG.md in the project
@@ -257,25 +278,62 @@ Builds the same zip 'fglpkg publish' would upload, for local inspection.
 		Name:       "login",
 		Summary:    "Sign in to the registry",
 		ListDetail: " (OAuth browser flow, or --token <PAT>)",
-		Usage:      "fglpkg login [--token <PAT>]",
+		Usage:      "fglpkg login [--token <PAT>]\nfglpkg login --registry <name> [--token <t> | --user <u> --password <p> | --api-key <k>]",
 		Long: `FLAGS:
   --token <PAT>            Store a Personal Access Token instead of the
                            browser OAuth flow (for CI / non-interactive use)
+  --registry <name>        Sign in to a configured secondary repository (e.g. a
+                           JFrog Artifactory repo) instead of the default GI
+                           registry. The credential type follows the repo's
+                           declared auth scheme (see below).
+  --user <u> --password <p>  Basic auth for a --registry with auth "basic"
+                           (the password may be an account password or a token)
+  --api-key <k>            API key for a --registry with auth "apikey"
 
-With no flags, opens a browser to complete an OAuth (code + PKCE) login.
+With no flags, opens a browser to complete an OAuth (code + PKCE) login to the
+GI registry.
+
+SECONDARY REPOSITORIES:
+  'fglpkg login --registry <name>' stores credentials for a repository declared
+  in fglpkg.json / ~/.fglpkg/config.json, keyed by its URL. The flag to use
+  depends on that repo's "auth" scheme:
+    bearer     --token <access-token>        (recommended for Artifactory)
+    basic      --user <u> --password <p|token>
+    apikey     --api-key <key>
+    anonymous  no login needed
+  Credentials for GI and every secondary repo coexist — logging in to one never
+  affects another.
+
+NOTE:
+  FGLPKG_TOKEN, when set, authenticates the GI registry ahead of any stored
+  login, so a GI login has no visible effect until that variable is unset.
 `,
 	},
 	{
 		Name:    "logout",
 		Summary: "Remove saved credentials",
-		Usage:   "fglpkg logout",
-		Long:    "Removes the saved credentials for the active registry.\n",
+		Usage:   "fglpkg logout [--registry <name>]",
+		Long: `FLAGS:
+  --registry <name>        Remove credentials for a configured secondary
+                           repository instead of the default GI registry.
+
+Removes the saved credentials for the target registry from
+~/.fglpkg/credentials.json.
+
+NOTE:
+  If FGLPKG_TOKEN is set, it authenticates the GI registry from the environment
+  and cannot be removed by logout — unset FGLPKG_TOKEN to fully log out of GI.
+`,
 	},
 	{
 		Name:    "whoami",
 		Summary: "Show current authenticated user",
 		Usage:   "fglpkg whoami",
-		Long:    "Shows the authenticated user, partner, and scopes for the active registry.\n",
+		Long: `Shows the authenticated user, partner, and scopes for the GI registry, plus
+an Auth line reporting the credential source: "FGLPKG_TOKEN (environment
+variable)" when the env var is set (it takes precedence), otherwise "stored
+login".
+`,
 	},
 	{
 		Name:    "workspace",
@@ -287,6 +345,29 @@ With no flags, opens a browser to complete an OAuth (code + PKCE) login.
   add <path>               Add a member project to the workspace
   list                     List workspace members
   info                     Print a workspace summary
+`,
+	},
+	{
+		Name:    "registry",
+		Summary: "List configured package repositories",
+		Usage:   "fglpkg registry list",
+		Long: `SUBCOMMANDS:
+  list                     Show configured repositories, priority, auth scheme, and login status
+
+Repositories are configured via a "registries" array in fglpkg.json and/or
+~/.fglpkg/config.json, alongside the built-in Genero Intelligence registry.
+Lower "priority" is tried first; priorities must be unique.
+
+LOGIN column values:
+  yes     credentials are stored for this repo (via 'fglpkg login')
+  env     the GI registry is authenticated by the FGLPKG_TOKEN env var
+  no      no usable credentials found
+  anon    the repo's auth scheme is "anonymous" (no login required)
+
+Sign in to a secondary repo with 'fglpkg login --registry <name>'. Set which
+repo 'fglpkg publish' targets by default with a top-level "defaultRegistry" in
+fglpkg.json (or the FGLPKG_PUBLISH_REGISTRY env var).
+See specs/artifactory-secondary-repository.md.
 `,
 	},
 	{

@@ -104,6 +104,14 @@ type LockedPackage struct {
 	// or "optional". Empty means production. Used by `fglpkg install
 	// --production` to skip dev-scoped entries.
 	Scope string `json:"scope,omitempty"`
+
+	// Registry is the logical repository this package resolved from ("gi",
+	// "acme-internal"). Empty means the default GI registry, so
+	// pre-Artifactory locks parse unchanged (additive, omitempty — no
+	// lockfileVersion bump). It is the dependency-confusion pin: a locked
+	// package is re-fetched from this repository and can never be silently
+	// re-routed. See specs/artifactory-secondary-repository.md §9.
+	Registry string `json:"registry,omitempty"`
 }
 
 // LockedWebcomponent is the fully-pinned record of one webcomponent package.
@@ -132,6 +140,10 @@ type LockedWebcomponent struct {
 	// Scope is the dependency scope: "dev" or "optional". Empty means
 	// production.
 	Scope string `json:"scope,omitempty"`
+
+	// Registry is the logical repository this package resolved from. Empty
+	// means the default GI registry. See LockedPackage.Registry.
+	Registry string `json:"registry,omitempty"`
 }
 
 // LockedJAR is the fully-pinned record of one Java JAR.
@@ -183,6 +195,7 @@ func FromPlan(plan *resolver.Plan, root *manifest.Manifest) *LockFile {
 				Checksum:    p.Checksum,
 				RequiredBy:  requiredBy,
 				Scope:       scopeLockString(p.Scope),
+				Registry:    p.Source,
 			})
 			continue
 		}
@@ -195,6 +208,7 @@ func FromPlan(plan *resolver.Plan, root *manifest.Manifest) *LockFile {
 			GeneroMajor: plan.GeneroVersion.MajorString(),
 			RequiredBy:  requiredBy,
 			Scope:       scopeLockString(p.Scope),
+			Registry:    p.Source,
 		})
 	}
 	sort.Slice(pkgs, func(i, j int) bool { return pkgs[i].Name < pkgs[j].Name })

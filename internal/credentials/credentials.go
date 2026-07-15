@@ -33,6 +33,7 @@ package credentials
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -52,7 +53,10 @@ type Entry struct {
 	Token       string        `json:"token,omitempty"` // legacy: read-only, migrated to Pat on next Save
 	Username    string        `json:"username,omitempty"`
 	GitHubToken string        `json:"githubToken,omitempty"`
-	SavedAt     string        `json:"savedAt"`
+	// APIKey is the JFrog X-JFrog-Art-Api key, used when a repository's auth
+	// scheme is "apikey". bearer/basic reuse Pat (secret) + Username.
+	APIKey  string `json:"apiKey,omitempty"`
+	SavedAt string `json:"savedAt"`
 }
 
 // File is the top-level credentials file structure.
@@ -130,10 +134,63 @@ func (f *File) SetOAuth(registryURL string, t oauth.Tokens, username string) {
 	f.Registries[key] = e
 }
 
+// SetAPIKey stores a JFrog API key for the given registry URL, for the
+// "apikey" auth scheme. Existing OAuth/PAT are preserved.
+func (f *File) SetAPIKey(registryURL, apiKey string) {
+	key := normalise(registryURL)
+	e := f.Registries[key]
+	e.APIKey = apiKey
+	e.SavedAt = nowRFC3339()
+	f.Registries[key] = e
+}
+
+// SetBasic stores a username + secret (password or access token) for the
+// "basic" auth scheme. Existing OAuth is preserved.
+func (f *File) SetBasic(registryURL, username, secret string) {
+	key := normalise(registryURL)
+	e := f.Registries[key]
+	e.Username = username
+	e.Pat = secret
+	e.SavedAt = nowRFC3339()
+	f.Registries[key] = e
+}
+
 // Get retrieves the credential entry for registryURL.
 func (f *File) Get(registryURL string) (Entry, bool) {
 	e, ok := f.Registries[normalise(registryURL)]
 	return e, ok
+}
+
+// Auth scheme names (mirrors internal/config; duplicated to avoid an import).
+const (
+	SchemeBearer    = "bearer"
+	SchemeBasic     = "basic"
+	SchemeAPIKey    = "apikey"
+	SchemeAnonymous = "anonymous"
+)
+
+// AuthHeaders returns the HTTP headers implementing the given auth scheme for
+// registryURL, using stored credentials. Returns nil for anonymous, an unknown
+// scheme, or when the required secret is absent. Used for both Artifactory
+// storage-API reads and artifact downloads.
+func (f *File) AuthHeaders(registryURL, scheme string) map[string]string {
+	e, _ := f.Get(registryURL)
+	switch scheme {
+	case SchemeBearer:
+		if e.Pat != "" {
+			return map[string]string{"Authorization": "Bearer " + e.Pat}
+		}
+	case SchemeBasic:
+		if e.Pat != "" {
+			raw := e.Username + ":" + e.Pat
+			return map[string]string{"Authorization": "Basic " + base64.StdEncoding.EncodeToString([]byte(raw))}
+		}
+	case SchemeAPIKey:
+		if e.APIKey != "" {
+			return map[string]string{"X-JFrog-Art-Api": e.APIKey}
+		}
+	}
+	return nil
 }
 
 // Delete removes the entire credential entry (OAuth + PAT + GitHub token) for

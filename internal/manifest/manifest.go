@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/4js-mikefolcher/fglpkg/internal/config"
 	"github.com/4js-mikefolcher/fglpkg/internal/semver"
 )
 
@@ -80,6 +81,18 @@ type Manifest struct {
 	// is an ordered list of declarative operations from a fixed vocabulary
 	// (see HookOp). Arbitrary shell commands are intentionally not supported.
 	Hooks Hooks `json:"hooks,omitempty"`
+	// Registries declares additional package repositories (e.g. a JFrog
+	// Artifactory instance) alongside the built-in Genero Intelligence
+	// registry. Committed with the project so teammates inherit the repo URLs
+	// on clone; credentials stay per-developer in ~/.fglpkg/credentials.json.
+	// See specs/artifactory-secondary-repository.md.
+	Registries []config.Registry `json:"registries,omitempty"`
+	// DefaultRegistry names the repository that `fglpkg publish` targets when no
+	// --registry flag is given (and FGLPKG_PUBLISH_REGISTRY is unset). Lets a
+	// team that publishes to their own Artifactory avoid typing --registry every
+	// time. Empty ("" or "gi") preserves the default of publishing to GI. This
+	// is a publish-only default; it does not bias consume-side routing.
+	DefaultRegistry string `json:"defaultRegistry,omitempty"`
 }
 
 // HasWebcomponents reports whether the manifest declares one or more
@@ -174,11 +187,26 @@ type HookOperation struct {
 type Dependencies struct {
 	FGL  map[string]string `json:"fgl,omitempty"`  // name -> version constraint
 	Java []JavaDependency  `json:"java,omitempty"` // Maven coordinates
+	// FGLPins records the optional per-dependency repository pin from the
+	// object form `{"version": ..., "registry": ...}` (name -> registry name).
+	// It is not a distinct JSON key — it is derived from / re-emitted into the
+	// `fgl` object entries by (Un)MarshalJSON. See
+	// specs/artifactory-secondary-repository.md §6.
+	FGLPins map[string]string `json:"-"`
 }
 
-// UnmarshalJSON rejects unknown keys under `dependencies` with a hint,
-// since a common mistake is to put package names directly under
-// `dependencies` instead of nested under `dependencies.fgl`.
+// fglDepObject is the object form of an fgl dependency value, an alternative
+// to the plain version-constraint string.
+type fglDepObject struct {
+	Version  string `json:"version"`
+	Registry string `json:"registry,omitempty"`
+}
+
+// UnmarshalJSON rejects unknown keys under `dependencies` with a hint (a common
+// mistake is putting package names directly under `dependencies` rather than
+// nested under `dependencies.fgl`). Each `fgl` value may be either a plain
+// version-constraint string or an object `{"version": ..., "registry": ...}`;
+// the optional registry pin is collected into FGLPins.
 func (d *Dependencies) UnmarshalJSON(data []byte) error {
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(data, &raw); err != nil {
@@ -193,8 +221,38 @@ func (d *Dependencies) UnmarshalJSON(data []byte) error {
 		}
 	}
 	if fglRaw, ok := raw["fgl"]; ok {
-		if err := json.Unmarshal(fglRaw, &d.FGL); err != nil {
+		var entries map[string]json.RawMessage
+		if err := json.Unmarshal(fglRaw, &entries); err != nil {
 			return fmt.Errorf(`invalid "dependencies.fgl": %w`, err)
+		}
+		d.FGL = make(map[string]string, len(entries))
+		for name, v := range entries {
+			// Plain string form: "^1.0.0".
+			var s string
+			if err := json.Unmarshal(v, &s); err == nil {
+				d.FGL[name] = s
+				continue
+			}
+			// Object form: {"version": "^1.0.0", "registry": "acme-internal"}.
+			var obj fglDepObject
+			dec := json.NewDecoder(bytes.NewReader(v))
+			dec.DisallowUnknownFields()
+			if err := dec.Decode(&obj); err != nil {
+				return fmt.Errorf(
+					`invalid "dependencies.fgl.%s": expected a version string or {"version": ..., "registry": ...}: %w`,
+					name, err,
+				)
+			}
+			if obj.Version == "" {
+				return fmt.Errorf(`invalid "dependencies.fgl.%s": the object form requires "version"`, name)
+			}
+			d.FGL[name] = obj.Version
+			if obj.Registry != "" {
+				if d.FGLPins == nil {
+					d.FGLPins = map[string]string{}
+				}
+				d.FGLPins[name] = obj.Registry
+			}
 		}
 	}
 	if javaRaw, ok := raw["java"]; ok {
@@ -203,6 +261,29 @@ func (d *Dependencies) UnmarshalJSON(data []byte) error {
 		}
 	}
 	return nil
+}
+
+// MarshalJSON emits fgl entries as a plain version string, or as the object
+// form `{"version": ..., "registry": ...}` when the entry carries a registry
+// pin (FGLPins). Empty buckets marshal to `{}`, matching the previous shape so
+// the manifest's own empty-bucket stripping keeps working.
+func (d Dependencies) MarshalJSON() ([]byte, error) {
+	out := map[string]interface{}{}
+	if len(d.FGL) > 0 {
+		fgl := make(map[string]interface{}, len(d.FGL))
+		for name, constraint := range d.FGL {
+			if reg := d.FGLPins[name]; reg != "" {
+				fgl[name] = fglDepObject{Version: constraint, Registry: reg}
+			} else {
+				fgl[name] = constraint
+			}
+		}
+		out["fgl"] = fgl
+	}
+	if len(d.Java) > 0 {
+		out["java"] = d.Java
+	}
+	return json.Marshal(out)
 }
 
 // UnmarshalJSON rejects unknown lifecycle event names with a helpful
@@ -493,6 +574,9 @@ func (m *Manifest) PublishCopy() *Manifest {
 		clone.ImportRoot = ""
 	}
 	clone.Include = nil
+	// defaultRegistry is a publisher-side convenience (where THIS project
+	// publishes); it is meaningless to a consumer reading the sidecar.
+	clone.DefaultRegistry = ""
 	return &clone
 }
 
@@ -522,12 +606,31 @@ func (m *Manifest) AddFGLDependencyScoped(name, version string, scope Scope) {
 			continue
 		}
 		delete(m.bucket(s).FGL, name)
+		delete(m.bucket(s).FGLPins, name)
 	}
 	b := m.bucket(scope)
 	if b.FGL == nil {
 		b.FGL = map[string]string{}
 	}
 	b.FGL[name] = version
+	// A plain add carries no registry pin; drop any stale one.
+	delete(b.FGLPins, name)
+}
+
+// AddFGLDependencyPinned adds or updates a BDL package dependency pinned to a
+// specific repository (the inline `{ "version": …, "registry": … }` form). An
+// empty registry falls back to the unpinned add. Like AddFGLDependencyScoped,
+// any declaration in a different scope is removed first.
+func (m *Manifest) AddFGLDependencyPinned(name, version, registry string, scope Scope) {
+	m.AddFGLDependencyScoped(name, version, scope)
+	if registry == "" {
+		return
+	}
+	b := m.bucket(scope)
+	if b.FGLPins == nil {
+		b.FGLPins = map[string]string{}
+	}
+	b.FGLPins[name] = registry
 }
 
 // RemoveFGLDependency removes a BDL package dependency from whichever scope
@@ -536,6 +639,7 @@ func (m *Manifest) RemoveFGLDependency(name string) Scope {
 	for _, s := range []Scope{ScopeProd, ScopeDev, ScopeOptional} {
 		if _, ok := m.bucket(s).FGL[name]; ok {
 			delete(m.bucket(s).FGL, name)
+			delete(m.bucket(s).FGLPins, name)
 			return s
 		}
 	}

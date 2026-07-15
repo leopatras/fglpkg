@@ -121,9 +121,19 @@ func TestParseLoginArgs(t *testing.T) {
 			if (err != nil) != c.wantErr {
 				t.Fatalf("err = %v, wantErr = %v", err, c.wantErr)
 			}
-			if got != c.wantPAT {
-				t.Errorf("pat = %q, want %q", got, c.wantPAT)
+			if got.token != c.wantPAT {
+				t.Errorf("token = %q, want %q", got.token, c.wantPAT)
 			}
 		})
+	}
+}
+
+func TestParseLoginArgs_Registry(t *testing.T) {
+	got, err := parseLoginArgs([]string{"--registry", "acme", "--user", "u", "--password", "p", "--api-key", "k"})
+	if err != nil {
+		t.Fatalf("parseLoginArgs: %v", err)
+	}
+	if got.registry != "acme" || got.user != "u" || got.password != "p" || got.apiKey != "k" {
+		t.Fatalf("parsed = %+v", got)
 	}
 }

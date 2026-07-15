@@ -34,6 +34,23 @@ type Installer struct {
 	webcomponentsDir string // ~/.fglpkg/webcomponents
 	githubToken      string // GitHub PAT for downloading from private GitHub Releases
 	registryToken    string // bearer for the consumer registry when it serves zips directly
+	repoAuth         []RepoAuth
+	// versionFetcher/infoFetcher, when non-nil, replace the default live GI
+	// registry fetchers with a multi-provider routing layer (RepositorySet).
+	versionFetcher resolver.VersionFetcher
+	infoFetcher    resolver.InfoFetcher
+	// pinDeclarer, when non-nil, receives per-dependency registry pins found in
+	// resolved packages' manifests so transitive deps route to the author's
+	// stated source. Set alongside the multi-provider fetchers.
+	pinDeclarer resolver.PinDeclarer
+}
+
+// RepoAuth maps a repository URL prefix to the HTTP headers that authenticate
+// downloads from it. Used for secondary (Artifactory) repositories, whose auth
+// scheme may be bearer/basic/apikey. Matched by longest URL prefix.
+type RepoAuth struct {
+	URLPrefix string
+	Headers   map[string]string
 }
 
 // New creates an Installer rooted at home.
@@ -52,6 +69,58 @@ func New(home, githubToken, registryToken string) *Installer {
 		githubToken:      githubToken,
 		registryToken:    registryToken,
 	}
+}
+
+// WithRepoAuth attaches per-repository download auth (for Artifactory
+// secondary repositories) and returns the installer for chaining.
+func (i *Installer) WithRepoAuth(ra []RepoAuth) *Installer {
+	i.repoAuth = ra
+	return i
+}
+
+// WithFetchers replaces the default live GI registry fetchers with a
+// multi-provider routing layer (e.g. a RepositorySet's Versions/Info). Pass
+// nil,nil to keep the default single-registry behaviour.
+func (i *Installer) WithFetchers(fv resolver.VersionFetcher, fi resolver.InfoFetcher) *Installer {
+	i.versionFetcher = fv
+	i.infoFetcher = fi
+	return i
+}
+
+// WithPinDeclarer attaches a PinDeclarer (typically the same RepositorySet
+// backing the fetchers) so declared per-dependency registry pins are honoured
+// during resolution. Returns the installer for chaining.
+func (i *Installer) WithPinDeclarer(pd resolver.PinDeclarer) *Installer {
+	i.pinDeclarer = pd
+	return i
+}
+
+// newResolver builds the resolver, using injected multi-provider fetchers when
+// configured (still honouring any workspace), else the default live resolver.
+func (i *Installer) newResolver(gv genero.Version) (*resolver.Resolver, error) {
+	if i.versionFetcher != nil && i.infoFetcher != nil {
+		r := resolver.NewWithFetchers(gv, i.versionFetcher, i.infoFetcher)
+		if i.pinDeclarer != nil {
+			r = r.WithPinDeclarer(i.pinDeclarer)
+		}
+		if err := r.DetectWorkspace(); err != nil {
+			return nil, err
+		}
+		return r, nil
+	}
+	return resolver.New()
+}
+
+// matchRepoAuth returns the headers for the configured repo whose URL prefix
+// best (longest) matches url, or nil if none match.
+func (i *Installer) matchRepoAuth(url string) map[string]string {
+	var best RepoAuth
+	for _, ra := range i.repoAuth {
+		if strings.HasPrefix(url, ra.URLPrefix) && len(ra.URLPrefix) > len(best.URLPrefix) {
+			best = ra
+		}
+	}
+	return best.Headers
 }
 
 // Options controls optional install behaviour.
@@ -114,7 +183,7 @@ func (i *Installer) InstallAllWithOptions(m *manifest.Manifest, projectDir strin
 
 	// ── Resolve the full dependency graph ───────────────────────────────────
 	fmt.Printf("Resolving dependency graph (Genero %s)...\n", gv)
-	r, err := resolver.New()
+	r, err := i.newResolver(gv)
 	if err != nil {
 		return fmt.Errorf("cannot initialise resolver: %w", err)
 	}
@@ -389,7 +458,7 @@ func (i *Installer) installBDL(info *registry.PackageInfo) error {
 	downloadURL := registry.AbsoluteDownloadURL(info.DownloadURL)
 
 	// Download and verify in one streaming pass.
-	if err := downloadAndVerify(downloadURL, info.Checksum, info.Name, tmp, i.githubToken, i.registryToken); err != nil {
+	if err := downloadAndVerify(downloadURL, info.Checksum, info.Name, tmp, i.githubToken, i.registryToken, i.matchRepoAuth(downloadURL)); err != nil {
 		tmp.Close()
 		return err
 	}
@@ -446,7 +515,7 @@ func (i *Installer) installWebcomponent(info *registry.PackageInfo) error {
 	defer os.Remove(tmpName)
 
 	downloadURL := registry.AbsoluteDownloadURL(info.DownloadURL)
-	if err := downloadAndVerify(downloadURL, info.Checksum, info.Name, tmp, i.githubToken, i.registryToken); err != nil {
+	if err := downloadAndVerify(downloadURL, info.Checksum, info.Name, tmp, i.githubToken, i.registryToken, i.matchRepoAuth(downloadURL)); err != nil {
 		tmp.Close()
 		return err
 	}
@@ -478,7 +547,8 @@ func (i *Installer) InstallJar(dep manifest.JavaDependency) error {
 	url := dep.MavenURL()
 
 	// JavaDependency doesn't carry a checksum field today; pass "" to skip.
-	if err := downloadAndVerify(url, dep.Checksum, dep.JarFileName(), f, "", ""); err != nil {
+	// JARs come from Maven Central anonymously — no repo auth.
+	if err := downloadAndVerify(url, dep.Checksum, dep.JarFileName(), f, "", "", nil); err != nil {
 		f.Close()
 		os.Remove(dest)
 		return err
@@ -515,7 +585,11 @@ func (i *Installer) ReconcileAfterRemove(m *manifest.Manifest, projectDir string
 	if err := i.ensureDirs(); err != nil {
 		return nil, err
 	}
-	r, err := resolver.New()
+	gv, err := genero.Detect()
+	if err != nil {
+		return nil, fmt.Errorf("cannot detect Genero version: %w", err)
+	}
+	r, err := i.newResolver(gv)
 	if err != nil {
 		return nil, fmt.Errorf("cannot initialise resolver: %w", err)
 	}
@@ -634,7 +708,7 @@ func (i *Installer) JarsDir() string { return i.jarsDir }
 //   - Non-GitHub URL + registryToken non-empty → send registryToken (new
 //     service.generointelligence.ai path where the registry serves zips).
 //   - Otherwise → no auth (anonymous public download).
-func downloadAndVerify(url, expectedChecksum, name string, w io.Writer, githubToken, registryToken string) error {
+func downloadAndVerify(url, expectedChecksum, name string, w io.Writer, githubToken, registryToken string, repoHeaders map[string]string) error {
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
 		return fmt.Errorf("download failed for %s: %w", name, err)
@@ -647,6 +721,12 @@ func downloadAndVerify(url, expectedChecksum, name string, w io.Writer, githubTo
 		authToken = githubToken
 		req.Header.Set("Authorization", "Bearer "+authToken)
 		req.Header.Set("Accept", "application/octet-stream")
+	case !isGH && len(repoHeaders) > 0:
+		// Secondary (Artifactory) repository: apply its configured auth scheme
+		// headers (bearer / basic / apikey).
+		for k, v := range repoHeaders {
+			req.Header.Set(k, v)
+		}
 	case !isGH && registryToken != "":
 		authToken = registryToken
 		req.Header.Set("Authorization", "Bearer "+authToken)

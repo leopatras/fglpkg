@@ -55,6 +55,10 @@ func TestCmdSearchAllSurfacesCleanErrorOn400(t *testing.T) {
 	}))
 	defer ts.Close()
 	t.Setenv("FGLPKG_REGISTRY", ts.URL)
+	// Isolate the fglpkg home so a developer's real ~/.fglpkg/config.json
+	// (e.g. a globally-configured Artifactory repo) doesn't add a second
+	// provider that satisfies the search and masks the GI 400 under test.
+	t.Setenv("FGLPKG_HOME", t.TempDir())
 
 	err := cmdSearch([]string{"--all"})
 	if err == nil {

@@ -132,6 +132,15 @@
     "optionalDependencies": {
       "$ref": "#/definitions/dependencyBucket",
       "description": "Dependencies that are attempted like production deps but whose failure to resolve or download only emits a warning."
+    },
+    "registries": {
+      "type": "array",
+      "description": "Additional package repositories (e.g. a JFrog Artifactory instance) consulted alongside the built-in Genero Intelligence registry. Committed with the project; credentials stay per-developer in ~/.fglpkg/credentials.json.",
+      "items": { "$ref": "#/definitions/registry" }
+    },
+    "defaultRegistry": {
+      "type": "string",
+      "description": "Name of the repository that `fglpkg publish` targets when no --registry flag is given (and FGLPKG_PUBLISH_REGISTRY is unset). Lets a team that publishes to their own Artifactory avoid passing --registry every time. Omit (or use \"gi\") to publish to the Genero Intelligence registry. Publish-only: does not affect which repository packages are consumed from."
     }
   },
   "definitions": {
@@ -141,10 +150,29 @@
       "properties": {
         "fgl": {
           "type": "object",
-          "description": "BDL package dependencies. Keys are package names; values are semver constraint strings (e.g. \"^1.2.0\", \">=1.0.0 <2.0.0\").",
+          "description": "BDL package dependencies. Keys are package names; each value is either a semver constraint string (e.g. \"^1.2.0\") or an object pinning the source repository, e.g. {\"version\": \"^1.0.0\", \"registry\": \"acme-internal\"}.",
           "additionalProperties": {
-            "type": "string",
-            "description": "Semver constraint for this dependency."
+            "oneOf": [
+              {
+                "type": "string",
+                "description": "Semver constraint for this dependency (routed to whichever configured repository owns the name)."
+              },
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["version"],
+                "properties": {
+                  "version": {
+                    "type": "string",
+                    "description": "Semver constraint for this dependency."
+                  },
+                  "registry": {
+                    "type": "string",
+                    "description": "Name of the configured registry this dependency must resolve from (disambiguates a name available in more than one repository)."
+                  }
+                }
+              }
+            ]
           }
         },
         "java": {
@@ -223,6 +251,48 @@
           "description": "Override the Maven Central URL entirely. Useful for mirrors or non-standard repositories."
         }
       }
+    },
+    "registry": {
+      "type": "object",
+      "description": "A package repository descriptor. Carries no secrets — credentials live in ~/.fglpkg/credentials.json, keyed by url.",
+      "additionalProperties": false,
+      "required": ["name", "type", "url"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Logical id, used in --registry, the lockfile, and as the credentials key display."
+        },
+        "type": {
+          "type": "string",
+          "enum": ["genero", "artifactory"],
+          "description": "Repository kind: the Genero Intelligence registry protocol, or a JFrog Artifactory generic repository."
+        },
+        "url": {
+          "type": "string",
+          "description": "Base URL including any context path, e.g. \"https://artifactory.acme.example/artifactory\"."
+        },
+        "repoKey": {
+          "type": "string",
+          "description": "Artifactory generic-repository key. Required when type is \"artifactory\"."
+        },
+        "priority": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Resolution priority; lower is tried first. Must be unique across the configured set."
+        },
+        "auth": {
+          "type": "string",
+          "enum": ["bearer", "basic", "apikey", "anonymous"],
+          "description": "Authentication scheme for this repository. Defaults to \"bearer\"."
+        },
+        "packages": {
+          "type": "array",
+          "description": "Optional glob allow-list of package names this repository owns (e.g. [\"acme-*\"]). Omit to consult it for any name.",
+          "items": { "type": "string" }
+        }
+      },
+      "if": { "properties": { "type": { "const": "artifactory" } } },
+      "then": { "required": ["repoKey"] }
     }
   }
 }

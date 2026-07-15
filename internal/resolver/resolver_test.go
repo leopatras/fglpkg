@@ -2,6 +2,7 @@ package resolver_test
 
 import (
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/4js-mikefolcher/fglpkg/internal/genero"
@@ -80,7 +81,113 @@ var (
 	genero320 = genero.MustParse("3.20.05")
 )
 
+// recordingPinDeclarer captures the per-dependency registry pins the resolver
+// discovers, to assert they are threaded from a package's FGLDepPins.
+type recordingPinDeclarer struct{ pins map[string]string }
+
+func (r *recordingPinDeclarer) DeclarePin(name, registry string) error {
+	r.pins[name] = registry
+	return nil
+}
+
+// collisionDB is a fetcher+pin-declarer that mimics the multi-provider routing
+// layer: a "colliding" name returns an ErrCollision-wrapping error until a pin
+// is declared for it, after which it resolves normally. Used to test that the
+// resolver defers a collision and retries it once a pin arrives — independent
+// of the order names are discovered in.
+type collisionDB struct {
+	db        packageDB
+	colliding map[string]bool
+	pins      map[string]string
+}
+
+func (c *collisionDB) versions(name string) ([]resolver.CandidateVersion, error) {
+	if c.colliding[name] && c.pins[name] == "" {
+		return nil, fmt.Errorf("%q collides: %w", name, resolver.ErrCollision)
+	}
+	return c.db.versions(name)
+}
+func (c *collisionDB) info(name, version, gm string) (*registry.PackageInfo, error) {
+	return c.db.info(name, version, gm)
+}
+func (c *collisionDB) DeclarePin(name, registry string) error {
+	c.pins[name] = registry
+	return nil
+}
+
+// TestDeferredCollisionResolvedByPin: `widget` is a direct root dependency that
+// collides, but its sibling `helper` declares widget→acme. Resolution must
+// succeed regardless of whether widget or helper is dequeued first.
+func TestDeferredCollisionResolvedByPin(t *testing.T) {
+	helper := pkg("helper", "1.0.0", map[string]string{"widget": "*"})
+	helper.FGLDepPins = map[string]string{"widget": "acme"}
+	c := &collisionDB{
+		db: packageDB{
+			"helper": {"1.0.0": entry("", helper)},
+			"widget": {"1.0.0": entry("", pkg("widget", "1.0.0", nil))},
+		},
+		colliding: map[string]bool{"widget": true},
+		pins:      map[string]string{},
+	}
+	root := manifest.New("app", "1.0.0", "", "")
+	root.AddFGLDependency("widget", "*")
+	root.AddFGLDependency("helper", "*")
+
+	r := resolver.NewWithFetchers(genero401, c.versions, c.info).WithPinDeclarer(c)
+	plan, err := r.Resolve(root)
+	if err != nil {
+		t.Fatalf("expected deferred collision to resolve via declared pin, got: %v", err)
+	}
+	byName := planByName(plan)
+	assertVersion(t, byName, "widget", "1.0.0")
+	assertVersion(t, byName, "helper", "1.0.0")
+}
+
+// TestUnresolvedCollisionErrors: a colliding name that nothing ever pins must
+// still fail, wrapping ErrCollision.
+func TestUnresolvedCollisionErrors(t *testing.T) {
+	c := &collisionDB{
+		db:        packageDB{"widget": {"1.0.0": entry("", pkg("widget", "1.0.0", nil))}},
+		colliding: map[string]bool{"widget": true},
+		pins:      map[string]string{},
+	}
+	root := manifest.New("app", "1.0.0", "", "")
+	root.AddFGLDependency("widget", "*")
+
+	r := resolver.NewWithFetchers(genero401, c.versions, c.info).WithPinDeclarer(c)
+	_, err := r.Resolve(root)
+	if err == nil {
+		t.Fatal("expected a collision error")
+	}
+	if !errors.Is(err, resolver.ErrCollision) {
+		t.Fatalf("error should wrap ErrCollision, got: %v", err)
+	}
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────────
+
+// TestResolveThreadsDeclaredPin verifies that a registry pin declared in a
+// resolved package's manifest (FGLDepPins) is handed to the PinDeclarer for its
+// transitive dependency, so routing can honour the author's stated source.
+func TestResolveThreadsDeclaredPin(t *testing.T) {
+	a := pkg("a", "1.0.0", map[string]string{"b": "^1.0.0"})
+	a.FGLDepPins = map[string]string{"b": "acme"}
+	db := packageDB{
+		"a": {"1.0.0": entry("", a)},
+		"b": {"1.0.0": entry("", pkg("b", "1.0.0", nil))},
+	}
+	root := manifest.New("myapp", "1.0.0", "", "")
+	root.AddFGLDependency("a", "^1.0.0")
+
+	pd := &recordingPinDeclarer{pins: map[string]string{}}
+	_, err := db.newResolver(genero401).WithPinDeclarer(pd).Resolve(root)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if pd.pins["b"] != "acme" {
+		t.Fatalf("declared pin not threaded to declarer: %+v", pd.pins)
+	}
+}
 
 func TestNoDeps(t *testing.T) {
 	db := packageDB{}
