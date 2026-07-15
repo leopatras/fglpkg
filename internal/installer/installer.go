@@ -111,16 +111,21 @@ func (i *Installer) newResolver(gv genero.Version) (*resolver.Resolver, error) {
 	return resolver.New()
 }
 
-// matchRepoAuth returns the headers for the configured repo whose URL prefix
-// best (longest) matches url, or nil if none match.
-func (i *Installer) matchRepoAuth(url string) map[string]string {
+// matchRepoAuth returns the auth headers for the configured repository whose
+// URL prefix best (longest) matches url, and whether any configured repo
+// matched at all. A match with empty headers (an "anonymous" repo) still
+// reports matched=true, so the caller knows the host belongs to a configured
+// repository and must NOT be sent the GI registry token (which would leak the
+// GI bearer to a third-party host — see GIS-267).
+func (i *Installer) matchRepoAuth(url string) (headers map[string]string, matched bool) {
 	var best RepoAuth
 	for _, ra := range i.repoAuth {
 		if strings.HasPrefix(url, ra.URLPrefix) && len(ra.URLPrefix) > len(best.URLPrefix) {
 			best = ra
+			matched = true
 		}
 	}
-	return best.Headers
+	return best.Headers, matched
 }
 
 // Options controls optional install behaviour.
@@ -458,7 +463,8 @@ func (i *Installer) installBDL(info *registry.PackageInfo) error {
 	downloadURL := registry.AbsoluteDownloadURL(info.DownloadURL)
 
 	// Download and verify in one streaming pass.
-	if err := downloadAndVerify(downloadURL, info.Checksum, info.Name, tmp, i.githubToken, i.registryToken, i.matchRepoAuth(downloadURL)); err != nil {
+	repoHeaders, repoMatched := i.matchRepoAuth(downloadURL)
+	if err := downloadAndVerify(downloadURL, info.Checksum, info.Name, tmp, i.githubToken, i.registryToken, repoHeaders, repoMatched); err != nil {
 		tmp.Close()
 		return err
 	}
@@ -515,7 +521,8 @@ func (i *Installer) installWebcomponent(info *registry.PackageInfo) error {
 	defer os.Remove(tmpName)
 
 	downloadURL := registry.AbsoluteDownloadURL(info.DownloadURL)
-	if err := downloadAndVerify(downloadURL, info.Checksum, info.Name, tmp, i.githubToken, i.registryToken, i.matchRepoAuth(downloadURL)); err != nil {
+	repoHeaders, repoMatched := i.matchRepoAuth(downloadURL)
+	if err := downloadAndVerify(downloadURL, info.Checksum, info.Name, tmp, i.githubToken, i.registryToken, repoHeaders, repoMatched); err != nil {
 		tmp.Close()
 		return err
 	}
@@ -548,7 +555,7 @@ func (i *Installer) InstallJar(dep manifest.JavaDependency) error {
 
 	// JavaDependency doesn't carry a checksum field today; pass "" to skip.
 	// JARs come from Maven Central anonymously — no repo auth.
-	if err := downloadAndVerify(url, dep.Checksum, dep.JarFileName(), f, "", "", nil); err != nil {
+	if err := downloadAndVerify(url, dep.Checksum, dep.JarFileName(), f, "", "", nil, false); err != nil {
 		f.Close()
 		os.Remove(dest)
 		return err
@@ -702,13 +709,17 @@ func (i *Installer) JarsDir() string { return i.jarsDir }
 // into w, and verifies the SHA256 against expectedChecksum in a single pass.
 // name is used only in error messages.
 //
-// Auth selection:
+// Auth selection (first match wins):
 //   - GitHub URL + githubToken non-empty → send githubToken (legacy private
 //     GitHub Releases path used by fglpkg-registry.fly.dev).
-//   - Non-GitHub URL + registryToken non-empty → send registryToken (new
-//     service.generointelligence.ai path where the registry serves zips).
+//   - URL belongs to a configured secondary repository (repoMatched) → send
+//     that repo's auth-scheme headers, or NONE for an "anonymous" repo. The GI
+//     registry token is never sent here: doing so would leak the GI bearer to
+//     a third-party (e.g. Artifactory) host (GIS-267).
+//   - Other non-GitHub URL + registryToken non-empty → send registryToken (the
+//     GI service.generointelligence.ai path where the registry serves zips).
 //   - Otherwise → no auth (anonymous public download).
-func downloadAndVerify(url, expectedChecksum, name string, w io.Writer, githubToken, registryToken string, repoHeaders map[string]string) error {
+func downloadAndVerify(url, expectedChecksum, name string, w io.Writer, githubToken, registryToken string, repoHeaders map[string]string, repoMatched bool) error {
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
 		return fmt.Errorf("download failed for %s: %w", name, err)
@@ -721,9 +732,11 @@ func downloadAndVerify(url, expectedChecksum, name string, w io.Writer, githubTo
 		authToken = githubToken
 		req.Header.Set("Authorization", "Bearer "+authToken)
 		req.Header.Set("Accept", "application/octet-stream")
-	case !isGH && len(repoHeaders) > 0:
-		// Secondary (Artifactory) repository: apply its configured auth scheme
-		// headers (bearer / basic / apikey).
+	case repoMatched:
+		// Configured secondary (Artifactory) repository: apply its auth-scheme
+		// headers (bearer / basic / apikey), or none for an anonymous repo.
+		// Never fall through to registryToken — that would leak the GI bearer
+		// to the secondary host (GIS-267).
 		for k, v := range repoHeaders {
 			req.Header.Set(k, v)
 		}

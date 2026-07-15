@@ -3051,9 +3051,11 @@ func buildRepositorySet(globalHome string, m *manifest.Manifest) (*provider.Repo
 				headers = creds.AuthHeaders(r.URL, r.Auth)
 			}
 			provs = append(provs, provider.NewArtifactoryProvider(r, nil, headersApplier(headers)))
-			if len(headers) > 0 {
-				repoAuth = append(repoAuth, installer.RepoAuth{URLPrefix: r.URL, Headers: headers})
-			}
+			// Register the repo's URL prefix even when anonymous (headers may be
+			// empty): the installer must recognise the host as a configured
+			// secondary repo so it never falls back to sending the GI registry
+			// bearer there (GIS-267).
+			repoAuth = append(repoAuth, installer.RepoAuth{URLPrefix: r.URL, Headers: headers})
 		default: // genero
 			provs = append(provs, provider.NewGeneroProvider(r.Name))
 		}
