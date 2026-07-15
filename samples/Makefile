@@ -1,11 +1,15 @@
-# fglpkg samples — five packages (A, B, C, v5, v6) and a consumer (D).
+# fglpkg samples — five BDL packages (A, B, C, v5, v6), one webcomponent
+# package (WC), and two consumers (D, E).
 #
-#   sample-a  (A/)   no dependencies
-#   sample-b  (B/)   depends on sample-a and sample-c
-#   sample-c  (C/)   depends on sample-a and sample-b   (B <-> C is a cycle)
-#   sample-v5 (v5/)  requires Genero >= 5.00.03 (base.Channel.getExitStatus)
-#   sample-v6 (v6/)  requires Genero >= 6.00    (prometheus package)
-#   sample-d  (D/)   app project consuming a/b/c via `fglpkg install`
+#   sample-a   (A/)   no dependencies
+#   sample-b   (B/)   depends on sample-a and sample-c
+#   sample-c   (C/)   depends on sample-a and sample-b   (B <-> C is a cycle)
+#   sample-v5  (v5/)  requires Genero >= 5.00.03 (base.Channel.getExitStatus)
+#   sample-v6  (v6/)  requires Genero >= 6.00    (prometheus package)
+#   sample-img (WC/)  pure webcomponent package (no BDL content) — an
+#                     image-display widget, COMPONENTTYPE "img"
+#   sample-d   (D/)   app project consuming a/b/c via `fglpkg install`
+#   sample-e   (E/)   app project consuming sample-img via `fglpkg install`
 #
 # Targets:
 #   make demo-4gl   end-to-end with the Genero 4GL fglpkg (g/fglpkg)
@@ -15,8 +19,13 @@
 #
 # Each demo target starts a private mock registry
 # (g/fglpkg/test/mock_registry.py — its package index lives in memory),
-# publishes A, C, B, then installs/compiles/runs the consumer D against
-# it, and stops the registry again.
+# publishes A, C, B, v5, v6, WC, then installs/compiles/runs consumer D
+# and installs/compiles consumer E against it, and stops the registry
+# again. E's webcomponent form is only compiled (fglform -M), not run
+# interactively — WEBCOMPONENT widgets need a browser-capable front end
+# (GBC/GWC), which this headless FGLGUI=0/TERM=xterm demo doesn't have;
+# compiling the form + program is enough to prove the package installed
+# into .fglpkg/webcomponents/img/ and is discoverable via FGLIMAGEPATH.
 
 SHELL := /bin/bash
 REPO := $(abspath ..)
@@ -36,16 +45,17 @@ FGLPKG_GO := $(REPO)/bin/fglpkg-go
 
 all: demo-4gl
 
-# publish A/C/B to a fresh mock registry, then install + build + run D;
-# the registry only lives for the duration of the recipe
+# publish A/C/B/v5/v6/WC to a fresh mock registry, then install + build
+# + run D, and install + build E; the registry only lives for the
+# duration of the recipe
 define demo_flow
 	set -e; \
-	rm -rf .registry-state .fglpkg-home D/.fglpkg D/fglpkg.lock D/d.42m; \
+	rm -rf .registry-state .fglpkg-home D/.fglpkg D/fglpkg.lock D/d.42m E/.fglpkg E/fglpkg.lock E/imgdemo.42m E/imgdemo.42f; \
 	lsof -ti tcp:$(REGISTRY_PORT) | xargs kill 2>/dev/null || true; \
 	python3 $(REPO)/g/fglpkg/test/mock_registry.py $(REGISTRY_PORT) .registry-state & REG=$$!; \
 	trap 'kill $$REG 2>/dev/null || true' EXIT; \
 	sleep 1; \
-	for p in A C B v5 v6; do \
+	for p in A C B v5 v6 WC; do \
 	  echo "== publish $$p"; \
 	  (cd $$p && $(1) publish --ci); \
 	done; \
@@ -54,7 +64,11 @@ define demo_flow
 	echo "== install dependencies in D"; \
 	(cd D && $(1) install); \
 	echo "== compile and run D"; \
-	cd D && eval "$$($(1) env)" && fglcomp -M d.4gl && fglrun d.42m
+	(cd D && eval "$$($(1) env)" && fglcomp -M d.4gl && fglrun d.42m); \
+	echo "== install dependencies in E"; \
+	(cd E && $(1) install); \
+	echo "== compile E (webcomponent form — not run, see header comment)"; \
+	(cd E && eval "$$($(1) env)" && fglform -M imgdemo.per && fglcomp -M imgdemo.4gl)
 endef
 
 demo-4gl: modules
@@ -83,6 +97,6 @@ $(FGLPKG_GO):
 
 clean:
 	rm -rf .build .registry-state .fglpkg-home
-	rm -f A/*.42m B/*.42m C/*.42m D/*.42m v5/*.42m v6/*.42m
-	rm -rf D/.fglpkg
-	rm -f D/fglpkg.lock
+	rm -f A/*.42m B/*.42m C/*.42m D/*.42m v5/*.42m v6/*.42m E/*.42m E/*.42f
+	rm -rf D/.fglpkg E/.fglpkg
+	rm -f D/fglpkg.lock E/fglpkg.lock

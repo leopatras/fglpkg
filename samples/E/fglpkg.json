@@ -1,0 +1,13 @@
+{
+  "name": "sample-e",
+  "version": "1.0.0",
+  "description": "fglpkg sample consumer project using the sample-img webcomponent package",
+  "author": "fglpkg samples",
+  "license": "MIT",
+  "genero": "*",
+  "dependencies": {
+    "fgl": {
+      "sample-img": "^1.0.0"
+    }
+  }
+}
