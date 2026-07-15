@@ -342,7 +342,7 @@ type GeneroMismatchError struct {
 func (e *GeneroMismatchError) Error() string {
 	return fmt.Sprintf(
 		"lock file was generated with Genero %s but current runtime is %s.\n"+
-			"Run 'fglpkg install' to re-resolve for the current Genero version.",
+			"Run 'fglpkg update' to re-resolve for the current Genero version.",
 		e.Locked, e.Current,
 	)
 }
