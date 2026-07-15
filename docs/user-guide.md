@@ -261,11 +261,15 @@ This deletes the package from `~/.fglpkg/packages/` and removes it from whicheve
 
 ### Updating Dependencies
 
+Once a `fglpkg.lock` exists, `fglpkg install` will **not** fetch a newer version of a dependency just because one was published — even if your version constraint (e.g. `^1.0.0`) would allow it. `install` only re-resolves when `fglpkg.json` itself changed; otherwise it validates the existing lock against disk and stops there (`Lock file is up to date... Nothing to install`).
+
 To re-resolve all dependencies to their latest compatible versions (ignoring the lock file):
 
 ```bash
 fglpkg update
 ```
+
+This rewrites `fglpkg.lock` with whatever versions the registry now resolves to, and re-installs anything that changed — BDL packages, Java JARs, and webcomponent packages alike. Webcomponent bundles are always re-extracted on install (there's no "already installed, skip" fast path for them like there is for BDL packages), so an `update` that picks up a new webcomponent version reliably overwrites the old files in `.fglpkg/webcomponents/<COMPONENTTYPE>/`. See [Publishing an Update](#publishing-an-update) for the publisher side of this flow.
 
 ### Listing Installed Packages
 
@@ -431,6 +435,25 @@ The publish flow:
 5. `POST …/versions/:version/submit` — submits the version for admin review.
 
 Authentication uses the OAuth/PAT bearer from `fglpkg login` (or `FGLPKG_TOKEN` in CI). No GitHub token is involved.
+
+### Publishing an Update
+
+To publish a new version of a package you own:
+
+```bash
+fglpkg version patch    # or minor | major | prerelease | <semver>
+fglpkg publish
+```
+
+`fglpkg version` bumps the `version` field in `fglpkg.json` (`patch` takes `1.2.3` → `1.2.4`, etc.) and prints a suggested `git tag` command; pass `--git` to have it create the tag for you automatically. Publishing then works exactly like a first release — the CLI picks up the new version from the manifest. This is the same two-command flow regardless of package kind (BDL, JAR-bearing, or pure webcomponent).
+
+**Consumers do not pick up the new version automatically.** Once a project has a `fglpkg.lock`, plain `fglpkg install` is a no-op if `fglpkg.json` hasn't changed — it validates the lock against what's on disk and prints `Lock file is up to date... Nothing to install`, even when a newer version satisfying the existing constraint (e.g. `^1.0.0`) now exists on the registry. To fetch it, run:
+
+```bash
+fglpkg update
+```
+
+in the consuming project. See [Updating Dependencies](#updating-dependencies) for what this does.
 
 ### Version Changelog
 
