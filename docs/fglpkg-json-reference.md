@@ -45,12 +45,12 @@ project root, drives every fglpkg operation:
 | Operation | What the manifest supplies |
 |---|---|
 | `fglpkg install` | The dependency graph (`dependencies`, `devDependencies`, `optionalDependencies`) to resolve, lock, and download. |
-| `fglpkg add` / `fglpkg remove` | The manifest is rewritten in place to record the change. |
+| `fglpkg install <pkg>` / `fglpkg remove` | The manifest is rewritten in place to record the change. |
 | `fglpkg pack` / `fglpkg publish` | Identity (`name`, `version`), the file-selection rules (`root`, `importRoot`, `files`, `include`, `docs`, `bin`), and registry metadata (`description`, `license`, `repository`, `author`, `visibility`, `keywords`). |
 | `fglpkg env` | Combined with the lock file to build `FGLLDPATH` / `CLASSPATH`. |
 | `fglpkg bdl` | The list of runnable `programs`. |
 | Install/publish lifecycle | The declarative `hooks` to run around each event. |
-| Registry search & `fglpkg info` | `description`, `keywords`, `author`, `license`, `repository`. |
+| Registry search & `fglpkg info` | `description`, `author`, `license`, `repository`. (`keywords` is advisory only — not currently matched by `fglpkg search`.) |
 
 Because the manifest is consumed by both the local CLI **and** the registry, it
 must stay accurate: fields such as `dependencies` and `genero` propagate to
@@ -174,7 +174,7 @@ confusing errors:
 - **The removed `scripts` field** produces a migration error pointing you at
   `hooks`.
 - **Round-tripping preserves field order and drops empty buckets.** When
-  fglpkg rewrites the file (`fglpkg add`, etc.), it writes 2-space-indented JSON
+  fglpkg rewrites the file (`fglpkg install <pkg>`, `fglpkg remove`, etc.), it writes 2-space-indented JSON
   in the struct's field order and omits `devDependencies` /
   `optionalDependencies` when they are empty.
 
@@ -235,9 +235,9 @@ URL of the source repository (e.g. `https://github.com/org/repo`).
 **Required to publish.**
 
 #### `keywords` — array of string
-Free-form tags that aid registry search and discovery, e.g.
-`["database", "utilities"]`. Advisory metadata only — fglpkg does not interpret
-them. Entries must be unique.
+Free-form tags intended to aid discovery, e.g. `["database", "utilities"]`.
+Advisory metadata only — fglpkg does not interpret them, and they are **not
+currently matched by `fglpkg search`** (see GIS-268). Entries must be unique.
 
 #### `visibility` — string · `"public"` | `"private"`
 Who can read the package on the registry. `"public"` (the default when the key

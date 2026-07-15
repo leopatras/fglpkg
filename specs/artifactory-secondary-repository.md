@@ -1,6 +1,6 @@
 # Spec: Artifactory as a secondary package repository
 
-**Status:** ⏳ In progress — GIS-249 (design decisions resolved 2026-07-10, see §17; not yet on `main`)
+**Status:** ◐ Partial — GIS-249. Phases 1–2 (consume + publish) **merged to `main` 2026-07-15** via PR #12 (commits `60581f5`, `65e0c5d`, `b32291c`, `f82ada1`). The security-critical core — multi-provider routing, the hard collision guard, native-SHA-256 integrity, fail-closed 401/403 handling — shipped and matches this spec. Four open issues found in the post-merge review (§18), one a security fix. Phase 3 not started. Design decisions resolved 2026-07-10 (§17).
 **Date:** 2026-07-10
 **Author:** Mike Folcher
 **Motivation:** A customer hosts their **internal** BDL packages in their own **JFrog
@@ -512,11 +512,11 @@ fglpkg registry list                     # configured repos + auth status
 
 ## 14. Rollout phases
 
-| Phase | Content |
-|---|---|
-| **1 — Consume** | `internal/config` + cascade; `Provider` interface + `GeneroProvider` extraction; `ArtifactoryProvider` (storage-API discovery, sidecar metadata, SHA-256); routing + collision guard; auth schemes + `login --registry`; installer auth generalization; lock `Registry` pin. Delivers install/update/search/info/outdated from Artifactory. |
-| **2 — Publish** | `publish --registry` deploy path (PUT zip + sidecar, checksum header, overwrite guard, dry-run). |
-| **3 — Later (not committed)** | JARs via an Artifactory Maven repo (global Maven-base override + Maven auth branch — see §16); `registry add/remove`; AQL-based search for very large repos; signing for Artifactory artifacts. |
+| Phase | Status | Content |
+|---|---|---|
+| **1 — Consume** | ✅ Merged 2026-07-15 (PR #12) — gaps in §18 | `internal/config` + cascade; `Provider` interface + `GeneroProvider` extraction; `ArtifactoryProvider` (storage-API discovery, sidecar metadata, SHA-256); routing + collision guard; auth schemes + `login --registry`; installer auth generalization; lock `Registry` pin. Delivers install from Artifactory — **but `info`/`outdated` are still GI-only, `search` lacks dedup, and `update --registry` is unwired (ISSUE-C).** |
+| **2 — Publish** | ✅ Merged 2026-07-15 (PR #12) | `publish --registry` deploy path (PUT zip + sidecar, checksum header, overwrite guard, dry-run). |
+| **3 — Later (not committed)** | 📋 Not started | JARs via an Artifactory Maven repo (global Maven-base override + Maven auth branch — see §16); `registry add/remove` (**requested 2026-07-15 — pull forward, ISSUE-H**); AQL-based search for very large repos; signing for Artifactory artifacts. |
 
 ## 15. Test plan
 
@@ -588,3 +588,139 @@ Each landed on the recommended option.
 7. **Auth schemes → settled.** ✅ `bearer` + `basic` + `apikey` + `anonymous`
    ([§8](#8-authentication)); Basic was promoted to first-class after the trial showed the instance
    advertises `Basic` and disables anonymous read.
+
+## 18. Post-merge status & open issues (reviewed 2026-07-15)
+
+Phases 1–2 landed on `main` via **PR #12** (`60581f5` "Add JFrog Artifactory as a secondary package
+repository", `65e0c5d` "Complete Artifactory routing, publish defaults, and docs", `b32291c`
+"resolver: defer registry collisions so declared pins win regardless of order", `f82ada1` "Fix user
+message and add fglpkg.json reference doc"). This section is the delta between what shipped and this
+spec, from a section-by-section code review.
+
+### 18.1 Shipped and matching the spec ✅
+
+- **§4 configuration model** — `registries` block in `fglpkg.json` + `~/.fglpkg/config.json` global
+  fallback + built-in `gi`; merge-by-name cascade; duplicate-priority / unknown-type / missing-`repoKey`
+  validation. (`internal/config/config.go`, `internal/manifest/manifest.go`, `schema/fglpkg.schema.json`.)
+- **§5 / §7 provider + Artifactory client** — `Provider` interface, `GeneroProvider`,
+  `ArtifactoryProvider`; storage-API version discovery, sidecar `fglpkg.json` metadata, path layout,
+  `packages` glob filter, native SHA-256 integrity. (`internal/provider/*`.)
+- **§7.2 fail-closed auth** — 401/403 is a hard error; only 404 counts as "absent"
+  (`internal/provider/artifactory.go`), with a regression test. This is the property that stops a
+  mis-configured or expired credential from silently dropping a repo out of the collision hit-count.
+- **§6 routing + collision guard** — query-all-then-count → 0/1/≥2 = not-found / resolve+pin / hard
+  collision error; per-dependency inline pin (`{version, registry}`); no global precedence knob.
+  (`internal/provider/repositoryset.go`, `internal/manifest/manifest.go`.) The `b32291c` change
+  **improves** on the spec: a collision is deferred until the resolve queue drains, so the verdict no
+  longer depends on Go's randomized map-iteration order — the guard itself is unchanged, only *when* it
+  renders its verdict. An unpinned name in ≥2 repos still hard-errors (regression-tested).
+- **§8 auth schemes** — bearer / basic / apikey / anonymous header construction; `credentials.APIKey`;
+  URL-keyed storage. (`internal/credentials/credentials.go`.)
+- **§10 publish** — Artifactory deploy (PUT zip + sidecar, `X-Checksum-Sha256`, overwrite guard +
+  `--force`, `--dry-run`, no approval step, `visibility` ignored with a note).
+  (`internal/provider/artifactory.go`, `internal/cli/cli.go`.)
+- **§8.2 / §11** — `login`/`logout --registry`; `registry list` command.
+
+### 18.2 Open issues found in review
+
+**Ticket routing (2026-07-15):** ISSUE-A → **GIS-267** (Security Defect — *fixed*). ISSUE-E/F/G →
+**GIS-268**, with their own spec [search-metadata-and-keywords.md](search-metadata-and-keywords.md).
+ISSUE-B, C, D and H remain under the Artifactory ticket **GIS-249**.
+
+**ISSUE-A (→ GIS-267, FIXED 2026-07-15) — 🔴 security: GI bearer token is sent to an `anonymous` secondary repo.**
+`installer.downloadAndVerify` applies the matched repo's auth headers only when it produced some
+(`len(repoHeaders) > 0`). An `anonymous` repo produces none, so the request falls through to the
+`!isGH && registryToken != ""` branch and attaches the user's **GI bearer token to the secondary
+(Artifactory) host** — a cross-host credential exposure. §8/§8.3 require anonymous → no header. It
+triggers only when a repo is configured `anonymous` while a GI token is present (the mainline customer
+uses `bearer`/`basic`), but it is a real leak. **Fix:** scope the `registryToken` branch to the GI base
+URL (or to `type=genero` repos), not "any non-GitHub URL"; add a test asserting an anonymous download
+carries no `Authorization`. (`internal/installer/installer.go`.)
+
+**Fix (shipped, pending commit):** `matchRepoAuth` now also returns whether a configured repo matched;
+`buildRepositorySet` registers a `RepoAuth` entry for every secondary repo including anonymous ones;
+`downloadAndVerify` applies the matched repo's headers (possibly none) and never falls through to the
+GI token. Regression tests in `internal/installer/download_auth_test.go`.
+
+**ISSUE-B — 🟠 the lock `Registry` field is write-only; §6/§9 lock-pinning is unwired.**
+`FromPlan` writes `LockedPackage.Registry` / `LockedWebcomponent.Registry`, but nothing reads it.
+Consequently (a) §6's "*or the lock has a Source* → query only that provider" short-circuit does not
+exist — `update`/re-resolve routes from manifest pins only; and (b) §9's "a lock referencing a
+`Registry` absent from the current config is a clear error" is **missing** — a lock naming a removed
+repo installs silently. The anti-confusion guarantee for locked installs still holds via the existing
+absolute-`DownloadURL`+checksum pin, so this is robustness/correctness, not an active hole. **Fix:**
+read `Registry` in `installFromLock` to short-circuit routing to that provider, and add the
+absent-registry check to `lockfile.Validate`. (`internal/lockfile/lockfile.go`,
+`internal/installer/installer.go`.)
+
+**ISSUE-C — 🟠 several §11 consuming commands are not Artifactory-aware.**
+The §11 table claims these route through the multi-provider set; they do not:
+- `info <pkg>` and `outdated` still call the GI-only `registry.*` functions, so an Artifactory-sourced
+  package is queried against GI (wrong / 404). (`internal/cli/info.go`, `internal/cli/outdated.go`.)
+- `search` fans out and source-tags results but does **not** dedup by name or show the "in gi and
+  acme-internal" collision line. (`internal/cli/cli.go`.)
+- `update --registry <name>` errors (`parseInstallFlags` rejects the flag with no package argument);
+  only `install --registry` works, though §11 groups both. (`internal/cli/cli.go`.)
+**Fix:** route `info`/`outdated` through the `RepositorySet` (using each locked package's source); add
+search dedup; accept `--registry` on `update`.
+
+**ISSUE-D — 🟡 decision needed: author-declared transitive pins can suppress a collision (broader than
+decision #3).** A dependency's own manifest/sidecar can carry `FGLDepPins` that pin *its* transitive
+deps and thereby quietly resolve a name present in ≥2 repos (`internal/provider/repositoryset.go`,
+`DeclarePin`). Decision #3 (§17) states the *consumer's* inline pin is the only override. Rails exist
+(consumer root pin wins; conflicting declared pins hard-error; an unpinned collision still errors), but
+a trusted transitive author could steer a colliding name toward the public repo without the consumer's
+acknowledgement. **Decide:** keep and document as intended, warn on it, or restrict overrides to
+consumer pins only.
+
+The following three surfaced in follow-up CLI testing (2026-07-15):
+
+**ISSUE-E (→ GIS-268) — 🟠 `search` shows no description/author for Artifactory results (fglpkg client; Artifactory-specific).**
+`ArtifactoryProvider.Search` (`internal/provider/artifactory.go`, ~L203) returns `SearchResult{Name,
+LatestVersion}` only — it never reads the version sidecar `fglpkg.json`, so `Description`/`Author` are
+always blank for Artifactory-sourced rows. (The GI path fills these correctly, so this is Artifactory-
+only.) **Fix:** in `Search`, best-effort fetch the latest version's sidecar and populate
+Description/Author — one extra metadata read per hit, pruned by the `packages` allow-list; or defer the
+enrichment to `info`. This is the Artifactory half of the "descriptions not appearing" report.
+
+**ISSUE-F (→ GIS-268) — 🟡 package `description` is publish-write-once (fglpkg client + GI service; general, not Artifactory-specific).**
+`registry.PublishCreatePackage` (`internal/registry/registry.go`, ~L281) sets the package `description`
+only when it *creates* the slug; on republish the slug exists → `409` → no-op, and there is no
+metadata-update call, so a description added or changed in `fglpkg.json` after the first publish never
+reaches the registry (GI `POST /registry/packages` writes `description` once — `registry-routes.ts`
+~L568). This is why a GI `search` can still show a blank description. **Fix:** add a GI owner-only
+metadata update (e.g. `PATCH /registry/packages/:slug`) called from publish, or refresh the package
+description from the latest approved version's manifest at approval time — GI-service work plus a small
+client call. Related: [publish-rich-metadata.md](publish-rich-metadata.md).
+
+**ISSUE-G (→ GIS-268) — 🟡 keywords are not searchable end-to-end (GI service + fglpkg client; general, not Artifactory-specific).**
+Manifest `keywords` (`internal/manifest/manifest.go:45`) are collected and documented but (1) never
+sent by publish, (2) not stored — `registry_packages` has no keywords column (GI
+`migrations/0020_registry.sql`), and (3) not matched by the browse filter, which `LIKE`s only
+`p.name` / `p.slug` / `p.description` (GI `registry-routes.ts` ~L312). So `fglpkg search <keyword>` can
+never match on a keyword. **Fix (GI-led):** store package keywords (new column or join table), ingest
+at publish, and add them to the `q` match; **client:** send `keywords` on publish (currently dropped).
+Decide whether these map onto the existing `tag` facet system (`registry_version_tags`) or a dedicated
+field. Best tracked with [genero-aware-search.md](genero-aware-search.md) (GIS-254) as a search-quality
+item rather than as Artifactory work.
+
+**ISSUE-H (→ GIS-249) — 🟢 add `fglpkg registry add`/`remove` (fglpkg client; pull forward from §14 Phase 3).**
+Today `fglpkg registry` supports only `list` (`internal/cli/cli.go`, `cmdRegistry` ~L2369); `add` /
+`remove` return "unknown registry subcommand". §11 and §14 deferred them to Phase 3 with "editing config
+by hand works in the meantime," but testing confirmed hand-editing `~/.fglpkg/config.json` is the real
+friction point. **Fix (client-only, no GI change):**
+`fglpkg registry add <name> <url> [--type genero|artifactory] [--repo-key K] [--auth
+bearer|basic|apikey|anonymous] [--priority N] [--packages 'acme-*']` writes a validated
+`config.Registry` descriptor into `~/.fglpkg/config.json` (global) or `fglpkg.json` with `--project`;
+`registry remove <name>` deletes it. Reuse `config.Registry` + its existing validation; credentials
+still flow through `login --registry`.
+
+### 18.3 Intentional divergences (not issues, noted for the record)
+
+- The `Provider` interface omits `Publish`; it is a concrete method on `*ArtifactoryProvider`
+  (documented in `provider.go`).
+- `config.Load(home, fglpkgRegistry, projectRegistries)` differs from §4.3's `Load(projectDir)` — the
+  caller pre-parses `fglpkg.json` to avoid a `manifest`→`config` import cycle.
+- A new `defaultRegistry` manifest field + `FGLPKG_PUBLISH_REGISTRY` env select the publish target
+  (additive to §11's "no new required vars").
+- Extra config validations beyond §4.3's three (unknown `auth`, missing name/url, non-positive priority).

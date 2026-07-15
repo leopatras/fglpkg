@@ -203,7 +203,7 @@ eval "$(fglpkg env --global)"
 | `author` | No | Author name |
 | `license` | No | License identifier (e.g., `MIT`, `Apache-2.0`) |
 | `repository` | No | Source repository URL |
-| `keywords` | No | Free-form tags that aid registry search/discovery (e.g. `["database", "utilities"]`) |
+| `keywords` | No | Free-form tags for discovery (e.g. `["database", "utilities"]`). Advisory metadata — not currently matched by `fglpkg search`. |
 | `main` | No | Primary `.42m` entry point |
 | `genero` | No | Genero BDL version constraint (e.g., `^4.0.0`) |
 | `root` | No | Base directory for package files when publishing (default `.`) |
@@ -266,10 +266,18 @@ fglpkg list                              # List installed packages
 fglpkg env                               # Print export statements (auto-detects scope)
 fglpkg env --global                      # Print exports for all global packages
 fglpkg env --gst                         # Print in Genero Studio format
-fglpkg search json                       # Search registry by keyword
+fglpkg search json                       # Search the registry (matches name/description)
 fglpkg search --all                      # List every package in the registry
 fglpkg bdl <pkg> <module> [args...]      # Run a BDL program from a package
 fglpkg bdl --list                        # List available BDL programs
+
+# Discovery & inspection
+fglpkg info <pkg>[@ver]                  # Show registry metadata for a package
+fglpkg outdated                          # List FGL deps with newer versions (CI gate)
+fglpkg audit                             # Scan installed Java JARs for CVEs (OSV.dev)
+fglpkg sbom                              # Emit a CycloneDX SBOM from fglpkg.lock
+fglpkg pack                              # Build the publishable zip without uploading
+fglpkg completion bash                   # Print shell completion script
 
 # Publishing
 fglpkg publish                           # Publish current package to registry
