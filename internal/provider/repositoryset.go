@@ -272,5 +272,15 @@ func collisionError(name string, hits []routeDecision) error {
 	fmt.Fprintf(&b, "  Refusing to guess. Pin the source in fglpkg.json:\n")
 	fmt.Fprintf(&b, "      \"dependencies\": { \"fgl\": { %q: { \"version\": \"^1.0.0\", \"registry\": %q } } }\n", name, first)
 	fmt.Fprintf(&b, "  or rename so the name is unique to one repository.")
-	return errors.New(b.String())
+	// Wrap resolver.ErrCollision so the resolver can recognise a collision and
+	// defer it (a later package may declare a pin that breaks the tie) rather
+	// than failing at once. Error() still returns the full disambiguation text.
+	return &collisionErr{msg: b.String()}
 }
+
+// collisionErr carries the human-readable disambiguation message while
+// unwrapping to resolver.ErrCollision for errors.Is checks.
+type collisionErr struct{ msg string }
+
+func (e *collisionErr) Error() string { return e.msg }
+func (e *collisionErr) Unwrap() error { return resolver.ErrCollision }

@@ -18,6 +18,7 @@
 package resolver
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -165,6 +166,15 @@ type PinDeclarer interface {
 	DeclarePin(name, registry string) error
 }
 
+// ErrCollision is returned by a VersionFetcher (the multi-provider routing
+// layer) when a package name is available from more than one repository and no
+// pin selects one. The resolver treats it specially: rather than failing at
+// once, it defers the name and retries after the graph settles, because a
+// not-yet-processed package may declare a pin that resolves the ambiguity. Only
+// names still colliding once no further progress is possible are real errors.
+// A fetcher signals a collision by returning an error that wraps this sentinel.
+var ErrCollision = errors.New("package available from more than one repository")
+
 // Resolver resolves the full transitive dependency graph.
 type Resolver struct {
 	fetchVersions VersionFetcher
@@ -259,92 +269,18 @@ func (r *Resolver) ResolveWithOptions(root *manifest.Manifest, opts ResolveOptio
 		r.enqueueRootBucket(root.OptionalDependencies, manifest.ScopeOptional, state)
 	}
 
-	for state.hasWork() {
-		item := state.dequeue()
+	// deferredCollisions holds work items whose name currently resolves to more
+	// than one repository. A package processed later may declare a pin that
+	// breaks the tie, so these are retried after each full drain of the queue
+	// (below) rather than failing immediately — making the outcome independent
+	// of the order names happen to be discovered in.
+	var deferredCollisions []workItem
+	for {
+		for state.hasWork() {
+			item := state.dequeue()
 
-		if r.ws != nil && r.ws.IsLocal(item.name) {
-			member := r.ws.Member(item.name)
-			state.addLocalMember(LocalMember{
-				Name:    member.Manifest.Name,
-				Version: member.Manifest.Version,
-				Path:    member.Path,
-			})
-			continue
-		}
-
-		if state.isResolved(item.name) {
-			state.promoteScope(item.name, item.scope)
-			if err := state.addConstraint(item.name, item.constraint, item.requiredBy); err != nil {
-				state.addConflict(err.(Conflict))
-			}
-			if err := state.checkExistingResolution(item.name, item.constraint, item.requiredBy); err != nil {
-				state.addConflict(err.(Conflict))
-			}
-			continue
-		}
-
-		state.addConstraint(item.name, item.constraint, item.requiredBy) //nolint:errcheck
-
-		candidates, err := r.fetchVersions(item.name)
-		if err != nil {
-			if item.scope == manifest.ScopeOptional {
-				state.skipOptional(item.name, fmt.Sprintf("fetch versions: %v", err))
-				continue
-			}
-			return nil, fmt.Errorf("failed to fetch versions for %q: %w", item.name, err)
-		}
-
-		generoCompatible, err := r.filterByGenero(item.name, candidates)
-		if err != nil {
-			return nil, err
-		}
-		if len(generoCompatible) == 0 {
-			if item.scope == manifest.ScopeOptional {
-				state.skipOptional(item.name, fmt.Sprintf("no version compatible with Genero %s", r.generoVersion))
-				continue
-			}
-			return nil, fmt.Errorf(
-				"no version of %q is compatible with Genero %s",
-				item.name, r.generoVersion,
-			)
-		}
-
-		chosen, err := state.bestVersion(item.name, generoCompatible)
-		if err != nil {
-			if item.scope == manifest.ScopeOptional {
-				state.skipOptional(item.name, fmt.Sprintf("no version satisfies constraints: %v", err))
-				continue
-			}
-			state.addConflict(Conflict{
-				Package:     item.name,
-				Constraints: state.constraints[item.name],
-			})
-			continue
-		}
-
-		info, err := r.fetchInfo(item.name, chosen.String(), r.generoVersion.MajorString())
-		if err != nil {
-			if item.scope == manifest.ScopeOptional {
-				state.skipOptional(item.name, fmt.Sprintf("fetch info: %v", err))
-				continue
-			}
-			return nil, fmt.Errorf("failed to fetch info for %s@%s: %w", item.name, chosen, err)
-		}
-
-		state.markResolved(item.name, chosen, info, item.scope)
-
-		for depName, depConstraint := range info.FGLDeps {
-			// Honour the registry this package's manifest pinned for depName, so
-			// a transitive dep resolves from the author's stated source even when
-			// the name also exists elsewhere. Declared before the dep is enqueued
-			// (hence before it is routed), so the pin is in effect at route time.
-			if pin := info.FGLDepPins[depName]; pin != "" && r.pinDeclarer != nil {
-				if err := r.pinDeclarer.DeclarePin(depName, pin); err != nil {
-					return nil, fmt.Errorf("resolving dependencies of %s@%s: %w", item.name, chosen, err)
-				}
-			}
-			if r.ws != nil && r.ws.IsLocal(depName) {
-				member := r.ws.Member(depName)
+			if r.ws != nil && r.ws.IsLocal(item.name) {
+				member := r.ws.Member(item.name)
 				state.addLocalMember(LocalMember{
 					Name:    member.Manifest.Name,
 					Version: member.Manifest.Version,
@@ -352,17 +288,137 @@ func (r *Resolver) ResolveWithOptions(root *manifest.Manifest, opts ResolveOptio
 				})
 				continue
 			}
-			if state.isResolved(depName) {
-				state.promoteScope(depName, item.scope)
-				if err := state.checkExistingResolution(depName, depConstraint, item.name); err != nil {
+
+			if state.isResolved(item.name) {
+				state.promoteScope(item.name, item.scope)
+				if err := state.addConstraint(item.name, item.constraint, item.requiredBy); err != nil {
+					state.addConflict(err.(Conflict))
+				}
+				if err := state.checkExistingResolution(item.name, item.constraint, item.requiredBy); err != nil {
 					state.addConflict(err.(Conflict))
 				}
 				continue
 			}
-			state.enqueue(workItem{name: depName, constraint: depConstraint, requiredBy: item.name, scope: item.scope})
+
+			state.addConstraint(item.name, item.constraint, item.requiredBy) //nolint:errcheck
+
+			candidates, err := r.fetchVersions(item.name)
+			if err != nil {
+				// A collision may be broken once a later package declares a pin
+				// for this name; defer and retry after the queue drains so the
+				// result never depends on discovery order (spec §6).
+				if r.pinDeclarer != nil && errors.Is(err, ErrCollision) {
+					deferredCollisions = append(deferredCollisions, item)
+					continue
+				}
+				if item.scope == manifest.ScopeOptional {
+					state.skipOptional(item.name, fmt.Sprintf("fetch versions: %v", err))
+					continue
+				}
+				return nil, fmt.Errorf("failed to fetch versions for %q: %w", item.name, err)
+			}
+
+			generoCompatible, err := r.filterByGenero(item.name, candidates)
+			if err != nil {
+				return nil, err
+			}
+			if len(generoCompatible) == 0 {
+				if item.scope == manifest.ScopeOptional {
+					state.skipOptional(item.name, fmt.Sprintf("no version compatible with Genero %s", r.generoVersion))
+					continue
+				}
+				return nil, fmt.Errorf(
+					"no version of %q is compatible with Genero %s",
+					item.name, r.generoVersion,
+				)
+			}
+
+			chosen, err := state.bestVersion(item.name, generoCompatible)
+			if err != nil {
+				if item.scope == manifest.ScopeOptional {
+					state.skipOptional(item.name, fmt.Sprintf("no version satisfies constraints: %v", err))
+					continue
+				}
+				state.addConflict(Conflict{
+					Package:     item.name,
+					Constraints: state.constraints[item.name],
+				})
+				continue
+			}
+
+			info, err := r.fetchInfo(item.name, chosen.String(), r.generoVersion.MajorString())
+			if err != nil {
+				if item.scope == manifest.ScopeOptional {
+					state.skipOptional(item.name, fmt.Sprintf("fetch info: %v", err))
+					continue
+				}
+				return nil, fmt.Errorf("failed to fetch info for %s@%s: %w", item.name, chosen, err)
+			}
+
+			state.markResolved(item.name, chosen, info, item.scope)
+
+			for depName, depConstraint := range info.FGLDeps {
+				// Honour the registry this package's manifest pinned for depName, so
+				// a transitive dep resolves from the author's stated source even when
+				// the name also exists elsewhere. Declared before the dep is enqueued
+				// (hence before it is routed), so the pin is in effect at route time.
+				if pin := info.FGLDepPins[depName]; pin != "" && r.pinDeclarer != nil {
+					if err := r.pinDeclarer.DeclarePin(depName, pin); err != nil {
+						return nil, fmt.Errorf("resolving dependencies of %s@%s: %w", item.name, chosen, err)
+					}
+				}
+				if r.ws != nil && r.ws.IsLocal(depName) {
+					member := r.ws.Member(depName)
+					state.addLocalMember(LocalMember{
+						Name:    member.Manifest.Name,
+						Version: member.Manifest.Version,
+						Path:    member.Path,
+					})
+					continue
+				}
+				if state.isResolved(depName) {
+					state.promoteScope(depName, item.scope)
+					if err := state.checkExistingResolution(depName, depConstraint, item.name); err != nil {
+						state.addConflict(err.(Conflict))
+					}
+					continue
+				}
+				state.enqueue(workItem{name: depName, constraint: depConstraint, requiredBy: item.name, scope: item.scope})
+			}
+			for _, jar := range info.JavaDeps {
+				state.addJARScoped(jar, item.scope)
+			}
 		}
-		for _, jar := range info.JavaDeps {
-			state.addJARScoped(jar, item.scope)
+
+		if len(deferredCollisions) == 0 {
+			break
+		}
+
+		// Queue drained with collisions outstanding. Any pin declared during the
+		// drain may now route some of them: re-enqueue those, keep the rest
+		// deferred. If a full retry pass unblocks nothing, the survivors are
+		// genuine collisions (or skippable optionals).
+		progressed := false
+		var stillDeferred []workItem
+		for _, item := range deferredCollisions {
+			if _, err := r.fetchVersions(item.name); err == nil || !errors.Is(err, ErrCollision) {
+				state.enqueue(item) // resolvable now, or a different terminal error to surface
+				progressed = true
+			} else {
+				stillDeferred = append(stillDeferred, item)
+			}
+		}
+		deferredCollisions = stillDeferred
+		if !progressed {
+			for _, item := range deferredCollisions {
+				if item.scope == manifest.ScopeOptional {
+					state.skipOptional(item.name, "available from more than one repository")
+					continue
+				}
+				_, err := r.fetchVersions(item.name)
+				return nil, fmt.Errorf("failed to fetch versions for %q: %w", item.name, err)
+			}
+			break // only optional collisions remained; all skipped
 		}
 	}
 
@@ -508,6 +564,13 @@ func (s *state) isResolved(n string) bool      { _, ok := s.resolved[n]; return 
 func (s *state) addLocalMember(lm LocalMember) { s.localMembers[lm.Name] = lm }
 
 func (s *state) addConstraint(name, constraint, requiredBy string) error {
+	// Idempotent: a deferred-then-retried work item re-enters the loop with the
+	// same (constraint, requiredBy), and must not record a duplicate.
+	for _, cs := range s.constraints[name] {
+		if cs.constraint == constraint && cs.requiredBy == requiredBy {
+			return nil
+		}
+	}
 	s.constraints[name] = append(s.constraints[name], constraintSource{
 		constraint: constraint,
 		requiredBy: requiredBy,
