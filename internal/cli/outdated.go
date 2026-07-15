@@ -9,6 +9,7 @@ import (
 
 	"github.com/4js-mikefolcher/fglpkg/internal/lockfile"
 	"github.com/4js-mikefolcher/fglpkg/internal/manifest"
+	"github.com/4js-mikefolcher/fglpkg/internal/provider"
 	"github.com/4js-mikefolcher/fglpkg/internal/registry"
 	"github.com/4js-mikefolcher/fglpkg/internal/semver"
 )
@@ -58,16 +59,27 @@ func cmdOutdated(args []string) error {
 
 	// Current versions come from the lockfile — the deterministic record
 	// of what was last installed. If the lockfile is missing we still
-	// fetch registry data and mark everything as "not installed".
+	// fetch registry data and mark everything as "not installed". The lock
+	// also records each package's source repository, so an Artifactory-sourced
+	// package is checked against its own repo rather than GI (spec §11).
 	projectDir, _ := os.Getwd()
 	current := map[string]string{}
+	sources := map[string]string{}
 	if lockfile.Exists(projectDir) {
 		lf, err := lockfile.Load(projectDir)
 		if err == nil {
 			for _, p := range lf.Packages {
 				current[p.Name] = p.Version
+				sources[p.Name] = p.Registry
 			}
 		}
+	}
+
+	// Multi-provider set (nil in the single-registry case → GI-only client).
+	home, _ := fglpkgHome()
+	rs, _, _, rsErr := buildRepositorySet(home, m)
+	if rsErr != nil {
+		fmt.Fprintf(os.Stderr, "warning: ignoring registries config: %v\n", rsErr)
 	}
 
 	names := make([]string, 0, len(m.Dependencies.FGL))
@@ -80,7 +92,7 @@ func cmdOutdated(args []string) error {
 	outdatedCount := 0
 
 	for _, name := range names {
-		row := buildOutdatedRow(name, m.Dependencies.FGL[name], current[name])
+		row := buildOutdatedRow(rs, name, m.Dependencies.FGL[name], current[name], sources[name])
 		rows = append(rows, row)
 		if row.Status != "ok" {
 			outdatedCount++
@@ -108,8 +120,10 @@ func cmdOutdated(args []string) error {
 }
 
 // buildOutdatedRow fetches the version list for one package and computes
-// its current/wanted/latest/status fields.
-func buildOutdatedRow(name, constraint, currentVer string) outdatedRow {
+// its current/wanted/latest/status fields. When a multi-provider set is
+// configured (rs != nil) the package is checked against its locked source
+// repository (sourceReg; "" ⇒ the built-in GI registry) rather than always GI.
+func buildOutdatedRow(rs *provider.RepositorySet, name, constraint, currentVer, sourceReg string) outdatedRow {
 	row := outdatedRow{
 		Name:       name,
 		Constraint: constraint,
@@ -119,7 +133,7 @@ func buildOutdatedRow(name, constraint, currentVer string) outdatedRow {
 		row.Current = "missing"
 	}
 
-	vl, err := registry.FetchVersionList(name)
+	vl, err := outdatedVersionList(rs, name, sourceReg)
 	if err != nil {
 		row.Status = "registry error"
 		return row
@@ -160,6 +174,23 @@ func buildOutdatedRow(name, constraint, currentVer string) outdatedRow {
 		row.Status = "ok"
 	}
 	return row
+}
+
+// outdatedVersionList lists a package's versions from its locked source repo
+// when a multi-provider set is configured, else via the GI-only client.
+func outdatedVersionList(rs *provider.RepositorySet, name, sourceReg string) (*registry.VersionList, error) {
+	if rs == nil {
+		return registry.FetchVersionList(name)
+	}
+	cvs, err := rs.VersionsFrom(sourceReg, name)
+	if err != nil {
+		return nil, err
+	}
+	vs := make([]string, 0, len(cvs))
+	for _, cv := range cvs {
+		vs = append(vs, cv.Version.String())
+	}
+	return &registry.VersionList{Versions: vs}, nil
 }
 
 func parseVersionStrings(vs []string) []semver.Version {

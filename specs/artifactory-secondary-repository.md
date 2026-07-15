@@ -637,7 +637,7 @@ uses `bearer`/`basic`), but it is a real leak. **Fix:** scope the `registryToken
 URL (or to `type=genero` repos), not "any non-GitHub URL"; add a test asserting an anonymous download
 carries no `Authorization`. (`internal/installer/installer.go`.)
 
-**Fix (shipped, pending commit):** `matchRepoAuth` now also returns whether a configured repo matched;
+**Fix (shipped):** `matchRepoAuth` now also returns whether a configured repo matched;
 `buildRepositorySet` registers a `RepoAuth` entry for every secondary repo including anonymous ones;
 `downloadAndVerify` applies the matched repo's headers (possibly none) and never falls through to the
 GI token. Regression tests in `internal/installer/download_auth_test.go`.
@@ -653,6 +653,14 @@ read `Registry` in `installFromLock` to short-circuit routing to that provider, 
 absent-registry check to `lockfile.Validate`. (`internal/lockfile/lockfile.go`,
 `internal/installer/installer.go`.)
 
+**Fix (shipped):** the lock `Registry` is now read. `RepositorySet.VersionsFrom`
+resolves a package against exactly its recorded source repository (bypassing the collision guard —
+the §6 "lock has a Source → query only that provider" short-circuit); it backs `outdated` (ISSUE-C).
+`LockFile.CheckRegistries` errors when a locked package/webcomponent names a repository absent from
+the configured set; wired into `Installer` via `WithConfiguredRegistries` and checked before any
+install-from-lock. Tests in `internal/lockfile/registry_pin_test.go`,
+`internal/provider/repositoryset_test.go`.
+
 **ISSUE-C — 🟠 several §11 consuming commands are not Artifactory-aware.**
 The §11 table claims these route through the multi-provider set; they do not:
 - `info <pkg>` and `outdated` still call the GI-only `registry.*` functions, so an Artifactory-sourced
@@ -664,6 +672,13 @@ The §11 table claims these route through the multi-provider set; they do not:
 **Fix:** route `info`/`outdated` through the `RepositorySet` (using each locked package's source); add
 search dedup; accept `--registry` on `update`.
 
+**Fix (shipped):** `info` routes through the `RepositorySet` (`infoVersionList`/
+`infoFetch`) and prints the owning repo (`Source`); `outdated` checks each package against its locked
+source via `VersionsFrom`; `search` dedups by name across providers, shows all sources for a colliding
+name, and prints a collision note; `update --registry <name>` restricts re-resolution to one repo (the
+"requires a package" rule moved from `parseInstallFlags` to `cmdInstall`). (`internal/cli/info.go`,
+`internal/cli/outdated.go`, `internal/cli/cli.go`.)
+
 **ISSUE-D — 🟡 decision needed: author-declared transitive pins can suppress a collision (broader than
 decision #3).** A dependency's own manifest/sidecar can carry `FGLDepPins` that pin *its* transitive
 deps and thereby quietly resolve a name present in ≥2 repos (`internal/provider/repositoryset.go`,
@@ -672,6 +687,12 @@ deps and thereby quietly resolve a name present in ≥2 repos (`internal/provide
 a trusted transitive author could steer a colliding name toward the public repo without the consumer's
 acknowledgement. **Decide:** keep and document as intended, warn on it, or restrict overrides to
 consumer pins only.
+
+**Fix (shipped):** decision = *warn*. `RepositorySet.DeclarePin`
+(`internal/provider/repositoryset.go`) now emits a one-time stderr warning naming the package and
+registry whenever a **transitive** (author-declared) pin is recorded, advising an explicit pin in
+`fglpkg.json` to confirm the source. The consumer's own root pin still wins silently (returns before
+the warning) and a repeat of the same declared pin is idempotent (no re-warn). Rails unchanged.
 
 The following three surfaced in follow-up CLI testing (2026-07-15):
 
@@ -682,6 +703,11 @@ always blank for Artifactory-sourced rows. (The GI path fills these correctly, s
 only.) **Fix:** in `Search`, best-effort fetch the latest version's sidecar and populate
 Description/Author — one extra metadata read per hit, pruned by the `packages` allow-list; or defer the
 enrichment to `info`. This is the Artifactory half of the "descriptions not appearing" report.
+
+**Fix (shipped):** `Search` now stamps `Source` and, for each hit, best-effort reads
+the latest version's sidecar via a new `fetchSidecar` helper (shared with `FetchInfo`) to populate
+`Description`/`Author`. A missing/unparseable sidecar leaves the fields blank without failing the
+search. (F/G remain GI-service work, tracked under GIS-268 in `search-metadata-and-keywords.md`.)
 
 **ISSUE-F (→ GIS-268) — 🟡 package `description` is publish-write-once (fglpkg client + GI service; general, not Artifactory-specific).**
 `registry.PublishCreatePackage` (`internal/registry/registry.go`, ~L281) sets the package `description`
@@ -714,6 +740,15 @@ bearer|basic|apikey|anonymous] [--priority N] [--packages 'acme-*']` writes a va
 `config.Registry` descriptor into `~/.fglpkg/config.json` (global) or `fglpkg.json` with `--project`;
 `registry remove <name>` deletes it. Reuse `config.Registry` + its existing validation; credentials
 still flow through `login --registry`.
+
+**Fix (shipped):** `cmdRegistry` now dispatches `list`/`add`/`remove` (`rm` alias).
+`registry add <name> <url>` (type defaults to `artifactory`) validates the descriptor against the
+prospective effective set via `config.Resolve` (type/auth/repoKey + unique priority; priority
+auto-assigned to max+1 when omitted), refuses a duplicate name and redefining the built-in `gi`, then
+writes to `~/.fglpkg/config.json` (or the project `fglpkg.json` with `--project`). `registry remove`
+deletes an entry (clearing `defaultRegistry` if it pointed there) and refuses to remove `gi`. New
+config helpers `LoadGlobalFile`/`WriteGlobalFile` back the read-modify-write; credentials still flow
+through `login --registry`.
 
 ### 18.3 Intentional divergences (not issues, noted for the record)
 

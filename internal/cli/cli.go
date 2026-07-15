@@ -19,6 +19,7 @@ import (
 	"regexp"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/4js-mikefolcher/fglpkg/internal/config"
@@ -240,6 +241,12 @@ func cmdInstall(args []string) error {
 	if err != nil {
 		return err
 	}
+	// On `install`, --registry pins the named package's source repository, so a
+	// package argument is required. (`update --registry` restricts re-resolution
+	// to one repo and needs no package — see cmdUpdate.)
+	if flags.registry != "" && len(flags.pkgs) == 0 {
+		return fmt.Errorf("--registry requires a package to install (it pins that package's source repository)")
+	}
 
 	// `fglpkg install <pkg>` in a directory that isn't yet a project (no
 	// .fglpkg/, no fglpkg.json) is treated as local: the add-package branch
@@ -317,7 +324,7 @@ func cmdInstall(args []string) error {
 	if err != nil {
 		globalHome = home
 	}
-	rs, _, rsErr := buildRepositorySet(globalHome, m)
+	rs, _, _, rsErr := buildRepositorySet(globalHome, m)
 	if rsErr != nil {
 		fmt.Fprintf(os.Stderr, "warning: ignoring registries config: %v\n", rsErr)
 	}
@@ -549,9 +556,6 @@ func parseInstallFlags(args []string) (installFlags, error) {
 	if f.production && (devSeen || optSeen) {
 		return f, fmt.Errorf("--production cannot be combined with --save-dev or --save-optional")
 	}
-	if f.registry != "" && len(f.pkgs) == 0 {
-		return f, fmt.Errorf("--registry requires a package to install (it pins that package's source repository)")
-	}
 	return f, nil
 }
 
@@ -632,7 +636,20 @@ func cmdUpdate(args []string) error {
 	projectDir, _ := os.Getwd()
 	fmt.Println("Ignoring lock file and re-resolving all dependencies...")
 	instOpts := installer.Options{Production: flags.production, NoManifestFallback: flags.noManifestFallback}
-	return newInstaller(home, m).InstallAllWithOptions(m, projectDir, true, instOpts)
+	inst, rs := buildInstaller(home, m)
+
+	// --registry <name> restricts this re-resolution to a single repository
+	// (spec §11). It needs no package argument (unlike `install --registry`).
+	if flags.registry != "" {
+		if rs == nil {
+			if flags.registry != config.GIName {
+				return fmt.Errorf("--registry %q: no repository named %q is configured (add it to fglpkg.json or ~/.fglpkg/config.json)", flags.registry, flags.registry)
+			}
+		} else {
+			rs.Restrict(flags.registry)
+		}
+	}
+	return inst.InstallAllWithOptions(m, projectDir, true, instOpts)
 }
 
 // ─── list ─────────────────────────────────────────────────────────────────────
@@ -732,7 +749,7 @@ func cmdSearch(args []string) error {
 	if mm, mErr := manifest.Load("."); mErr == nil {
 		m = mm
 	}
-	if rs, _, rErr := buildRepositorySet(home, m); rErr == nil && rs != nil {
+	if rs, _, _, rErr := buildRepositorySet(home, m); rErr == nil && rs != nil {
 		return searchAcrossProviders(rs, term, all)
 	}
 
@@ -771,19 +788,39 @@ func cmdSearch(args []string) error {
 // searchAcrossProviders fans out a search to every configured provider, tags
 // each result with its source repository, and prints a source-tagged table.
 func searchAcrossProviders(rs *provider.RepositorySet, term string, all bool) error {
-	var results []registry.SearchResult
+	// Gather in provider priority order so the first-seen version/description
+	// for a colliding name comes from the highest-priority repository.
+	type merged struct {
+		name        string
+		version     string
+		description string
+		sources     []string // every repo the name appears in, priority order
+	}
+	var order []string
+	byName := map[string]*merged{}
 	for _, p := range rs.Providers() {
 		rr, err := p.Search(term)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "warning: search in %q failed: %v\n", p.Name(), err)
 			continue
 		}
-		for i := range rr {
-			rr[i].Source = p.Name()
+		for _, r := range rr {
+			if m, ok := byName[r.Name]; ok {
+				// A name in more than one repo: record the extra source but keep
+				// the higher-priority repo's version/description.
+				m.sources = append(m.sources, p.Name())
+				continue
+			}
+			byName[r.Name] = &merged{
+				name:        r.Name,
+				version:     r.LatestVersion,
+				description: r.Description,
+				sources:     []string{p.Name()},
+			}
+			order = append(order, r.Name)
 		}
-		results = append(results, rr...)
 	}
-	if len(results) == 0 {
+	if len(order) == 0 {
 		if all {
 			fmt.Println("No packages in any configured repository.")
 		} else {
@@ -792,14 +829,24 @@ func searchAcrossProviders(rs *provider.RepositorySet, term string, all bool) er
 		return nil
 	}
 	if all {
-		fmt.Printf("All packages (%d):\n", len(results))
+		fmt.Printf("All packages (%d):\n", len(order))
 	} else {
 		fmt.Printf("Results for %q:\n", term)
 	}
-	fmt.Printf("  %-28s %-12s %-14s %s\n", "NAME", "VERSION", "SOURCE", "DESCRIPTION")
-	fmt.Printf("  %-28s %-12s %-14s %s\n", "----", "-------", "------", "-----------")
-	for _, r := range results {
-		fmt.Printf("  %-28s %-12s %-14s %s\n", r.Name, r.LatestVersion, r.Source, r.Description)
+	fmt.Printf("  %-28s %-12s %-24s %s\n", "NAME", "VERSION", "SOURCE", "DESCRIPTION")
+	fmt.Printf("  %-28s %-12s %-24s %s\n", "----", "-------", "------", "-----------")
+	collisions := 0
+	for _, name := range order {
+		m := byName[name]
+		source := strings.Join(m.sources, ", ")
+		if len(m.sources) > 1 {
+			collisions++
+		}
+		fmt.Printf("  %-28s %-12s %-24s %s\n", m.name, m.version, source, m.description)
+	}
+	if collisions > 0 {
+		fmt.Printf("\nnote: %d package name(s) are available from more than one repository (shown with all sources).\n"+
+			"  Pin the source in fglpkg.json to install a colliding name.\n", collisions)
 	}
 	return nil
 }
@@ -2367,10 +2414,280 @@ func parseOwnerRepo(s string) (owner, repo string, err error) {
 // ─── registry ───────────────────────────────────────────────────────────────
 
 func cmdRegistry(args []string) error {
-	if len(args) == 0 || args[0] == "list" {
+	if len(args) == 0 {
 		return cmdRegistryList()
 	}
-	return fmt.Errorf("unknown registry subcommand %q\nusage: fglpkg registry list", args[0])
+	switch args[0] {
+	case "list":
+		return cmdRegistryList()
+	case "add":
+		return cmdRegistryAdd(args[1:])
+	case "remove", "rm":
+		return cmdRegistryRemove(args[1:])
+	default:
+		return fmt.Errorf("unknown registry subcommand %q\nusage: fglpkg registry <list|add|remove>", args[0])
+	}
+}
+
+// registryEditFlags carries the parsed flags for `registry add`.
+type registryEditFlags struct {
+	name     string
+	url      string
+	typ      string
+	repoKey  string
+	auth     string
+	priority int
+	packages []string
+	project  bool // write to the project fglpkg.json instead of the global config
+}
+
+const registryAddUsage = "usage: fglpkg registry add <name> <url> " +
+	"[--type genero|artifactory] [--repo-key K] [--auth bearer|basic|apikey|anonymous] " +
+	"[--priority N] [--packages 'acme-*,foo-*'] [--project]"
+
+func parseRegistryAddFlags(args []string) (registryEditFlags, error) {
+	f := registryEditFlags{typ: config.TypeArtifactory}
+	var positional []string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "--project":
+			f.project = true
+		case a == "--type" || strings.HasPrefix(a, "--type="):
+			v, err := flagValue(a, &i, args)
+			if err != nil {
+				return f, err
+			}
+			f.typ = v
+		case a == "--repo-key" || strings.HasPrefix(a, "--repo-key="):
+			v, err := flagValue(a, &i, args)
+			if err != nil {
+				return f, err
+			}
+			f.repoKey = v
+		case a == "--auth" || strings.HasPrefix(a, "--auth="):
+			v, err := flagValue(a, &i, args)
+			if err != nil {
+				return f, err
+			}
+			f.auth = v
+		case a == "--priority" || strings.HasPrefix(a, "--priority="):
+			v, err := flagValue(a, &i, args)
+			if err != nil {
+				return f, err
+			}
+			n, err := strconv.Atoi(v)
+			if err != nil {
+				return f, fmt.Errorf("--priority must be an integer, got %q", v)
+			}
+			f.priority = n
+		case a == "--packages" || strings.HasPrefix(a, "--packages="):
+			v, err := flagValue(a, &i, args)
+			if err != nil {
+				return f, err
+			}
+			for _, p := range strings.Split(v, ",") {
+				if p = strings.TrimSpace(p); p != "" {
+					f.packages = append(f.packages, p)
+				}
+			}
+		case strings.HasPrefix(a, "-"):
+			return f, fmt.Errorf("unknown flag %q\n%s", a, registryAddUsage)
+		default:
+			positional = append(positional, a)
+		}
+	}
+	if len(positional) != 2 {
+		return f, fmt.Errorf("registry add needs exactly <name> and <url>\n%s", registryAddUsage)
+	}
+	f.name, f.url = positional[0], positional[1]
+	return f, nil
+}
+
+// flagValue resolves either "--flag value" (advancing i) or "--flag=value".
+func flagValue(a string, i *int, args []string) (string, error) {
+	if v, ok := strings.CutPrefix(a, "--"); ok {
+		if eq := strings.IndexByte(v, '='); eq >= 0 {
+			return v[eq+1:], nil
+		}
+	}
+	*i++
+	if *i >= len(args) {
+		return "", fmt.Errorf("%s requires a value", a)
+	}
+	return args[*i], nil
+}
+
+func cmdRegistryAdd(args []string) error {
+	f, err := parseRegistryAddFlags(args)
+	if err != nil {
+		return err
+	}
+	if f.name == config.GIName {
+		return fmt.Errorf("%q is the built-in registry and cannot be redefined", config.GIName)
+	}
+
+	home, err := fglpkgHome()
+	if err != nil {
+		return err
+	}
+	env := os.Getenv("FGLPKG_REGISTRY")
+
+	// Current effective set: reject a duplicate name and auto-assign a priority
+	// when none was given (max existing + 1) so the common case needs no --priority.
+	current, err := config.Load(home, env, projectRegistries())
+	if err != nil {
+		return err
+	}
+	if _, dup := config.Find(current, f.name); dup {
+		return fmt.Errorf("a registry named %q already exists; run 'fglpkg registry remove %s' first", f.name, f.name)
+	}
+	if f.priority == 0 {
+		max := 0
+		for _, r := range current {
+			if r.Priority > max {
+				max = r.Priority
+			}
+		}
+		f.priority = max + 1
+	}
+
+	r := config.Registry{
+		Name:     f.name,
+		Type:     f.typ,
+		URL:      f.url,
+		RepoKey:  f.repoKey,
+		Priority: f.priority,
+		Auth:     f.auth,
+		Packages: f.packages,
+	}
+
+	// Validate against the prospective effective set (type/auth/repoKey and
+	// priority-uniqueness) before writing anything.
+	if f.project {
+		m, err := manifest.Load(".")
+		if err != nil {
+			return fmt.Errorf("registry add --project requires an fglpkg.json in the current directory: %w", err)
+		}
+		proj := append(append([]config.Registry(nil), m.Registries...), r)
+		global, err := config.LoadGlobal(home)
+		if err != nil {
+			return err
+		}
+		if _, err := config.Resolve(config.BuiltinGI(env), global, proj); err != nil {
+			return err
+		}
+		m.Registries = proj
+		if err := m.Save("."); err != nil {
+			return err
+		}
+		fmt.Printf("✓ Added registry %q to %s\n", f.name, manifest.Filename)
+		return nil
+	}
+
+	g, err := config.LoadGlobalFile(home)
+	if err != nil {
+		return err
+	}
+	global := append(append([]config.Registry(nil), g.Registries...), r)
+	if _, err := config.Resolve(config.BuiltinGI(env), global, projectRegistries()); err != nil {
+		return err
+	}
+	g.Registries = global
+	if err := config.WriteGlobalFile(home, g); err != nil {
+		return err
+	}
+	fmt.Printf("✓ Added registry %q to %s\n", f.name, filepath.Join(home, config.GlobalFilename))
+	if r.Auth != config.AuthAnonymous {
+		fmt.Printf("  Run 'fglpkg login --registry %s' to store credentials.\n", f.name)
+	}
+	return nil
+}
+
+func cmdRegistryRemove(args []string) error {
+	var name string
+	project := false
+	for _, a := range args {
+		switch {
+		case a == "--project":
+			project = true
+		case strings.HasPrefix(a, "-"):
+			return fmt.Errorf("unknown flag %q\nusage: fglpkg registry remove <name> [--project]", a)
+		case name == "":
+			name = a
+		default:
+			return fmt.Errorf("registry remove takes a single <name>")
+		}
+	}
+	if name == "" {
+		return fmt.Errorf("usage: fglpkg registry remove <name> [--project]")
+	}
+	if name == config.GIName {
+		return fmt.Errorf("the built-in %q registry cannot be removed", config.GIName)
+	}
+
+	if project {
+		m, err := manifest.Load(".")
+		if err != nil {
+			return fmt.Errorf("registry remove --project requires an fglpkg.json in the current directory: %w", err)
+		}
+		kept, removed := dropRegistry(m.Registries, name)
+		if !removed {
+			return fmt.Errorf("no registry named %q in %s", name, manifest.Filename)
+		}
+		m.Registries = kept
+		if err := m.Save("."); err != nil {
+			return err
+		}
+		fmt.Printf("✓ Removed registry %q from %s\n", name, manifest.Filename)
+		return nil
+	}
+
+	home, err := fglpkgHome()
+	if err != nil {
+		return err
+	}
+	g, err := config.LoadGlobalFile(home)
+	if err != nil {
+		return err
+	}
+	kept, removed := dropRegistry(g.Registries, name)
+	if !removed {
+		return fmt.Errorf("no registry named %q in %s (use --project to remove one declared in fglpkg.json)",
+			name, config.GlobalFilename)
+	}
+	g.Registries = kept
+	if g.DefaultRegistry == name {
+		g.DefaultRegistry = ""
+	}
+	if err := config.WriteGlobalFile(home, g); err != nil {
+		return err
+	}
+	fmt.Printf("✓ Removed registry %q from %s\n", name, filepath.Join(home, config.GlobalFilename))
+	return nil
+}
+
+// dropRegistry returns regs without the named entry and whether it was present.
+func dropRegistry(regs []config.Registry, name string) ([]config.Registry, bool) {
+	kept := make([]config.Registry, 0, len(regs))
+	removed := false
+	for _, r := range regs {
+		if r.Name == name {
+			removed = true
+			continue
+		}
+		kept = append(kept, r)
+	}
+	return kept, removed
+}
+
+// projectRegistries returns the current project's declared registries, or nil
+// when there is no manifest in the working directory.
+func projectRegistries() []config.Registry {
+	if m, err := manifest.Load("."); err == nil {
+		return m.Registries
+	}
+	return nil
 }
 
 func cmdRegistryList() error {
@@ -3000,6 +3317,15 @@ func fglpkgHome() (string, error) {
 }
 
 func newInstaller(home string, m *manifest.Manifest) *installer.Installer {
+	inst, _ := buildInstaller(home, m)
+	return inst
+}
+
+// buildInstaller is newInstaller's core, additionally returning the
+// RepositorySet backing the installer's fetchers (nil in the single-registry
+// case). Callers that need to constrain resolution — e.g. `update --registry`
+// — use the returned set to call Restrict before installing.
+func buildInstaller(home string, m *manifest.Manifest) (*installer.Installer, *provider.RepositorySet) {
 	// Always look up credentials from the global home directory, even when
 	// installing to a local project directory (--local).
 	globalHome, err := fglpkgHome()
@@ -3014,18 +3340,25 @@ func newInstaller(home string, m *manifest.Manifest) *installer.Installer {
 	// Engage multi-provider routing only when repositories beyond the built-in
 	// GI registry are configured — otherwise the single-registry path stays
 	// byte-identical (no Source stamped in the lockfile).
-	if rs, repoAuth, err := buildRepositorySet(globalHome, m); err != nil {
+	var set *provider.RepositorySet
+	if rs, repoAuth, regNames, err := buildRepositorySet(globalHome, m); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: ignoring registries config: %v\n", err)
-	} else if rs != nil {
-		inst = inst.WithFetchers(rs.Versions, rs.Info).WithRepoAuth(repoAuth).WithPinDeclarer(rs)
+	} else {
+		// Record the configured names in every case (even single-registry) so a
+		// lock referencing a since-removed repository is rejected (§9).
+		inst = inst.WithConfiguredRegistries(regNames)
+		if rs != nil {
+			set = rs
+			inst = inst.WithFetchers(rs.Versions, rs.Info).WithRepoAuth(repoAuth).WithPinDeclarer(rs)
+		}
 	}
-	return inst
+	return inst, set
 }
 
 // buildRepositorySet resolves the configured registries and, when more than the
 // built-in GI registry is present, builds a RepositorySet plus the per-repo
 // download auth. Returns (nil, nil, nil) for the single-registry case.
-func buildRepositorySet(globalHome string, m *manifest.Manifest) (*provider.RepositorySet, []installer.RepoAuth, error) {
+func buildRepositorySet(globalHome string, m *manifest.Manifest) (*provider.RepositorySet, []installer.RepoAuth, []string, error) {
 	var projRegs []config.Registry
 	var pins map[string]string
 	if m != nil {
@@ -3034,10 +3367,14 @@ func buildRepositorySet(globalHome string, m *manifest.Manifest) (*provider.Repo
 	}
 	regs, err := config.Load(globalHome, os.Getenv("FGLPKG_REGISTRY"), projRegs)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
+	}
+	regNames := make([]string, 0, len(regs))
+	for _, r := range regs {
+		regNames = append(regNames, r.Name)
 	}
 	if len(regs) <= 1 {
-		return nil, nil, nil // only the built-in gi — keep legacy behaviour
+		return nil, nil, regNames, nil // only the built-in gi — keep legacy behaviour
 	}
 
 	creds, _ := credentials.Load(globalHome)
@@ -3060,7 +3397,7 @@ func buildRepositorySet(globalHome string, m *manifest.Manifest) (*provider.Repo
 			provs = append(provs, provider.NewGeneroProvider(r.Name))
 		}
 	}
-	return provider.NewRepositorySet(provs, regs, pins), repoAuth, nil
+	return provider.NewRepositorySet(provs, regs, pins), repoAuth, regNames, nil
 }
 
 // headersApplier turns a fixed header map into a provider.AuthApplier (nil when

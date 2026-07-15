@@ -39,6 +39,48 @@ func TestFromPlan_RecordsSourceAsRegistry(t *testing.T) {
 	}
 }
 
+func TestCheckRegistries(t *testing.T) {
+	lf := &lockfile.LockFile{
+		Packages: []lockfile.LockedPackage{
+			{Name: "logft"},                              // empty registry = gi default
+			{Name: "acme-utils", Registry: "acme-internal"},
+		},
+		Webcomponents: []lockfile.LockedWebcomponent{
+			{Name: "chart-3d", Registry: "acme-internal"},
+		},
+	}
+
+	// All recorded registries configured → no error.
+	if err := lf.CheckRegistries([]string{"gi", "acme-internal"}); err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	// acme-internal removed from config → clear error naming the package and repo.
+	err := lf.CheckRegistries([]string{"gi"})
+	if err == nil {
+		t.Fatal("expected error when a locked registry is not configured")
+	}
+	if !strings.Contains(err.Error(), "acme-utils") || !strings.Contains(err.Error(), "acme-internal") {
+		t.Errorf("error should name the package and repo: %v", err)
+	}
+
+	// Empty configured set (caller couldn't determine it) → check skipped.
+	if err := lf.CheckRegistries(nil); err != nil {
+		t.Errorf("nil configured should skip the check: %v", err)
+	}
+}
+
+func TestCheckRegistries_WebcomponentSource(t *testing.T) {
+	lf := &lockfile.LockFile{
+		Webcomponents: []lockfile.LockedWebcomponent{
+			{Name: "chart-3d", Registry: "gone"},
+		},
+	}
+	if err := lf.CheckRegistries([]string{"gi"}); err == nil {
+		t.Fatal("expected error for webcomponent referencing an unconfigured repo")
+	}
+}
+
 func TestFromPlan_EmptySourceOmittedInJSON(t *testing.T) {
 	plan := &resolver.Plan{
 		GeneroVersion: genero.MustParse("6.00.01"),

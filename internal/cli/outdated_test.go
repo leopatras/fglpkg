@@ -86,7 +86,7 @@ func TestBuildOutdatedRowStatuses(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			row := buildOutdatedRow("demo", tc.constraint, tc.current)
+			row := buildOutdatedRow(nil, "demo", tc.constraint, tc.current, "")
 			if row.Status != tc.wantStatus {
 				t.Errorf("status = %q, want %q", row.Status, tc.wantStatus)
 			}
@@ -102,7 +102,7 @@ func TestBuildOutdatedRowStatuses(t *testing.T) {
 
 func TestBuildOutdatedRowRegistryError(t *testing.T) {
 	t.Setenv("FGLPKG_REGISTRY", "http://127.0.0.1:1") // unreachable
-	row := buildOutdatedRow("demo", "^1.0.0", "1.0.0")
+	row := buildOutdatedRow(nil, "demo", "^1.0.0", "1.0.0", "")
 	if row.Status != "registry error" {
 		t.Errorf("status = %q, want %q", row.Status, "registry error")
 	}

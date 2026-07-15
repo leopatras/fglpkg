@@ -22,6 +22,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/4js-mikefolcher/fglpkg/internal/manifest"
@@ -439,6 +440,45 @@ func (lf *LockFile) Validate(root *manifest.Manifest, currentGenero, packagesDir
 	}
 
 	return result
+}
+
+// CheckRegistries reports the first locked package or webcomponent whose
+// recorded Registry is not among configured (the logical names of the
+// currently-configured repositories, which must include the built-in "gi").
+// An empty Registry means the default GI registry and is always valid, so
+// pre-Artifactory locks pass unchanged. This is the spec §9 guarantee that a
+// lock referencing a repository since removed from the config fails clearly
+// instead of installing silently. configured empty ⇒ the check is skipped
+// (the caller could not determine the configured set).
+func (lf *LockFile) CheckRegistries(configured []string) error {
+	if len(configured) == 0 {
+		return nil
+	}
+	known := make(map[string]bool, len(configured))
+	for _, n := range configured {
+		known[n] = true
+	}
+	check := func(name, reg string) error {
+		if reg == "" || known[reg] {
+			return nil
+		}
+		return fmt.Errorf(
+			"locked package %q came from repository %q, which is not configured.\n"+
+				"  Configured repositories: %s\n"+
+				"  Re-add %q to fglpkg.json / ~/.fglpkg/config.json, or run 'fglpkg update' to re-resolve.",
+			name, reg, strings.Join(configured, ", "), reg)
+	}
+	for _, p := range lf.Packages {
+		if err := check(p.Name, p.Registry); err != nil {
+			return err
+		}
+	}
+	for _, w := range lf.Webcomponents {
+		if err := check(w.Name, w.Registry); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // ─── Plan extraction ──────────────────────────────────────────────────────────

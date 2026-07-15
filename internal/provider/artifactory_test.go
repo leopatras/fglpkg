@@ -165,6 +165,34 @@ func TestArtifactory_Search(t *testing.T) {
 	if results[0].LatestVersion != "1.0.0" {
 		t.Fatalf("latest = %q", results[0].LatestVersion)
 	}
+	// ISSUE-E: the sidecar's description is read and Source is stamped.
+	if results[0].Description != "a test" {
+		t.Fatalf("description = %q, want enrichment from sidecar", results[0].Description)
+	}
+	if results[0].Source != "acme" {
+		t.Fatalf("source = %q, want acme", results[0].Source)
+	}
+}
+
+// TestArtifactory_Search_MissingSidecarIsBlankNotError covers ISSUE-E's
+// best-effort contract: other-lib has version folders but no sidecar (404), so
+// Description stays blank and the search still succeeds.
+func TestArtifactory_Search_MissingSidecarIsBlankNotError(t *testing.T) {
+	srv := mockArtifactory(t)
+	p := newTestProvider(srv.URL)
+	results, err := p.Search("other")
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(results) != 1 || results[0].Name != "other-lib" {
+		t.Fatalf("results = %+v", results)
+	}
+	if results[0].LatestVersion != "2.1.0" {
+		t.Fatalf("latest = %q", results[0].LatestVersion)
+	}
+	if results[0].Description != "" {
+		t.Fatalf("missing sidecar should leave description blank, got %q", results[0].Description)
+	}
 }
 
 func TestArtifactory_AuthApplierInvoked(t *testing.T) {

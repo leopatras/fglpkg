@@ -289,6 +289,9 @@ fglpkg publish --changelog "notes..."    # Set this version's changelog inline (
 
 # Secondary repositories (JFrog Artifactory) — see section below
 fglpkg registry list                     # Show configured repositories + auth status
+fglpkg registry add acme https://a.example --repo-key GeneroBDL   # Add a repo (global)
+fglpkg registry add acme https://a.example --repo-key K --project # Add to fglpkg.json instead
+fglpkg registry remove acme              # Remove a configured repo
 fglpkg login --registry acme --token …   # Sign in to a secondary repo
 fglpkg install pkg --registry acme        # Add a package, pinning its source repo
 fglpkg publish --registry acme            # Publish to a secondary repo
@@ -447,6 +450,21 @@ ops team can set it for every project:
 | `priority` | Yes | Lower is tried first; must be unique. Ordering/diagnostics only — it is **not** a precedence tiebreak (see collision guard) |
 | `auth` | No | `bearer` (default) \| `basic` \| `apikey` \| `anonymous` |
 | `packages` | No | Glob allow-list (e.g. `["acme-*"]`) — names outside it are never queried against this repo |
+
+Rather than editing JSON by hand, `fglpkg registry add`/`remove` manage these
+entries for you (validated before write, with the priority auto-assigned after
+`gi` when omitted):
+
+```bash
+fglpkg registry add acme https://artifactory.acme.example/artifactory \
+    --repo-key fgl-internal-generic --packages "acme-*"   # → ~/.fglpkg/config.json
+fglpkg registry add acme https://… --repo-key K --project # → project fglpkg.json
+fglpkg registry remove acme
+```
+
+`add` defaults `--type` to `artifactory`; pass `--type genero`, `--auth`,
+`--priority`, and repeatable/comma-separated `--packages` as needed. It refuses
+to redefine the built-in `gi` or collide on name/priority.
 
 The built-in GI registry is always present as if declared `{ "name": "gi", "type": "genero", "priority": 1 }`. `FGLPKG_REGISTRY`, if set, retargets the GI URL.
 

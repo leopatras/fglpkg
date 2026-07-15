@@ -139,11 +139,15 @@ func TestParseInstallFlagsRegistryErrors(t *testing.T) {
 	if _, err := parseInstallFlags([]string{"pkg", "--registry"}); err == nil {
 		t.Error("--registry with no value: expected error")
 	}
-	// --registry only makes sense when adding a package (it pins that package).
-	if _, err := parseInstallFlags([]string{"--registry", "acme"}); err == nil {
-		t.Error("--registry with no package: expected error")
-	} else if !strings.Contains(err.Error(), "requires a package") {
-		t.Errorf("unexpected error: %v", err)
+	// --registry with no package now parses cleanly: `update --registry <name>`
+	// restricts re-resolution to one repo and needs no package argument. The
+	// "requires a package" rule is enforced in cmdInstall, not the shared parser.
+	f, err := parseInstallFlags([]string{"--registry", "acme"})
+	if err != nil {
+		t.Errorf("--registry with no package should parse: %v", err)
+	}
+	if f.registry != "acme" || len(f.pkgs) != 0 {
+		t.Errorf("registry=%q pkgs=%v", f.registry, f.pkgs)
 	}
 }
 

@@ -1,7 +1,10 @@
 package provider
 
 import (
+	"bytes"
 	"errors"
+	"io"
+	"os"
 	"strings"
 	"testing"
 
@@ -76,6 +79,33 @@ func TestRoute_NotFound(t *testing.T) {
 	}
 }
 
+func TestVersionsFrom_HonoursRecordedSource(t *testing.T) {
+	// "utils" exists in BOTH repos — a normal route() would collide. VersionsFrom
+	// pins to the recorded source and returns just that repo's versions.
+	gi := &fakeProvider{name: "gi", versions: map[string][]string{"utils": {"1.3.0"}}}
+	acme := &fakeProvider{name: "acme", versions: map[string][]string{"utils": {"0.9.0"}}}
+	rs := NewRepositorySet([]Provider{gi, acme}, descriptors(), nil)
+
+	vs, err := rs.VersionsFrom("acme", "utils")
+	if err != nil {
+		t.Fatalf("VersionsFrom: %v", err)
+	}
+	if len(vs) != 1 || vs[0].Version.String() != "0.9.0" {
+		t.Fatalf("want [0.9.0] from acme, got %+v", vs)
+	}
+
+	// Empty source name resolves to the built-in GI registry.
+	vs, err = rs.VersionsFrom("", "utils")
+	if err != nil || len(vs) != 1 || vs[0].Version.String() != "1.3.0" {
+		t.Fatalf("empty source should map to gi: %+v err=%v", vs, err)
+	}
+
+	// An unconfigured source is a clear error.
+	if _, err := rs.VersionsFrom("gone", "utils"); err == nil {
+		t.Fatal("expected error for unconfigured registry")
+	}
+}
+
 func TestRoute_CollisionIsHardError(t *testing.T) {
 	gi := &fakeProvider{name: "gi", versions: map[string][]string{"utils": {"1.2.0", "1.3.0"}}}
 	acme := &fakeProvider{name: "acme", versions: map[string][]string{"utils": {"0.9.0"}}}
@@ -124,6 +154,69 @@ func TestDeclarePin_HonouredOverCollision(t *testing.T) {
 	}
 	if info.Source != "acme" {
 		t.Fatalf("declared pin ignored: source = %q, want acme", info.Source)
+	}
+}
+
+// captureStderr redirects os.Stderr for the duration of fn and returns what was
+// written, so we can assert on best-effort warnings.
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	orig := os.Stderr
+	os.Stderr = w
+	defer func() { os.Stderr = orig }()
+	fn()
+	w.Close()
+	var buf bytes.Buffer
+	if _, err := io.Copy(&buf, r); err != nil {
+		t.Fatalf("copy: %v", err)
+	}
+	return buf.String()
+}
+
+func TestDeclarePin_TransitivePinWarns(t *testing.T) {
+	// A pin declared by a depending package (not the consumer's root pin) is an
+	// author-steering event and must warn (spec ISSUE-D, decision: warn).
+	gi := &fakeProvider{name: "gi", versions: map[string][]string{"qrcode": {"1.0.0"}}}
+	acme := &fakeProvider{name: "acme", versions: map[string][]string{"qrcode": {"0.2.0"}}}
+	rs := NewRepositorySet([]Provider{gi, acme}, descriptors(), nil)
+
+	out := captureStderr(t, func() {
+		if err := rs.DeclarePin("qrcode", "acme"); err != nil {
+			t.Fatalf("DeclarePin: %v", err)
+		}
+	})
+	if !strings.Contains(out, "qrcode") || !strings.Contains(out, "acme") || !strings.Contains(out, "warning") {
+		t.Fatalf("expected a warning naming the package and registry, got %q", out)
+	}
+
+	// A repeat of the same pin is idempotent and must NOT warn again (noise).
+	out2 := captureStderr(t, func() {
+		if err := rs.DeclarePin("qrcode", "acme"); err != nil {
+			t.Fatalf("idempotent DeclarePin: %v", err)
+		}
+	})
+	if out2 != "" {
+		t.Fatalf("repeat pin should not re-warn, got %q", out2)
+	}
+}
+
+func TestDeclarePin_RootPinDoesNotWarn(t *testing.T) {
+	// The consumer's own root pin wins silently — no warning.
+	gi := &fakeProvider{name: "gi", versions: map[string][]string{"qrcode": {"1.0.0"}}}
+	acme := &fakeProvider{name: "acme", versions: map[string][]string{"qrcode": {"0.2.0"}}}
+	rs := NewRepositorySet([]Provider{gi, acme}, descriptors(), map[string]string{"qrcode": "gi"})
+
+	out := captureStderr(t, func() {
+		if err := rs.DeclarePin("qrcode", "acme"); err != nil {
+			t.Fatalf("DeclarePin: %v", err)
+		}
+	})
+	if out != "" {
+		t.Fatalf("root pin should suppress the warning, got %q", out)
 	}
 }
 

@@ -109,6 +109,26 @@ func loadGlobalFile(home string) (GlobalFile, error) {
 	return f, nil
 }
 
+// LoadGlobalFile reads and parses ~/.fglpkg/config.json. A missing or blank
+// file yields a zero GlobalFile (not an error). It is the read half of the
+// read-modify-write cycle used by `fglpkg registry add/remove`.
+func LoadGlobalFile(home string) (GlobalFile, error) {
+	return loadGlobalFile(home)
+}
+
+// WriteGlobalFile writes g to ~/.fglpkg/config.json as formatted JSON, creating
+// the home directory if needed. It is the write half of `registry add/remove`.
+func WriteGlobalFile(home string, g GlobalFile) error {
+	if err := os.MkdirAll(home, 0755); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(g, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(home, GlobalFilename), append(data, '\n'), 0644)
+}
+
 // GlobalDefaultRegistry returns the defaultRegistry declared in the global
 // config file, or "" if none (or no file). Errors mirror LoadGlobal.
 func GlobalDefaultRegistry(home string) (string, error) {

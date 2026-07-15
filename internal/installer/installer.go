@@ -43,6 +43,10 @@ type Installer struct {
 	// resolved packages' manifests so transitive deps route to the author's
 	// stated source. Set alongside the multi-provider fetchers.
 	pinDeclarer resolver.PinDeclarer
+	// configuredRegistries lists the logical names of the currently-configured
+	// repositories (including the built-in "gi"). Used to reject a lock file
+	// that references a repository since removed from the config (spec §9).
+	configuredRegistries []string
 }
 
 // RepoAuth maps a repository URL prefix to the HTTP headers that authenticate
@@ -92,6 +96,14 @@ func (i *Installer) WithFetchers(fv resolver.VersionFetcher, fi resolver.InfoFet
 // during resolution. Returns the installer for chaining.
 func (i *Installer) WithPinDeclarer(pd resolver.PinDeclarer) *Installer {
 	i.pinDeclarer = pd
+	return i
+}
+
+// WithConfiguredRegistries records the logical names of the currently
+// configured repositories so a lock file referencing a removed repository can
+// be rejected before install (spec §9). Returns the installer for chaining.
+func (i *Installer) WithConfiguredRegistries(names []string) *Installer {
+	i.configuredRegistries = names
 	return i
 }
 
@@ -168,6 +180,11 @@ func (i *Installer) InstallAllWithOptions(m *manifest.Manifest, projectDir strin
 		if err != nil {
 			fmt.Printf("warning: cannot read lock file: %v — re-resolving\n", err)
 		} else {
+			// A lock referencing a repository that is no longer configured is a
+			// hard error — never install from a source the user can't see (§9).
+			if err := lf.CheckRegistries(i.configuredRegistries); err != nil {
+				return err
+			}
 			vr := lf.Validate(m, gv.String(), i.packagesDir, i.webcomponentsDir)
 			if vr.NeedsResolve() {
 				fmt.Printf("Lock file is stale (%v) — re-resolving...\n", vr.ManifestMismatch)
