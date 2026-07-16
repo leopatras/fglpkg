@@ -12,6 +12,7 @@ import (
 
 	"github.com/4js-mikefolcher/fglpkg/internal/config"
 	"github.com/4js-mikefolcher/fglpkg/internal/semver"
+	"github.com/4js-mikefolcher/fglpkg/internal/slug"
 )
 
 // componentTypeName matches the Genero COMPONENTTYPE lexical rule:
@@ -721,6 +722,9 @@ func (m *Manifest) Validate() error {
 	if err := m.validateWebcomponentNames(); err != nil {
 		return err
 	}
+	if err := m.validateNoSelfDependency(); err != nil {
+		return err
+	}
 	if m.GeneroConstraint != "" && m.GeneroConstraint != "*" {
 		if _, err := semver.ParseConstraint(m.GeneroConstraint); err != nil {
 			return fmt.Errorf("invalid genero constraint %q: %w", m.GeneroConstraint, err)
@@ -849,6 +853,32 @@ func (m *Manifest) validateWebcomponentNames() error {
 			return fmt.Errorf(`duplicate COMPONENTTYPE %q in "webcomponents"`, name)
 		}
 		seen[name] = true
+	}
+	return nil
+}
+
+// validateNoSelfDependency rejects a manifest that lists its own package
+// among its dependencies in any scope. The resolver dedups every canonical
+// name to a single resolved version, so a self-dependency can never mean "a
+// different copy of me" — it can only pull a stale registry snapshot of this
+// package into its own tree, or form a trivial cycle. Every serious package
+// manager (npm's ENOSELF, Cargo's "package depends on itself", Maven, …)
+// blocks this; so do we. Names are compared canonically (GIS-271) so a
+// separator/case variant of the package's own name cannot slip past.
+func (m *Manifest) validateNoSelfDependency() error {
+	if m.Name == "" {
+		return nil // name is validated separately; nothing to compare against
+	}
+	self := slug.Canonical(m.Name)
+	for _, scope := range []Scope{ScopeProd, ScopeDev, ScopeOptional} {
+		for dep := range m.bucket(scope).FGL {
+			if slug.Canonical(dep) == self {
+				return fmt.Errorf(
+					"package %q cannot depend on itself (found %q in %s dependencies)",
+					m.Name, dep, scope,
+				)
+			}
+		}
 	}
 	return nil
 }

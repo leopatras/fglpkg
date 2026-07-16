@@ -364,6 +364,13 @@ func cmdInstall(args []string) error {
 		if info.Name == "" {
 			info.Name = name
 		}
+		// A package can never depend on itself — the resolver dedups to one
+		// version per name, so this would only pull a registry snapshot of this
+		// project into its own tree. Reject early with a clear message; the
+		// manifest validator enforces the same rule at load/publish time.
+		if m.Name != "" && slugutil.Canonical(info.Name) == slugutil.Canonical(m.Name) {
+			return fmt.Errorf("cannot add %q: a package cannot depend on itself", info.Name)
+		}
 		m.AddFGLDependencyPinned(info.Name, info.Version, flags.registry, flags.scope)
 		fmt.Printf("✓ Added %s@%s to %s [%s]\n", info.Name, info.Version, manifest.Filename, scopeLabel)
 	}

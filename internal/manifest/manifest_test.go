@@ -191,6 +191,69 @@ func TestValidateBinValid(t *testing.T) {
 	}
 }
 
+func TestValidateRejectsSelfDependency(t *testing.T) {
+	m := &manifest.Manifest{
+		Name:    "acme-lib",
+		Version: "1.0.0",
+		Dependencies: manifest.Dependencies{
+			FGL: map[string]string{"acme-lib": "^1.0.0"},
+		},
+	}
+	if err := m.Validate(); err == nil {
+		t.Fatal("expected error for a package depending on itself")
+	}
+}
+
+func TestValidateRejectsSelfDependencyCanonical(t *testing.T) {
+	// A separator/case variant of the package's own name must not slip past
+	// (GIS-271 canonicalization): "Acme_Lib" and "acme-lib" are one identity.
+	m := &manifest.Manifest{
+		Name:    "acme-lib",
+		Version: "1.0.0",
+		Dependencies: manifest.Dependencies{
+			FGL: map[string]string{"Acme_Lib": "^1.0.0"},
+		},
+	}
+	if err := m.Validate(); err == nil {
+		t.Fatal("expected error for a self-dependency spelled with a name variant")
+	}
+}
+
+func TestValidateRejectsSelfDependencyInDevAndOptional(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		m    *manifest.Manifest
+	}{
+		{"dev", &manifest.Manifest{
+			Name: "acme-lib", Version: "1.0.0",
+			DevDependencies: manifest.Dependencies{FGL: map[string]string{"acme-lib": "^1.0.0"}},
+		}},
+		{"optional", &manifest.Manifest{
+			Name: "acme-lib", Version: "1.0.0",
+			OptionalDependencies: manifest.Dependencies{FGL: map[string]string{"acme-lib": "^1.0.0"}},
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := tc.m.Validate(); err == nil {
+				t.Fatalf("expected error for self-dependency in %s scope", tc.name)
+			}
+		})
+	}
+}
+
+func TestValidateAllowsDependencyOnOtherPackage(t *testing.T) {
+	m := &manifest.Manifest{
+		Name:    "acme-lib",
+		Version: "1.0.0",
+		Dependencies: manifest.Dependencies{
+			FGL: map[string]string{"other-lib": "^1.0.0"},
+		},
+	}
+	if err := m.Validate(); err != nil {
+		t.Fatalf("unexpected validation error for a normal dependency: %v", err)
+	}
+}
+
 func TestValidateDocsValid(t *testing.T) {
 	m := &manifest.Manifest{
 		Name:    "test",
