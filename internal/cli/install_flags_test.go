@@ -85,6 +85,21 @@ func TestParseInstallFlagsProduction(t *testing.T) {
 	}
 }
 
+func TestParseInstallFlagsNoManifestFallback(t *testing.T) {
+	f, err := parseInstallFlags([]string{"--no-manifest-fallback"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !f.noManifestFallback {
+		t.Error("--no-manifest-fallback not set")
+	}
+	// Default is off (fallback enabled).
+	def, _ := parseInstallFlags([]string{"pkg"})
+	if def.noManifestFallback {
+		t.Error("noManifestFallback should default to false")
+	}
+}
+
 func TestParseInstallFlagsConflicting(t *testing.T) {
 	cases := [][]string{
 		{"--save-dev", "--save-optional", "x"},
@@ -97,6 +112,38 @@ func TestParseInstallFlagsConflicting(t *testing.T) {
 		} else if !strings.Contains(err.Error(), "mutually exclusive") && !strings.Contains(err.Error(), "cannot be combined") {
 			t.Errorf("args %v: error message unexpected: %v", args, err)
 		}
+	}
+}
+
+func TestParseInstallFlagsRegistry(t *testing.T) {
+	// Both the space form and the =form parse the registry and keep the package.
+	for _, args := range [][]string{
+		{"--registry", "acme", "pkg"},
+		{"pkg", "--registry=acme"},
+	} {
+		f, err := parseInstallFlags(args)
+		if err != nil {
+			t.Fatalf("args %v: %v", args, err)
+		}
+		if f.registry != "acme" {
+			t.Errorf("args %v: registry got %q, want %q", args, f.registry, "acme")
+		}
+		if len(f.pkgs) != 1 || f.pkgs[0] != "pkg" {
+			t.Errorf("args %v: pkgs %v", args, f.pkgs)
+		}
+	}
+}
+
+func TestParseInstallFlagsRegistryErrors(t *testing.T) {
+	// --registry needs a value.
+	if _, err := parseInstallFlags([]string{"pkg", "--registry"}); err == nil {
+		t.Error("--registry with no value: expected error")
+	}
+	// --registry only makes sense when adding a package (it pins that package).
+	if _, err := parseInstallFlags([]string{"--registry", "acme"}); err == nil {
+		t.Error("--registry with no package: expected error")
+	} else if !strings.Contains(err.Error(), "requires a package") {
+		t.Errorf("unexpected error: %v", err)
 	}
 }
 

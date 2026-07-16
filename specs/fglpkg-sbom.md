@@ -1,6 +1,6 @@
 # Spec: `fglpkg sbom` (v1)
 
-**Status:** Draft
+**Status:** ✅ Implemented — shipped ([internal/sbom/](../internal/sbom/))
 **Date:** 2026-05-15
 **Author:** Mike Folcher
 **Tracking:** P2 #24 in [docs/market-readiness-gaps.md](../docs/market-readiness-gaps.md)

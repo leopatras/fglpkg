@@ -34,6 +34,23 @@ type Installer struct {
 	webcomponentsDir string // ~/.fglpkg/webcomponents
 	githubToken      string // GitHub PAT for downloading from private GitHub Releases
 	registryToken    string // bearer for the consumer registry when it serves zips directly
+	repoAuth         []RepoAuth
+	// versionFetcher/infoFetcher, when non-nil, replace the default live GI
+	// registry fetchers with a multi-provider routing layer (RepositorySet).
+	versionFetcher resolver.VersionFetcher
+	infoFetcher    resolver.InfoFetcher
+	// pinDeclarer, when non-nil, receives per-dependency registry pins found in
+	// resolved packages' manifests so transitive deps route to the author's
+	// stated source. Set alongside the multi-provider fetchers.
+	pinDeclarer resolver.PinDeclarer
+}
+
+// RepoAuth maps a repository URL prefix to the HTTP headers that authenticate
+// downloads from it. Used for secondary (Artifactory) repositories, whose auth
+// scheme may be bearer/basic/apikey. Matched by longest URL prefix.
+type RepoAuth struct {
+	URLPrefix string
+	Headers   map[string]string
 }
 
 // New creates an Installer rooted at home.
@@ -54,11 +71,74 @@ func New(home, githubToken, registryToken string) *Installer {
 	}
 }
 
+// WithRepoAuth attaches per-repository download auth (for Artifactory
+// secondary repositories) and returns the installer for chaining.
+func (i *Installer) WithRepoAuth(ra []RepoAuth) *Installer {
+	i.repoAuth = ra
+	return i
+}
+
+// WithFetchers replaces the default live GI registry fetchers with a
+// multi-provider routing layer (e.g. a RepositorySet's Versions/Info). Pass
+// nil,nil to keep the default single-registry behaviour.
+func (i *Installer) WithFetchers(fv resolver.VersionFetcher, fi resolver.InfoFetcher) *Installer {
+	i.versionFetcher = fv
+	i.infoFetcher = fi
+	return i
+}
+
+// WithPinDeclarer attaches a PinDeclarer (typically the same RepositorySet
+// backing the fetchers) so declared per-dependency registry pins are honoured
+// during resolution. Returns the installer for chaining.
+func (i *Installer) WithPinDeclarer(pd resolver.PinDeclarer) *Installer {
+	i.pinDeclarer = pd
+	return i
+}
+
+// newResolver builds the resolver, using injected multi-provider fetchers when
+// configured (still honouring any workspace), else the default live resolver.
+func (i *Installer) newResolver(gv genero.Version) (*resolver.Resolver, error) {
+	if i.versionFetcher != nil && i.infoFetcher != nil {
+		r := resolver.NewWithFetchers(gv, i.versionFetcher, i.infoFetcher)
+		if i.pinDeclarer != nil {
+			r = r.WithPinDeclarer(i.pinDeclarer)
+		}
+		if err := r.DetectWorkspace(); err != nil {
+			return nil, err
+		}
+		return r, nil
+	}
+	return resolver.New()
+}
+
+// matchRepoAuth returns the auth headers for the configured repository whose
+// URL prefix best (longest) matches url, and whether any configured repo
+// matched at all. A match with empty headers (an "anonymous" repo) still
+// reports matched=true, so the caller knows the host belongs to a configured
+// repository and must NOT be sent the GI registry token (which would leak the
+// GI bearer to a third-party host — see GIS-267).
+func (i *Installer) matchRepoAuth(url string) (headers map[string]string, matched bool) {
+	var best RepoAuth
+	for _, ra := range i.repoAuth {
+		if strings.HasPrefix(url, ra.URLPrefix) && len(ra.URLPrefix) > len(best.URLPrefix) {
+			best = ra
+			matched = true
+		}
+	}
+	return best.Headers, matched
+}
+
 // Options controls optional install behaviour.
 type Options struct {
 	// Production skips dev-scoped packages and JARs. Optional entries are
 	// still attempted.
 	Production bool
+	// NoManifestFallback disables the fallback half of the dependency
+	// cross-check: when set, the installer still diffs each package's
+	// bundled manifest against the install set and warns on divergence, but
+	// it does NOT install Java coordinates the manifest declares and the
+	// install set omits. Default (false) means fallback is on.
+	NoManifestFallback bool
 }
 
 // InstallAll resolves or reads from the lock file, then installs every
@@ -101,14 +181,14 @@ func (i *Installer) InstallAllWithOptions(m *manifest.Manifest, projectDir strin
 				}
 				// Lock is valid but some packages are missing on disk — install them.
 				fmt.Printf("Installing from lock file (Genero %s)...\n", gv)
-				return i.installFromLock(lf, opts)
+				return i.installFromLock(lf, m, opts, projectDir)
 			}
 		}
 	}
 
 	// ── Resolve the full dependency graph ───────────────────────────────────
 	fmt.Printf("Resolving dependency graph (Genero %s)...\n", gv)
-	r, err := resolver.New()
+	r, err := i.newResolver(gv)
 	if err != nil {
 		return fmt.Errorf("cannot initialise resolver: %w", err)
 	}
@@ -136,13 +216,13 @@ func (i *Installer) InstallAllWithOptions(m *manifest.Manifest, projectDir strin
 		}
 	}
 
-	return i.installFromPlan(plan)
+	return i.installFromPlan(plan, m, opts, projectDir)
 }
 
 // installFromLock installs every entry in the lock file using its pinned
 // URLs and checksums, bypassing the resolver entirely. When opts.Production
 // is true, dev-scoped entries are skipped.
-func (i *Installer) installFromLock(lf *lockfile.LockFile, opts Options) error {
+func (i *Installer) installFromLock(lf *lockfile.LockFile, root *manifest.Manifest, opts Options, projectDir string) error {
 	var pkgs []lockfile.LockedPackage
 	var jars []lockfile.LockedJAR
 	var wcs []lockfile.LockedWebcomponent
@@ -204,7 +284,28 @@ func (i *Installer) installFromLock(lf *lockfile.LockFile, opts Options) error {
 		return err
 	}
 
-	// Filter JARs that are already on disk.
+	// ── Dependency cross-check (post-extraction) ────────────────────────────
+	// Diff each installed package's bundled manifest against the locked JAR
+	// set. Scans ALL locked packages (including those already on disk) so a
+	// stale lock is still cross-checked.
+	installedPkgs := make(map[string]bool, len(pkgs)+len(wcs))
+	bdlPkgNames := make([]string, 0, len(pkgs))
+	for _, p := range pkgs {
+		installedPkgs[p.Name] = true
+		bdlPkgNames = append(bdlPkgNames, p.Name)
+	}
+	for _, w := range wcs {
+		installedPkgs[w.Name] = true
+	}
+	install := make(map[string]manifest.JavaDependency, len(jars))
+	for _, jar := range jars {
+		install[jar.Key] = manifest.JavaDependency{
+			GroupID: jar.GroupID, ArtifactID: jar.ArtifactID, Version: jar.Version,
+		}
+	}
+	supplemental := i.crossCheckJava(root, bdlPkgNames, install, installedPkgs, opts)
+
+	// Filter locked JARs that are already on disk.
 	var jarsToInstall []lockfile.LockedJAR
 	for _, jar := range jars {
 		dep := manifest.JavaDependency{
@@ -217,7 +318,7 @@ func (i *Installer) installFromLock(lf *lockfile.LockFile, opts Options) error {
 		jarsToInstall = append(jarsToInstall, jar)
 	}
 
-	return runParallel(jarsToInstall, cap, func(jar lockfile.LockedJAR) error {
+	if err := runParallel(jarsToInstall, cap, func(jar lockfile.LockedJAR) error {
 		dep := manifest.JavaDependency{
 			GroupID:    jar.GroupID,
 			ArtifactID: jar.ArtifactID,
@@ -230,13 +331,33 @@ func (i *Installer) installFromLock(lf *lockfile.LockFile, opts Options) error {
 		}
 		printSync("  ✓ %s\n", jar.Key)
 		return nil
-	})
+	}); err != nil {
+		return err
+	}
+
+	// Fallback JARs recovered from bundled manifests — install as full
+	// JavaDependency structs so url/jar overrides survive. InstallJar is
+	// idempotent (skips JARs already on disk).
+	if err := runParallel(supplemental, cap, func(dep manifest.JavaDependency) error {
+		if err := i.InstallJar(dep); err != nil {
+			return fmt.Errorf("failed to install fallback JAR %s: %w", dep.Key(), err)
+		}
+		printSync("  ✓ %s (manifest fallback)\n", dep.JarFileName())
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	if !opts.Production {
+		i.recordManifestJARs(projectDir, supplemental)
+	}
+	return nil
 }
 
 // installFromPlan installs every entry in a freshly resolved Plan.
 // Optional-scoped items whose download or extraction fails emit a warning
 // and are skipped; hard-scope failures abort the install.
-func (i *Installer) installFromPlan(plan *resolver.Plan) error {
+func (i *Installer) installFromPlan(plan *resolver.Plan, root *manifest.Manifest, opts Options, projectDir string) error {
 	cap := installConcurrency()
 
 	if err := runParallel(plan.Packages, cap, func(pkg resolver.ResolvedPackage) error {
@@ -271,7 +392,26 @@ func (i *Installer) installFromPlan(plan *resolver.Plan) error {
 		return err
 	}
 
-	return runParallel(plan.JARs, cap, func(dep manifest.JavaDependency) error {
+	// ── Dependency cross-check (post-extraction) ────────────────────────────
+	var bdlPkgNames []string
+	installedPkgs := make(map[string]bool, len(plan.Packages))
+	for _, p := range plan.Packages {
+		installedPkgs[p.Name] = true
+		if !p.IsWebcomponent() {
+			bdlPkgNames = append(bdlPkgNames, p.Name)
+		}
+	}
+	install := make(map[string]manifest.JavaDependency, len(plan.JARs))
+	for _, dep := range plan.JARs {
+		install[dep.Key()] = dep
+	}
+	supplemental := i.crossCheckJava(root, bdlPkgNames, install, installedPkgs, opts)
+
+	// Install the resolved JARs plus any manifest-fallback JARs. Fallback
+	// JARs carry no plan scope, so they never hit the optional-skip path
+	// (transitive Java is always production for the consumer).
+	jarsToInstall := append(append([]manifest.JavaDependency(nil), plan.JARs...), supplemental...)
+	if err := runParallel(jarsToInstall, cap, func(dep manifest.JavaDependency) error {
 		if err := i.InstallJar(dep); err != nil {
 			if plan.JARScopes[dep.Key()] == manifest.ScopeOptional {
 				printSync("  warning: skipping optional JAR %s: %v\n", dep.Key(), err)
@@ -281,7 +421,14 @@ func (i *Installer) installFromPlan(plan *resolver.Plan) error {
 		}
 		printSync("  ✓ %s\n", dep.JarFileName())
 		return nil
-	})
+	}); err != nil {
+		return err
+	}
+
+	if !opts.Production {
+		i.recordManifestJARs(projectDir, supplemental)
+	}
+	return nil
 }
 
 // Install downloads, verifies, and unpacks a single package — dispatching
@@ -316,7 +463,8 @@ func (i *Installer) installBDL(info *registry.PackageInfo) error {
 	downloadURL := registry.AbsoluteDownloadURL(info.DownloadURL)
 
 	// Download and verify in one streaming pass.
-	if err := downloadAndVerify(downloadURL, info.Checksum, info.Name, tmp, i.githubToken, i.registryToken); err != nil {
+	repoHeaders, repoMatched := i.matchRepoAuth(downloadURL)
+	if err := downloadAndVerify(downloadURL, info.Checksum, info.Name, tmp, i.githubToken, i.registryToken, repoHeaders, repoMatched); err != nil {
 		tmp.Close()
 		return err
 	}
@@ -373,7 +521,8 @@ func (i *Installer) installWebcomponent(info *registry.PackageInfo) error {
 	defer os.Remove(tmpName)
 
 	downloadURL := registry.AbsoluteDownloadURL(info.DownloadURL)
-	if err := downloadAndVerify(downloadURL, info.Checksum, info.Name, tmp, i.githubToken, i.registryToken); err != nil {
+	repoHeaders, repoMatched := i.matchRepoAuth(downloadURL)
+	if err := downloadAndVerify(downloadURL, info.Checksum, info.Name, tmp, i.githubToken, i.registryToken, repoHeaders, repoMatched); err != nil {
 		tmp.Close()
 		return err
 	}
@@ -405,7 +554,8 @@ func (i *Installer) InstallJar(dep manifest.JavaDependency) error {
 	url := dep.MavenURL()
 
 	// JavaDependency doesn't carry a checksum field today; pass "" to skip.
-	if err := downloadAndVerify(url, dep.Checksum, dep.JarFileName(), f, "", ""); err != nil {
+	// JARs come from Maven Central anonymously — no repo auth.
+	if err := downloadAndVerify(url, dep.Checksum, dep.JarFileName(), f, "", "", nil, false); err != nil {
 		f.Close()
 		os.Remove(dest)
 		return err
@@ -420,6 +570,103 @@ func (i *Installer) Remove(name string) error {
 		return fmt.Errorf("package %q is not installed", name)
 	}
 	return os.RemoveAll(dir)
+}
+
+// ReconcileAfterRemove brings the install state back in line with a manifest
+// that has just had one or more dependencies removed. It re-resolves the
+// remaining graph, rewrites the lock file (so the removed package and its now
+// unreferenced JARs no longer reappear on the next install), and — when prune
+// is true — deletes installed packages and JARs that the resolved graph no
+// longer requires.
+//
+// prune MUST be false for a global (~/.fglpkg) home: those package and JAR
+// directories are shared across every project, so pruning against a single
+// project's graph would delete another project's dependencies. It is only
+// safe for a project-local (.fglpkg/) install. The lock rewrite is always
+// safe — the lock is project-local regardless of where artifacts live.
+//
+// A resolution failure (e.g. offline, registry unreachable) is returned so the
+// caller can fall back to a manifest-only removal; nothing is pruned in that
+// case.
+func (i *Installer) ReconcileAfterRemove(m *manifest.Manifest, projectDir string, prune bool) ([]string, error) {
+	if err := i.ensureDirs(); err != nil {
+		return nil, err
+	}
+	gv, err := genero.Detect()
+	if err != nil {
+		return nil, fmt.Errorf("cannot detect Genero version: %w", err)
+	}
+	r, err := i.newResolver(gv)
+	if err != nil {
+		return nil, fmt.Errorf("cannot initialise resolver: %w", err)
+	}
+	plan, err := r.ResolveWithOptions(m, resolver.DefaultResolveOptions())
+	if err != nil {
+		return nil, fmt.Errorf("dependency resolution failed:\n%w", err)
+	}
+
+	// Rewrite the lock only if the project already had one; a `remove` should
+	// not conjure a lock for a project that was never installed.
+	if lockfile.Exists(projectDir) {
+		if err := lockfile.FromPlan(plan, m).Save(projectDir); err != nil {
+			return nil, fmt.Errorf("cannot write lock file: %w", err)
+		}
+	}
+
+	if !prune {
+		return nil, nil
+	}
+	return i.pruneToPlan(plan)
+}
+
+// pruneToPlan deletes installed BDL packages and JARs that are absent from
+// plan, returning a human-readable list of what it removed. Webcomponent
+// bundles are not pruned: their on-disk layout is keyed by COMPONENTTYPE, not
+// package name, and that mapping is not persisted, so there is no reliable way
+// to know which bundle belonged to a removed package.
+func (i *Installer) pruneToPlan(plan *resolver.Plan) ([]string, error) {
+	wantPkg := make(map[string]bool, len(plan.Packages))
+	for _, p := range plan.Packages {
+		if !p.IsWebcomponent() {
+			wantPkg[p.Name] = true
+		}
+	}
+	wantJar := make(map[string]bool, len(plan.JARs))
+	for _, dep := range plan.JARs {
+		wantJar[dep.JarFileName()] = true
+	}
+
+	var pruned []string
+
+	pkgEntries, err := os.ReadDir(i.packagesDir)
+	if err != nil && !os.IsNotExist(err) {
+		return pruned, err
+	}
+	for _, e := range pkgEntries {
+		if !e.IsDir() || wantPkg[e.Name()] {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(i.packagesDir, e.Name())); err != nil {
+			return pruned, fmt.Errorf("cannot prune package %s: %w", e.Name(), err)
+		}
+		pruned = append(pruned, "package "+e.Name())
+	}
+
+	jarEntries, err := os.ReadDir(i.jarsDir)
+	if err != nil && !os.IsNotExist(err) {
+		return pruned, err
+	}
+	for _, e := range jarEntries {
+		if e.IsDir() || wantJar[e.Name()] {
+			continue
+		}
+		if err := os.Remove(filepath.Join(i.jarsDir, e.Name())); err != nil {
+			return pruned, fmt.Errorf("cannot prune jar %s: %w", e.Name(), err)
+		}
+		pruned = append(pruned, "jar "+e.Name())
+	}
+
+	return pruned, nil
 }
 
 // List returns all currently installed BDL packages by scanning the packages dir.
@@ -462,13 +709,17 @@ func (i *Installer) JarsDir() string { return i.jarsDir }
 // into w, and verifies the SHA256 against expectedChecksum in a single pass.
 // name is used only in error messages.
 //
-// Auth selection:
+// Auth selection (first match wins):
 //   - GitHub URL + githubToken non-empty → send githubToken (legacy private
 //     GitHub Releases path used by fglpkg-registry.fly.dev).
-//   - Non-GitHub URL + registryToken non-empty → send registryToken (new
-//     service.generointelligence.ai path where the registry serves zips).
+//   - URL belongs to a configured secondary repository (repoMatched) → send
+//     that repo's auth-scheme headers, or NONE for an "anonymous" repo. The GI
+//     registry token is never sent here: doing so would leak the GI bearer to
+//     a third-party (e.g. Artifactory) host (GIS-267).
+//   - Other non-GitHub URL + registryToken non-empty → send registryToken (the
+//     GI service.generointelligence.ai path where the registry serves zips).
 //   - Otherwise → no auth (anonymous public download).
-func downloadAndVerify(url, expectedChecksum, name string, w io.Writer, githubToken, registryToken string) error {
+func downloadAndVerify(url, expectedChecksum, name string, w io.Writer, githubToken, registryToken string, repoHeaders map[string]string, repoMatched bool) error {
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
 		return fmt.Errorf("download failed for %s: %w", name, err)
@@ -481,6 +732,14 @@ func downloadAndVerify(url, expectedChecksum, name string, w io.Writer, githubTo
 		authToken = githubToken
 		req.Header.Set("Authorization", "Bearer "+authToken)
 		req.Header.Set("Accept", "application/octet-stream")
+	case repoMatched:
+		// Configured secondary (Artifactory) repository: apply its auth-scheme
+		// headers (bearer / basic / apikey), or none for an anonymous repo.
+		// Never fall through to registryToken — that would leak the GI bearer
+		// to the secondary host (GIS-267).
+		for k, v := range repoHeaders {
+			req.Header.Set(k, v)
+		}
 	case !isGH && registryToken != "":
 		authToken = registryToken
 		req.Header.Set("Authorization", "Bearer "+authToken)

@@ -16,6 +16,7 @@ This guide covers the day-to-day usage of fglpkg, the package manager for Genero
 - [Lifecycle Hooks](#lifecycle-hooks)
 - [Package Documentation](#package-documentation)
 - [Registry Authentication](#registry-authentication)
+- [Secondary Repositories (JFrog Artifactory)](#secondary-repositories-jfrog-artifactory)
 - [Workspaces (Monorepos)](#workspaces-monorepos)
 - [Lock Files](#lock-files)
 - [Package Ownership](#package-ownership)
@@ -347,6 +348,38 @@ poiapi/
 
 When published, the zip preserves the full directory structure (`com/fourjs/poiapi/PoiApi.42m`). When installed, it extracts to `~/.fglpkg/packages/poiapi/com/fourjs/poiapi/PoiApi.42m`. Since `~/.fglpkg/packages/poiapi` is on the `FGLLDPATH`, Genero resolves `com.fourjs.poiapi` correctly.
 
+**Example: Compiled output under a build directory (`importRoot`)**
+
+Many projects compile into a build-output directory such as `lib/`, so the package files end up at `lib/com/fourjs/fglpkgtest/…`. Publishing that as-is would ship the `lib/` prefix, and `IMPORT FGL com.fourjs.fglpkgtest.*` would not resolve after install. Set `importRoot` to the directory whose *contents* should become the archive root:
+
+```
+fglpkgtest/
+├── fglpkg.json
+├── dist/
+│   └── app.4st
+└── lib/
+    └── com/
+        └── fourjs/
+            └── fglpkgtest/
+                ├── ModuleA.42m
+                └── ModuleB.42m
+```
+
+```json
+{
+  "name": "fglpkgtest",
+  "version": "1.0.0",
+  "root": "lib/com/fourjs/fglpkgtest",
+  "importRoot": "lib",
+  "files": ["*.42m"],
+  "include": ["dist/app.4st"]
+}
+```
+
+With `importRoot: "lib"`, packaged files are stored relative to `lib/`, so `lib/com/fourjs/fglpkgtest/ModuleA.42m` ships as `com/fourjs/fglpkgtest/ModuleA.42m` — the `lib/` prefix is stripped and imports resolve after install. Set `root` to the directory that directly holds your program modules (`fglpkg run` relies on it); `importRoot` must be a prefix of `root`.
+
+Use `include` for loose files that live outside `importRoot` but should sit at the archive root: each listed file is copied to the top of the archive under its **basename** (so `dist/app.4st` ships as `app.4st`). A file that must be namespaced (`com/fourjs/…`) belongs under `importRoot` in the source, not in `include`.
+
 ### File Selection
 
 By default, fglpkg collects files matching `*.42m`, `*.42f`, and `*.sch`. To customize this, use the `files` field:
@@ -375,53 +408,33 @@ Notes:
 - Files declared in the manifest's `bin` field are always included, even if they match an ignore pattern — dropping a declared script would silently break the package.
 - `fglpkg.json` is always included.
 
-### GitHub Setup (Required for Publishing and Installing)
-
-Package zips are stored as GitHub Release assets on a private repository. The fglpkg registry server stores only metadata.
-
-**Admin one-time setup:**
-
-1. Create a private GitHub repository for package storage (e.g., `4js-mikefolcher/fglpkg-packages`)
-2. Register the repo on the registry:
-   ```bash
-   fglpkg config github-repos add 4js-mikefolcher/fglpkg-packages
-   ```
-   This stores the repo in the registry config so all clients discover it automatically.
-
-**Per-developer setup:**
-
-3. Create a GitHub Personal Access Token (see [GitHub Token Setup](github-token-setup.md)):
-   - **Publishers**: fine-grained token with **Contents: Read and write** on the packages repo
-   - **Consumers**: fine-grained token with **Contents: Read** on the packages repo
-4. Log in to save both tokens:
-   ```bash
-   fglpkg login
-   ```
-
-The `FGLPKG_GITHUB_REPO` environment variable can still be used to override the registry-configured repo (useful for CI or testing against a different repo).
-
 ### Publishing
 
-Authenticate with both the registry and GitHub:
+Publishing requires a registry account — there is **no GitHub or per-repository setup**. The registry stores package artifacts itself (in R2-backed object storage). Authenticate once:
 
 ```bash
-fglpkg login
+fglpkg login                 # opens a browser for OAuth (code + PKCE)
+# or, for CI / headless machines:
+fglpkg login --token <PAT>   # store a Personal Access Token
 ```
 
-This prompts for your registry token and GitHub token. Both are stored in `~/.fglpkg/credentials.json`.
-
-Then publish:
+Credentials are saved to `~/.fglpkg/credentials.json` and refreshed automatically. Then, from the package directory:
 
 ```bash
 fglpkg publish
+fglpkg publish --dry-run     # preview every call without touching the network
 ```
 
-The CLI fetches the GitHub repo from the registry config automatically.
+Publishing is **additive and reviewed**: a freshly published version is marked *pending* and only becomes installable once a registry administrator approves it.
 
 The publish flow:
-1. Builds a zip of your package files and computes the SHA256 checksum
-2. Creates a GitHub Release tagged `{name}-v{version}` and uploads the zip as an asset
-3. Registers the metadata (including the GitHub download URL) with the registry server
+1. Builds a zip from the directory given by `root` (or `.`), collecting files matching `files` (default `*.42m`, `*.42f`, `*.sch`) plus declared `bin` scripts and `docs`, and SHA256s it.
+2. `POST /registry/packages` — creates the package on first publish (a `409` "already exists" is fine). New packages carry the manifest's `visibility` (`public` by default; set `"visibility": "private"` to restrict).
+3. `POST /registry/packages/:slug/versions` — creates the version and attaches its changelog (see below).
+4. `PUT …/versions/:version/artifacts/:variant` — streams the zip; the registry stores it and records size + checksum.
+5. `POST …/versions/:version/submit` — submits the version for admin review.
+
+Authentication uses the OAuth/PAT bearer from `fglpkg login` (or `FGLPKG_TOKEN` in CI). No GitHub token is involved.
 
 ### Publishing an Update
 
@@ -442,15 +455,33 @@ fglpkg update
 
 in the consuming project. See [Updating Dependencies](#updating-dependencies) for what this does.
 
-### Unpublishing a Version
+### Version Changelog
 
-To remove a published version from both the registry and GitHub:
+Each published version can carry a changelog that the registry stores and the
+portals display. Publish resolves it in this order:
 
-```bash
-fglpkg unpublish poiapi@1.0.0
-```
+1. `--changelog "<text>"` — inline text, useful in CI.
+2. **Automatic** (default): a `CHANGELOG.md` in the project root, in
+   [Keep a Changelog](https://keepachangelog.com) format. Publish sends only the
+   section whose heading names the version being published:
 
-This deletes the GitHub Release (and its zip asset) and removes the version metadata from the registry. You must be an owner of the package.
+   ```markdown
+   ## [1.2.0] - 2026-07-13
+
+   ### Added
+   - The thing you added.
+
+   ## [1.1.0] - 2026-06-01
+   - Older entry (not sent when publishing 1.2.0).
+   ```
+
+Headings may be bracketed (`## [1.2.0]`) or bare (`## 1.2.0`), with an optional
+`v` prefix and a trailing ` - date`. Only the entry for the version being
+published is sent — not the whole history.
+
+If `CHANGELOG.md` exists but has no entry for the version, publish prints a
+warning and sends an empty changelog (it does not block the publish). Use
+`fglpkg publish --dry-run` to preview the resolved changelog size before pushing.
 
 ### Genero Version Variants
 
@@ -462,21 +493,20 @@ When you run `fglpkg publish`, it automatically detects your local Genero versio
 
 ```
 $ fglpkg publish
-Publishing poiapi@1.0.0 (Genero 4 variant) to https://fglpkg-registry.fly.dev...
+Publishing poiapi@1.0.0 (Genero 4 variant) to https://service.generointelligence.ai...
   Package zip: 4096 bytes (SHA256: abc123...)
-  Uploading to GitHub (4js-mikefolcher/fglpkg-packages)...
-  Uploaded: poiapi-1.0.0-genero4.zip
-✓ Published poiapi@1.0.0
+  Uploaded variant: poiapi-1.0.0-genero4.zip
+✓ Published poiapi@1.0.0 (submitted for review)
 ```
 
 To publish for another Genero version, run the same command on a machine with that version installed:
 
 ```bash
 # On a Genero 6.x machine
-FGLPKG_GENERO_VERSION=6.0.0 fglpkg publish
+fglpkg publish
 ```
 
-Both variants are stored as separate assets under the same GitHub Release (`poiapi-v1.0.0`).
+Both variants live under the same version (`1.0.0`) on the registry as separate artifacts. Publishing a second variant for an existing version is additive and does not require bumping the version.
 
 #### Installing the correct variant
 
@@ -491,7 +521,7 @@ Resolving dependency graph (Genero 4.01.12)...
 
 #### Lock file and Genero changes
 
-The lock file records which Genero major version was used during resolution. If you switch to a different Genero major version, `fglpkg install` will automatically re-resolve to select the correct variants.
+The lock file records which Genero major version was used during resolution. If you switch to a different Genero major version, run `fglpkg update` to re-resolve and select the correct variants. Plain `fglpkg install` only **warns** about the mismatch and keeps the locked variants — it does not re-resolve for a Genero change.
 
 ### Genero Version Constraints
 
@@ -927,22 +957,25 @@ The `docs` field supports standard glob syntax with `**` for recursive matching:
 
 ### Logging In
 
+`fglpkg login` (no arguments) opens a browser and completes an OAuth (authorization code + PKCE) login against the registry:
+
 ```bash
 $ fglpkg login
-Registry URL (https://fglpkg-registry.fly.dev):
-Token: my-secret-token
-✓ Logged in to https://fglpkg-registry.fly.dev as jdeveloper
-GitHub token (optional, for package downloads): ghp_xxxxxxxxxxxx
-✓ GitHub token saved for package downloads
+Opening browser to complete login…
+✓ Logged in to https://service.generointelligence.ai as jdeveloper
 ```
 
-Credentials (both registry and GitHub tokens) are stored in `~/.fglpkg/credentials.json`.
+Credentials are stored in `~/.fglpkg/credentials.json` and refreshed automatically when they expire. For non-interactive machines, store a Personal Access Token instead:
+
+```bash
+fglpkg login --token <PAT>
+```
 
 ### Checking Your Identity
 
 ```bash
 $ fglpkg whoami
-Logged in to https://fglpkg-registry.fly.dev as jdeveloper
+Logged in to https://service.generointelligence.ai as jdeveloper
 ```
 
 ### Logging Out
@@ -951,54 +984,155 @@ Logged in to https://fglpkg-registry.fly.dev as jdeveloper
 fglpkg logout
 ```
 
-### Using Tokens Directly (CI/CD)
+### Using a Token in CI/CD
 
-For CI/CD environments, set tokens as environment variables instead of using `fglpkg login`:
+For non-interactive environments, provide a Personal Access Token via `FGLPKG_TOKEN` instead of running `fglpkg login`:
 
 ```bash
 # macOS / Linux
-export FGLPKG_PUBLISH_TOKEN=my-secret-token
-export FGLPKG_GITHUB_TOKEN=ghp_xxxxxxxxxxxx
-fglpkg publish
+export FGLPKG_TOKEN=<PAT>
+fglpkg publish --ci        # --ci is non-interactive and prints a machine-readable status line
 ```
 
 ```cmd
 REM Windows
-SET FGLPKG_PUBLISH_TOKEN=my-secret-token
-SET FGLPKG_GITHUB_TOKEN=ghp_xxxxxxxxxxxx
-fglpkg publish
+SET FGLPKG_TOKEN=<PAT>
+fglpkg publish --ci
 ```
 
-The GitHub repo is automatically fetched from the registry config. Override it with `FGLPKG_GITHUB_REPO` if needed.
+`FGLPKG_TOKEN` overrides any stored credentials and authenticates every registry command. Installing **public** packages needs no token at all. (For a secondary Artifactory repo in CI, authenticate it with `fglpkg login --registry <name> --token <access-token>` — `FGLPKG_TOKEN` applies only to the GI registry. See [Secondary Repositories](#secondary-repositories-jfrog-artifactory).)
 
-For install-only CI jobs, only the GitHub token is needed:
+## Secondary Repositories (JFrog Artifactory)
+
+By default fglpkg draws every BDL package from the Genero Intelligence (GI)
+registry. If your team hosts **internal** packages in a **JFrog Artifactory**
+instance, you can add it as a secondary repository: fglpkg will consume and
+publish your internal packages there while still pulling public packages from GI.
+This is entirely client-side — nothing changes on the GI side. (Java JARs are not
+routed through Artifactory; they stay on Maven Central.)
+
+### 1. Declare the repository
+
+Repositories are listed in a `registries` array. It contains **no secrets** —
+credentials are stored separately by `fglpkg login`. Declare it in your project's
+`fglpkg.json` (committed, so teammates get the URL on clone):
+
+```json
+{
+  "name": "myapp",
+  "version": "1.0.0",
+  "dependencies": { "fgl": { "acme-utils": "^1.0.0" } },
+  "registries": [
+    {
+      "name": "acme",
+      "type": "artifactory",
+      "url": "https://artifactory.acme.example/artifactory",
+      "repoKey": "fgl-internal-generic",
+      "priority": 2,
+      "auth": "bearer",
+      "packages": ["acme-*"]
+    }
+  ]
+}
+```
+
+Or provision it once for every project on the machine in `~/.fglpkg/config.json`
+(same shape) — useful for an ops team:
+
+```json
+{ "registries": [ { "name": "acme", "type": "artifactory", "url": "…", "repoKey": "…", "priority": 2, "auth": "bearer" } ] }
+```
+
+Descriptor fields:
+
+| Field | Required | Meaning |
+|---|---|---|
+| `name` | Yes | Logical id used in `--registry`, credentials, and dependency pins |
+| `type` | Yes | `"genero"` or `"artifactory"` |
+| `url` | Yes | Base URL, including any context path (e.g. `…/artifactory`) |
+| `repoKey` | For `artifactory` | The Artifactory **generic** repository key |
+| `priority` | Yes | Lower is tried first; must be unique. Ordering only — not a precedence tiebreak |
+| `auth` | No | `bearer` (default) \| `basic` \| `apikey` \| `anonymous` |
+| `packages` | No | Glob allow-list (e.g. `["acme-*"]`); names outside it are never queried against this repo |
+
+Check the effective configuration and login status any time:
 
 ```bash
-# macOS / Linux
-export FGLPKG_GITHUB_TOKEN=ghp_xxxxxxxxxxxx
-fglpkg install
+fglpkg registry list
+# NAME   TYPE         PRIO  AUTH    LOGIN  URL
+# gi     genero       1     bearer  env    https://service.generointelligence.ai
+# acme   artifactory  2     bearer  no     https://artifactory.acme.example/artifactory
 ```
 
-```cmd
-REM Windows
-SET FGLPKG_GITHUB_TOKEN=ghp_xxxxxxxxxxxx
-fglpkg install
-```
+The `LOGIN` column shows `yes` (stored credentials), `env` (GI authenticated by
+`FGLPKG_TOKEN`), `no` (none), or `anon` (no auth needed).
 
-### Token Management (Admin)
+### 2. Log in
 
-Administrators can create, revoke, and rotate tokens:
+Credentials are per-repository, so you stay logged into GI and every secondary
+repo simultaneously. Use the flag matching the repo's `auth` scheme:
 
 ```bash
-# Create a token for a new user
-fglpkg token create jdeveloper
-
-# Revoke a user's token
-fglpkg token revoke jdeveloper
-
-# Rotate your own token
-fglpkg token rotate
+fglpkg login --registry acme --token <access-token>           # bearer (recommended)
+fglpkg login --registry acme --user <u> --password <p|token>  # basic
+fglpkg login --registry acme --api-key <key>                  # apikey
+fglpkg logout --registry acme
 ```
+
+A JFrog access token can be used as the `bearer` token or as the `basic`
+password. `FGLPKG_TOKEN` authenticates GI only — it has no effect on secondary
+repos.
+
+### 3. Consume packages
+
+`fglpkg install` resolves each dependency to the repository that owns its name and
+records the source in `fglpkg.lock` (`"registry": "acme"`), so installs are
+reproducible. If a name exists in **more than one** repository, fglpkg stops with
+a collision error rather than guessing — this is the dependency-confusion
+safeguard. Resolve it by pinning the source:
+
+```json
+"dependencies": { "fgl": { "utils": { "version": "^1.0.0", "registry": "acme" } } }
+```
+
+or add + pin in one step:
+
+```bash
+fglpkg install utils --registry acme     # resolves from acme and writes the pin
+```
+
+A `packages` allow-list (e.g. `"packages": ["acme-*"]`) makes the split
+structural, so those names are only ever looked for in your Artifactory and never
+collide with GI.
+
+**Transitive dependencies** of an Artifactory package carry the pins their author
+declared, so they resolve from the intended repository automatically. A pin in
+your own `fglpkg.json` always overrides a package's declared pin.
+
+`fglpkg search <term>` fans out to every configured repository and tags each
+result with its source repo.
+
+### 4. Publish packages
+
+```bash
+fglpkg publish --registry acme            # deploy the built zip + sidecar manifest
+fglpkg publish --registry acme --dry-run  # preview the PUT URLs, no network
+fglpkg publish --registry acme --force    # overwrite an existing variant (refused by default)
+```
+
+To stop typing `--registry`, set a default publish target — resolved as
+`FGLPKG_PUBLISH_REGISTRY` → project `defaultRegistry` → global `defaultRegistry` →
+GI:
+
+```json
+{ "defaultRegistry": "acme", "registries": [ … ] }
+```
+
+A bare `fglpkg publish` then deploys to `acme`; `fglpkg publish --registry gi`
+still targets GI when you need it.
+
+For the complete design, see
+[specs/artifactory-secondary-repository.md](../specs/artifactory-secondary-repository.md).
 
 ## Workspaces (Monorepos)
 
@@ -1057,25 +1191,7 @@ fglpkg update
 
 ## Package Ownership
 
-Packages can have multiple owners who are allowed to publish new versions.
-
-### List Owners
-
-```bash
-fglpkg owner list myutils
-```
-
-### Add an Owner
-
-```bash
-fglpkg owner add myutils jdeveloper
-```
-
-### Remove an Owner
-
-```bash
-fglpkg owner remove myutils jdeveloper
-```
+Each package is owned by the partner (tenant) that first published it, and ownership governs who may publish new versions and who can see private or pending versions. Ownership and collaborator management are handled by registry administrators through the Genero Intelligence portal — there is no `fglpkg` CLI command for it.
 
 ## Troubleshooting
 
@@ -1087,7 +1203,7 @@ Make sure you have authenticated:
 fglpkg login
 ```
 
-Or set the `FGLPKG_PUBLISH_TOKEN` environment variable.
+Or set the `FGLPKG_TOKEN` environment variable.
 
 ### Packages not found by Genero after install
 

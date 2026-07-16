@@ -1,6 +1,6 @@
 # Spec: Package signing & provenance (v1)
 
-**Status:** Draft — reconciled 2026-07-07 with the GI-side implementation. Layer 1 and Layer 2 have shipped in the Genero Intelligence registry; the sections below carry the 11-point decision log (custody, key tooling, read-model, JCS guardrails, sign ordering, attestation keying, in-Worker Layer 2 verify). Source: `4js-genero-intelligence/specs/package-signing-gi-decisions.md`.
+**Status:** ◐ Partially implemented — Layer 1 & Layer 2 have shipped in the Genero Intelligence registry (GI-side); the fglpkg **CLI** verify-on-install / provenance work is not yet started (GIS-244 / GIS-245 / GIS-246). The sections below carry the 11-point GI decision log (custody, key tooling, read-model, JCS guardrails, sign ordering, attestation keying, in-Worker Layer 2 verify). Source: `4js-genero-intelligence/specs/package-signing-gi-decisions.md`.
 **Date:** 2026-07-02
 **Author:** Mike Folcher
 **Tracking:** Workstream C, item #6 (P0) in [docs/outstanding-work.md](../docs/outstanding-work.md); market-readiness gap #6.

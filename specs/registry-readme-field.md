@@ -1,6 +1,6 @@
 # Spec: Registry `readme` field on package metadata
 
-**Status:** Draft
+**Status:** ✅ Implemented — shipped (`readme`/`userguide` surfaced on package metadata)
 **Date:** 2026-05-14
 **Author:** Mike Folcher
 **Motivation:** Enable an MCP service (and future web UI) to surface a package's README without downloading the published zip.

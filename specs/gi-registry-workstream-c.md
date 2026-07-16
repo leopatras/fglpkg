@@ -1,6 +1,6 @@
 # Spec: Genero Intelligence registry changes for fglpkg Workstream C
 
-**Status:** Draft
+**Status:** ✅ GI-side implemented — deprecate + package-signing endpoints live on the GI `package-management` branch
 **Date:** 2026-07-02
 **Author:** Mike Folcher
 **Tracking:** Workstream C in [docs/outstanding-work.md](../docs/outstanding-work.md) §4.

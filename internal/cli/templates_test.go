@@ -148,10 +148,13 @@ func TestParsePublishFlags(t *testing.T) {
 		{"ci", []string{"--ci"}, false, true, false},
 		{"both", []string{"--dry-run", "--ci"}, true, true, false},
 		{"unknown", []string{"--nope"}, false, false, true},
+		{"changelog value", []string{"--changelog", "notes"}, false, false, false},
+		{"changelog eq", []string{"--changelog=notes"}, false, false, false},
+		{"changelog missing value", []string{"--changelog"}, false, false, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			dry, ci, _, err := parsePublishFlags(tc.args)
+			pf, err := parsePublishFlags(tc.args)
 			if tc.wantErr {
 				if err == nil {
 					t.Fatalf("expected error for %v", tc.args)
@@ -161,9 +164,37 @@ func TestParsePublishFlags(t *testing.T) {
 			if err != nil {
 				t.Fatalf("parsePublishFlags(%v): %v", tc.args, err)
 			}
-			if dry != tc.wantDry || ci != tc.wantCI {
-				t.Errorf("got dry=%v ci=%v, want dry=%v ci=%v", dry, ci, tc.wantDry, tc.wantCI)
+			if pf.dryRun != tc.wantDry || pf.ci != tc.wantCI {
+				t.Errorf("got dry=%v ci=%v, want dry=%v ci=%v", pf.dryRun, pf.ci, tc.wantDry, tc.wantCI)
 			}
 		})
+	}
+}
+
+func TestParsePublishFlagsChangelogValues(t *testing.T) {
+	pf, err := parsePublishFlags([]string{"--changelog", "hello world"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if pf.changelog != "hello world" {
+		t.Errorf("got text=%q, want %q", pf.changelog, "hello world")
+	}
+
+	pf, err = parsePublishFlags([]string{"--changelog=inline notes"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if pf.changelog != "inline notes" {
+		t.Errorf("got text=%q, want %q", pf.changelog, "inline notes")
+	}
+}
+
+func TestParsePublishFlagsRegistryAndForce(t *testing.T) {
+	pf, err := parsePublishFlags([]string{"--registry", "acme", "--force"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if pf.registry != "acme" || !pf.force {
+		t.Fatalf("parsed = %+v", pf)
 	}
 }

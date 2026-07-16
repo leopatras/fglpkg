@@ -1,7 +1,7 @@
 # fglpkg — Outstanding Work & R&D Handoff Plan
 
 **Status:** Handoff draft — Workstreams A + B shipped
-**Date:** 2026-06-15 · **Last reviewed:** 2026-07-02
+**Date:** 2026-06-15 · **Last reviewed:** 2026-07-15
 **Audience:** R&D team taking ownership of fglpkg
 **Supersedes the status (not the vision) of:** [fglpkg-enhancement-roadmap.md](fglpkg-enhancement-roadmap.md)
 
@@ -9,8 +9,9 @@
 > - ✅ **Workstream A — Jettison the registry** shipped 2026-06-19 (commit `94448f0`). CLI-only repo; server, legacy admin commands, AWS deps, and GitHub-release surface all removed.
 > - ✅ **Workstream B — Private packages** shipped 2026-06-26, merged 2026-06-30 (PR #4, commit `b64c209`). `privateHint` login-vs-not-found error, `publish --private/--public` flags, README docs.
 > - ✅ **Net-new: Webcomponent package support** shipped 2026-06-20 (v2.5.0, commit `8f4eb13`) with mixed BDL+WC packaging follow-up 2026-06-30 (commit `af35901`). Not in the original plan.
-> - **Current version:** 3.1.0 ([cmd/build.sh](../cmd/build.sh)).
-> - **Still open:** Workstream C items (signing, deprecate, telemetry) and the §7.1 uncovered backlog. Two items closed on 2026-07-02: the standalone `migrate` command was **dropped** (rename/redirect folded into `deprecate --moved-to`, npm model), and **org/team management** was **deferred to the GI web portal**. GI-side changes for the rest are collected in [specs/gi-registry-workstream-c.md](../specs/gi-registry-workstream-c.md).
+> - ✅ **Net-new shipped since 2026-07-02:** `importRoot` archive rebasing (GIS-252, `c4e02a7`); the **macOS release sign+notarize** pipeline (GIS-250, personal Developer ID — production 4Js cert swap tracked in GIS-257); the **dependency cross-check & fallback** ([internal/installer/crosscheck.go](../internal/installer/crosscheck.go)); and **package-signing Layer 1 & 2 on the GI registry side** (the fglpkg CLI verify/publish half remains — GIS-244/245/246).
+> - **Current version:** 3.5.0 ([cmd/build.sh](../cmd/build.sh)).
+> - **Still open:** Workstream C CLI work — **package-signing CLI** (GIS-244/245/246), `deprecate` (GIS-247, GI endpoints already live), telemetry — plus newer specced-but-unstarted items: `self-update` (GIS-255/256), Genero-aware `search` (GIS-254), webcomponent GWA filtering (GIS-248), Artifactory secondary repo (GIS-249, in progress), resolver plan-ordering perf, and the §7.1 uncovered backlog. Two items closed on 2026-07-02: the standalone `migrate` command was **dropped** (folded into `deprecate --moved-to`, npm model), and **org/team management** was **deferred to the GI web portal**. GI-side changes are collected in [specs/gi-registry-workstream-c.md](../specs/gi-registry-workstream-c.md).
 
 ---
 
@@ -21,7 +22,7 @@ resolves and installs BDL packages and Java JAR dependencies, with a lockfile fo
 reproducibility, semver constraint resolution, per-Genero-version build variants,
 and a publish flow that uploads to the **Genero Intelligence (GI)** registry.
 
-- **Version:** 3.1.0 · **Branch:** `main` (Workstreams A and B merged).
+- **Version:** 3.5.0 · **Branch:** `main` (Workstreams A and B merged).
 - **Registry backend:** the GI registry at `https://service.generointelligence.ai`
   (single base — the legacy `fglpkg-registry.fly.dev` server and its admin
   commands were removed in Workstream A).
@@ -251,14 +252,16 @@ release.
 ## 4. Workstream C — Remaining roadmap items
 
 Status carried over from the codebase audit. "Blocker" flags cross-repo
-dependencies on the GI registry. As of 2026-07-02 none of these have been
-started — Workstream C is the remaining ask.
+dependencies on the GI registry. **Update 2026-07-15:** package-signing has since
+shipped on the **GI registry side** (Layer 1 & 2); the fglpkg **CLI** half is the
+remaining signing work (GIS-244/245/246). `deprecate`'s GI endpoints are live, so it
+is now CLI-only work (GIS-247). The rest below is still open.
 
 | Item | Status | Blocker | Effort | Notes |
 |---|---|---|---|---|
-| `fglpkg deprecate <pkg>@<ver>` (with `--moved-to <new>`) | ⏳ Missing | **GI endpoint** | M | Marks a version deprecated with a message, warned at install/`info` (npm model). `--moved-to <new>` records a successor package — this **absorbs the dropped `migrate` command** (rename/redirect). Needs new GI columns + flag route + `deprecated`/`moved_to` fields surfaced on reads. **Design:** [GI/registry side](../specs/gi-registry-workstream-c.md) §1 · [CLI side](../specs/deprecate-cli.md) |
+| `fglpkg deprecate <pkg>@<ver>` (with `--moved-to <new>`) | ⏳ CLI not started (GIS-247) | GI endpoint ✅ live | M | Marks a version deprecated with a message, warned at install/`info` (npm model). `--moved-to <new>` records a successor package — this **absorbs the dropped `migrate` command** (rename/redirect). GI columns + flag route + `deprecated`/`moved_to` read fields are **implemented**; only the CLI remains. **Design:** [GI/registry side](../specs/gi-registry-workstream-c.md) §1 · [CLI side](../specs/deprecate-cli.md) |
 | ~~Org/team management commands~~ | ✅ Deferred | — | — | **Deferred 2026-07-02 — done from the GI web portal.** The partner portal already provides member management + PAT issuance; a CLI would only wrap it. No fglpkg/registry work. See [specs/gi-registry-workstream-c.md](../specs/gi-registry-workstream-c.md) §2 |
-| Package **signing** / `install --verify-signature` | 📋 Spec drafted 2026-07-02 | GI + fglpkg (see spec) | L | Largest security item; builds on existing SHA256 verification. **Detailed design:** [specs/package-signing.md](../specs/package-signing.md) — two-layer approach (registry-signed default + optional Sigstore provenance) |
+| Package **signing** / `install --verify-signature` | ◐ GI-side shipped; CLI pending | fglpkg CLI (GIS-244/245/246) | L | Largest security item; builds on existing SHA256 verification. **Layer 1 & 2 live on the GI registry**; the fglpkg CLI verify-on-install + provenance half is not started. **Design:** [specs/package-signing.md](../specs/package-signing.md) — two-layer (registry-signed default + optional Sigstore provenance) |
 | ~~`fglpkg migrate <old> <new>`~~ | ✅ Dropped | — | — | **Dropped 2026-07-02.** No mainstream PM ships a standalone rename command; npm folds it into `deprecate`. Rename/redirect is now the `deprecate --moved-to` flag above |
 | Opt-in telemetry | ⏳ Missing | none | M | Partly redundant — GI already tracks downloads server-side; reconsider need |
 | Self-hosted deployment kit / k8s (roadmap 2.3) | N/A | — | — | **Obsolete** — registry is Cloudflare-hosted in GI; drop from scope |
@@ -329,7 +332,7 @@ backlog).
 | 3 | `version` bump | P0 | ✅ Done | [internal/cli/version.go](../internal/cli/version.go) |
 | 4 | `outdated` | P0 | ✅ Done | [internal/cli/outdated.go](../internal/cli/outdated.go) |
 | 5 | `audit` (CVE) | P0 | ✅ Done | OSV.dev — [internal/audit/](../internal/audit/) |
-| 6 | Package signing / verification | P0 | 📋 Spec drafted | Workstream C — design locked in [specs/package-signing.md](../specs/package-signing.md); implementation not started |
+| 6 | Package signing / verification | P0 | ◐ GI-side done | Layer 1 & 2 live on the GI registry; fglpkg **CLI** verify/publish pending (GIS-244/245/246). [specs/package-signing.md](../specs/package-signing.md) |
 | 7 | Web registry UI | P0 | ✅/⚠️ Split | detail + README/USERGUIDE rendering done in GI portals; **self-service signup** (email verify, anti-abuse) ⚠️ uncovered (GI-side) |
 | 8 | CI gate blocking merge | P0 | ⚠️ Partial | `ci.yml` exists; **branch-protection enforcement** not documented/owned |
 | 8′ | `pack` | P1 | ✅ Done | [internal/cli/pack.go](../internal/cli/pack.go) |
@@ -360,11 +363,18 @@ backlog).
 | 33 | Audit log with retention | P3 | ⚠️ Uncovered | compliance; GI-side |
 | **34** | **Webcomponent packages** (pure-WC + mixed BDL+WC) | — | ✅ Done | *Net-new since original plan.* [specs/webcomponent-packages.md](../specs/webcomponent-packages.md); shipped v2.5.0 (`8f4eb13`, 2026-06-20), mixed follow-up `af35901` (2026-06-30) |
 | **35** | **`publish --private/--public` flags + `privateHint` error** | — | ✅ Done | Workstream B follow-through, `b64c209` 2026-06-26 |
+| **36** | **`importRoot` archive rebasing** | — | ✅ Done | *Net-new.* [specs/import-root.md](../specs/import-root.md); GIS-252 (`c4e02a7`) |
+| **37** | **macOS release sign + notarize** | — | ✅ Done | *Net-new.* [specs/macos-release-signing.md](../specs/macos-release-signing.md); pipeline GIS-250, prod-cert swap GIS-257 |
+| **38** | **Dependency cross-check & fallback** | — | ✅ Done | *Net-new.* [specs/dependency-crosscheck-fallback.md](../specs/dependency-crosscheck-fallback.md); [internal/installer/crosscheck.go](../internal/installer/crosscheck.go) |
+| **39** | **Genero-aware `search`** | — | 📋 Not started | [specs/genero-aware-search.md](../specs/genero-aware-search.md); GIS-254 |
+| **40** | **`self-update` + latest-release endpoint** | — | 📋 Not started | [specs/self-update.md](../specs/self-update.md) GIS-255 · [GI endpoint](../specs/gi-fglpkg-self-update-endpoint.md) GIS-256 |
+| **41** | **Artifactory secondary repository** | — | ⏳ In progress | [specs/artifactory-secondary-repository.md](../specs/artifactory-secondary-repository.md); GIS-249 |
 
-**Summary (2026-07-02):** 15 Done · ~5 In plan · ~13 Uncovered · 2 net-new done.
-Rows #7, #8, #14 remain split. Workstreams A + B (rows #22 + #31 dropped, #35 done)
-are fully cleared; Workstream C rows (#6, #11, #17, #23) plus the §7.1 backlog are
-the remaining work.
+**Summary (2026-07-15):** ~18 Done · a few In plan · ~13 Uncovered · 5 net-new done + 3 net-new in-flight.
+Rows #7, #8, #14 remain split. Workstreams A + B are fully cleared. Package signing (#6)
+is now **half-done** (GI side shipped; CLI pending). Remaining Workstream C: signing CLI
+(GIS-244/245/246), `deprecate` CLI (#11, GIS-247), telemetry (#23), VS Code (#17), plus the
+newer net-new specs (#39–#41) and the §7.1 backlog.
 
 ### 7.1 Newly surfaced backlog (the ⚠️ items to add to tracking)
 

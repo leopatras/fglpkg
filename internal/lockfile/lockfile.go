@@ -104,6 +104,14 @@ type LockedPackage struct {
 	// or "optional". Empty means production. Used by `fglpkg install
 	// --production` to skip dev-scoped entries.
 	Scope string `json:"scope,omitempty"`
+
+	// Registry is the logical repository this package resolved from ("gi",
+	// "acme-internal"). Empty means the default GI registry, so
+	// pre-Artifactory locks parse unchanged (additive, omitempty — no
+	// lockfileVersion bump). It is the dependency-confusion pin: a locked
+	// package is re-fetched from this repository and can never be silently
+	// re-routed. See specs/artifactory-secondary-repository.md §9.
+	Registry string `json:"registry,omitempty"`
 }
 
 // LockedWebcomponent is the fully-pinned record of one webcomponent package.
@@ -132,6 +140,10 @@ type LockedWebcomponent struct {
 	// Scope is the dependency scope: "dev" or "optional". Empty means
 	// production.
 	Scope string `json:"scope,omitempty"`
+
+	// Registry is the logical repository this package resolved from. Empty
+	// means the default GI registry. See LockedPackage.Registry.
+	Registry string `json:"registry,omitempty"`
 }
 
 // LockedJAR is the fully-pinned record of one Java JAR.
@@ -152,6 +164,14 @@ type LockedJAR struct {
 	// Scope is the dependency scope this JAR was installed under: "dev"
 	// or "optional". Empty means production.
 	Scope string `json:"scope,omitempty"`
+
+	// Source records where this JAR entry came from: "" / "registry"
+	// (resolved from registry metadata) or "manifest" (recovered from a
+	// package's bundled manifest via the dependency cross-check fallback).
+	// Informational; lets a reader see which JARs bypassed the registry's
+	// declared dependency set, and is the audit trail that makes future
+	// enforcement of manifest↔registry divergence possible.
+	Source string `json:"source,omitempty"`
 }
 
 // ─── Construction ─────────────────────────────────────────────────────────────
@@ -175,6 +195,7 @@ func FromPlan(plan *resolver.Plan, root *manifest.Manifest) *LockFile {
 				Checksum:    p.Checksum,
 				RequiredBy:  requiredBy,
 				Scope:       scopeLockString(p.Scope),
+				Registry:    p.Source,
 			})
 			continue
 		}
@@ -187,6 +208,7 @@ func FromPlan(plan *resolver.Plan, root *manifest.Manifest) *LockFile {
 			GeneroMajor: plan.GeneroVersion.MajorString(),
 			RequiredBy:  requiredBy,
 			Scope:       scopeLockString(p.Scope),
+			Registry:    p.Source,
 		})
 	}
 	sort.Slice(pkgs, func(i, j int) bool { return pkgs[i].Name < pkgs[j].Name })
@@ -215,6 +237,40 @@ func FromPlan(plan *resolver.Plan, root *manifest.Manifest) *LockFile {
 		JARs:          jars,
 		Webcomponents: wcs,
 	}
+}
+
+// AddManifestJARs appends Java dependencies recovered by the manifest
+// cross-check fallback to the lock's JAR list, marking each Source
+// "manifest". Coordinates already present (by key) are left untouched, so an
+// entry the resolver already recorded is never downgraded to manifest-sourced.
+// The list is re-sorted by key so diffs stay stable. Returns true if at least
+// one new entry was added.
+func (lf *LockFile) AddManifestJARs(deps []manifest.JavaDependency) bool {
+	existing := make(map[string]bool, len(lf.JARs))
+	for _, j := range lf.JARs {
+		existing[j.Key] = true
+	}
+	added := false
+	for _, dep := range deps {
+		if existing[dep.Key()] {
+			continue
+		}
+		lf.JARs = append(lf.JARs, LockedJAR{
+			Key:         dep.Key(),
+			GroupID:     dep.GroupID,
+			ArtifactID:  dep.ArtifactID,
+			Version:     dep.Version,
+			DownloadURL: dep.MavenURL(),
+			Checksum:    dep.Checksum,
+			Source:      "manifest",
+		})
+		existing[dep.Key()] = true
+		added = true
+	}
+	if added {
+		sort.Slice(lf.JARs, func(i, j int) bool { return lf.JARs[i].Key < lf.JARs[j].Key })
+	}
+	return added
 }
 
 // ─── Persistence ──────────────────────────────────────────────────────────────
@@ -300,7 +356,7 @@ type GeneroMismatchError struct {
 func (e *GeneroMismatchError) Error() string {
 	return fmt.Sprintf(
 		"lock file was generated with Genero %s but current runtime is %s.\n"+
-			"Run 'fglpkg install' to re-resolve for the current Genero version.",
+			"Run 'fglpkg update' to re-resolve for the current Genero version.",
 		e.Locked, e.Current,
 	)
 }

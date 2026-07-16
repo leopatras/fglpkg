@@ -1,6 +1,6 @@
 # Spec: Parallel package + JAR downloads (v1)
 
-**Status:** Draft
+**Status:** ✅ Implemented — shipped ([internal/installer/parallel.go](../internal/installer/parallel.go))
 **Date:** 2026-05-18
 **Author:** Mike Folcher
 **Tracking:** P3 #29 in [docs/market-readiness-gaps.md](../docs/market-readiness-gaps.md)

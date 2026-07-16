@@ -1,6 +1,6 @@
 # Spec: Align fglpkg with fglpkg-cli (registry URL, auth, whoami)
 
-**Status:** Draft
+**Status:** ✅ Implemented — shipped (single GI registry base, OAuth auth-code+PKCE, `whoami`)
 **Date:** 2026-05-29
 **Author:** Mike Folcher
 **Tracking:** Cross-repo alignment with [fglpkg-cli](https://github.com/4js-ai/fglpkg-cli)

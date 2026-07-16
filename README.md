@@ -43,6 +43,19 @@ sudo chmod +x /usr/local/bin/fglpkg
 copy fglpkg-windows-amd64.exe C:\tools\fglpkg.exe
 ```
 
+### macOS Gatekeeper warning
+
+If you download the macOS binary through a **browser**, macOS tags it with a quarantine
+attribute and Gatekeeper blocks it on first run — *"fglpkg cannot be opened because the developer
+cannot be verified."* Clear the quarantine flag after copying it into place:
+
+```bash
+sudo xattr -d com.apple.quarantine /usr/local/bin/fglpkg
+```
+
+Alternatively, right-click the file in Finder → **Open** once to add a one-time exception, or
+download the asset with `curl -L -O <asset-url>` (curl does not set the quarantine attribute).
+
 Add environment setup:
 
 **macOS / Linux** — add to `~/.bashrc` or `~/.zshrc`:
@@ -190,15 +203,17 @@ eval "$(fglpkg env --global)"
 | `author` | No | Author name |
 | `license` | No | License identifier (e.g., `MIT`, `Apache-2.0`) |
 | `repository` | No | Source repository URL |
-| `keywords` | No | Free-form tags that aid registry search/discovery (e.g. `["database", "utilities"]`) |
+| `keywords` | No | Free-form tags for discovery (e.g. `["database", "utilities"]`). Advisory metadata — not currently matched by `fglpkg search`. |
 | `main` | No | Primary `.42m` entry point |
 | `genero` | No | Genero BDL version constraint (e.g., `^4.0.0`) |
 | `root` | No | Base directory for package files when publishing (default `.`) |
 | `files` | No | Glob patterns for files to include in the zip (default `["*.42m", "*.42f", "*.sch"]`) |
 | `bin` | No | Command name to script path mappings (e.g., `{"migrate": "scripts/migrate.sh"}`) |
 | `docs` | No | Glob patterns for documentation files to include (e.g., `["README.md", "docs/**/*.md"]`) |
-| `dependencies.fgl` | No | BDL production package dependencies (`name` -> `version constraint`) |
+| `dependencies.fgl` | No | BDL production package dependencies. Each value is either a version-constraint string (`"^1.0.0"`) or an object pinning the source repository: `{ "version": "^1.0.0", "registry": "acme" }` (see [Secondary Package Repositories](#secondary-package-repositories-jfrog-artifactory)) |
 | `dependencies.java` | No | Java JAR production dependencies (Maven coordinates) |
+| `registries` | No | Additional package repositories (e.g. a JFrog Artifactory instance) consulted alongside the built-in GI registry. See [Secondary Package Repositories](#secondary-package-repositories-jfrog-artifactory) |
+| `defaultRegistry` | No | Name of the repository `fglpkg publish` targets when no `--registry` is given (publish-only; does not affect where packages are consumed from) |
 | `devDependencies` | No | Test / tooling deps (fgl + java), skipped with `--production` |
 | `optionalDependencies` | No | Attempted like prod, failures emit a warning instead of aborting |
 | `programs` | No | List of module names with MAIN blocks (e.g., `["PoiConvert"]`) |
@@ -210,8 +225,9 @@ eval "$(fglpkg env --global)"
 | Variable | Purpose |
 |---|---|
 | `FGLPKG_HOME` | Override default `~/.fglpkg` home |
-| `FGLPKG_REGISTRY` | Registry URL — used by `install`, `search`, `audit`, `info`, `outdated`, `whoami`, `login`, `publish`. Default: `https://service.generointelligence.ai` |
-| `FGLPKG_TOKEN` | Bearer token for the registry. Overrides stored OAuth/PAT credentials |
+| `FGLPKG_REGISTRY` | GI registry URL — used by `install`, `search`, `audit`, `info`, `outdated`, `whoami`, `login`, `publish`. Default: `https://service.generointelligence.ai` |
+| `FGLPKG_TOKEN` | Bearer token for the **GI** registry. Takes precedence over stored OAuth/PAT credentials, and cannot be cleared by `fglpkg logout` (unset it to fully log out). Does not authenticate secondary repositories |
+| `FGLPKG_PUBLISH_REGISTRY` | Name of the repository `fglpkg publish` targets when no `--registry` is given. Overrides the manifest's `defaultRegistry`. See [Secondary Package Repositories](#secondary-package-repositories-jfrog-artifactory) |
 | `FGLPKG_GENERO_VERSION` | Override Genero version detection |
 | `FGLPKG_INSTALL_CONCURRENCY` | Cap parallel downloads during install (default 4) |
 | `FGLLDPATH` | Auto-managed by `fglpkg env` (prepends, preserves existing value) |
@@ -250,10 +266,18 @@ fglpkg list                              # List installed packages
 fglpkg env                               # Print export statements (auto-detects scope)
 fglpkg env --global                      # Print exports for all global packages
 fglpkg env --gst                         # Print in Genero Studio format
-fglpkg search json                       # Search registry by keyword
+fglpkg search json                       # Search the registry (matches name/description)
 fglpkg search --all                      # List every package in the registry
 fglpkg bdl <pkg> <module> [args...]      # Run a BDL program from a package
 fglpkg bdl --list                        # List available BDL programs
+
+# Discovery & inspection
+fglpkg info <pkg>[@ver]                  # Show registry metadata for a package
+fglpkg outdated                          # List FGL deps with newer versions (CI gate)
+fglpkg audit                             # Scan installed Java JARs for CVEs (OSV.dev)
+fglpkg sbom                              # Emit a CycloneDX SBOM from fglpkg.lock
+fglpkg pack                              # Build the publishable zip without uploading
+fglpkg completion bash                   # Print shell completion script
 
 # Publishing
 fglpkg publish                           # Publish current package to registry
@@ -261,6 +285,14 @@ fglpkg publish --dry-run                 # Preview the publish calls, no network
 fglpkg publish --ci                      # Non-interactive publish (CI): needs FGLPKG_TOKEN
 fglpkg publish --private                 # Publish as private (overrides fglpkg.json visibility)
 fglpkg publish --public                  # Publish as public (overrides fglpkg.json visibility)
+fglpkg publish --changelog "notes..."    # Set this version's changelog inline (overrides CHANGELOG.md)
+
+# Secondary repositories (JFrog Artifactory) — see section below
+fglpkg registry list                     # Show configured repositories + auth status
+fglpkg login --registry acme --token …   # Sign in to a secondary repo
+fglpkg install pkg --registry acme        # Add a package, pinning its source repo
+fglpkg publish --registry acme            # Publish to a secondary repo
+fglpkg publish --registry acme --force    # Overwrite an existing variant
 
 # Authentication
 fglpkg login                             # Save registry + GitHub credentials
@@ -308,7 +340,7 @@ Publishing is **additive and reviewed**: a freshly published version is marked
 The publish flow:
 1. Builds a zip from the directory specified by `root` (or `.`), collecting files matching `files` patterns (default: `*.42m`, `*.42f`, `*.sch`) plus any declared `bin` scripts and `docs`, and SHA256s it.
 2. `POST /registry/packages` — creates the package slug on first publish (a `409` means it already exists, which is fine). New packages carry the manifest's `visibility` field. If `visibility` is omitted from `fglpkg.json`, fglpkg defaults to `"public"` — this is intentional (npm-style: public unless you opt out). To publish a private package, set `"visibility": "private"` explicitly. Visibility is set once on first publish and ignored on subsequent publishes.
-3. `POST /registry/packages/:slug/versions` — creates the version (a `409` means the version already exists; publish proceeds to add a new variant to it).
+3. `POST /registry/packages/:slug/versions` — creates the version (a `409` means the version already exists; publish proceeds to add a new variant to it). This call also carries the version's **changelog**: by default the section for the version being published is extracted from a `CHANGELOG.md` in the project root ([Keep a Changelog](https://keepachangelog.com) format, e.g. `## [1.2.0]`), or you can supply it inline with `--changelog "<text>"`. If `CHANGELOG.md` exists but has no entry for the version, publish warns and sends an empty changelog.
 4. `PUT /registry/packages/:slug/versions/:version/artifacts/:variant` — streams the zip body; the registry computes size + checksum and stores it in R2.
 5. `POST /registry/packages/:slug/versions/:version/submit` — marks the version pending for admin review.
 
@@ -363,6 +395,145 @@ registry. Publishing a second variant for an existing version is allowed and doe
 not require bumping the version. When a consumer runs `fglpkg install`, the
 resolver automatically selects the variant matching their local Genero major
 version.
+
+## Secondary Package Repositories (JFrog Artifactory)
+
+fglpkg can consume and publish **FGL/BDL packages** from one or more **JFrog
+Artifactory** repositories alongside the built-in Genero Intelligence (GI)
+registry. This lets a team keep pulling public packages from GI while hosting
+their **internal** packages in their own Artifactory. Everything is client-side —
+no GI backend involvement. (Java JARs are out of scope here; they continue to
+resolve from Maven Central.)
+
+### Configuring repositories
+
+Repositories are declared in a `registries` array, with **no secrets** — those
+stay in `~/.fglpkg/credentials.json`. The effective set is a cascade, in
+increasing precedence: the built-in GI registry → the machine-wide
+`~/.fglpkg/config.json` → the project's `fglpkg.json`. Entries merge by `name`.
+
+Put it in the project `fglpkg.json` (committed, so teammates inherit the URL on
+clone):
+
+```json
+{
+  "registries": [
+    {
+      "name": "acme",
+      "type": "artifactory",
+      "url": "https://artifactory.acme.example/artifactory",
+      "repoKey": "fgl-internal-generic",
+      "priority": 2,
+      "auth": "bearer",
+      "packages": ["acme-*"]
+    }
+  ]
+}
+```
+
+…or provision it once machine-wide in `~/.fglpkg/config.json` (same shape), so an
+ops team can set it for every project:
+
+```json
+{ "registries": [ { "name": "acme", "type": "artifactory", "url": "…", "repoKey": "…", "priority": 2, "auth": "bearer" } ] }
+```
+
+| Descriptor field | Required | Description |
+|---|---|---|
+| `name` | Yes | Logical id used in `--registry`, credentials, and dependency pins |
+| `type` | Yes | `"genero"` or `"artifactory"` |
+| `url` | Yes | Base URL (including any context path, e.g. `…/artifactory`) |
+| `repoKey` | For `artifactory` | The Artifactory **generic** repository key |
+| `priority` | Yes | Lower is tried first; must be unique. Ordering/diagnostics only — it is **not** a precedence tiebreak (see collision guard) |
+| `auth` | No | `bearer` (default) \| `basic` \| `apikey` \| `anonymous` |
+| `packages` | No | Glob allow-list (e.g. `["acme-*"]`) — names outside it are never queried against this repo |
+
+The built-in GI registry is always present as if declared `{ "name": "gi", "type": "genero", "priority": 1 }`. `FGLPKG_REGISTRY`, if set, retargets the GI URL.
+
+Inspect the effective set and login status:
+
+```bash
+fglpkg registry list
+# NAME   TYPE         PRIO  AUTH    LOGIN  URL
+# gi     genero       1     bearer  env    https://service.generointelligence.ai
+# acme   artifactory  2     bearer  yes    https://artifactory.acme.example/artifactory
+```
+
+`LOGIN` values: `yes` (credentials stored), `env` (GI authenticated by `FGLPKG_TOKEN`), `no` (none), `anon` (no auth needed).
+
+### Authentication
+
+Credentials are keyed by repository URL, so you can be logged into GI **and** any
+number of secondary repos at once — logging into one never affects another. The
+flag matches the repo's `auth` scheme:
+
+```bash
+fglpkg login --registry acme --token <access-token>          # bearer (recommended)
+fglpkg login --registry acme --user <u> --password <p|token> # basic
+fglpkg login --registry acme --api-key <key>                 # apikey
+# anonymous repos need no login
+fglpkg logout --registry acme
+```
+
+A JFrog access token works either as `bearer` (`--token`) or as the `basic`
+password. Note `FGLPKG_TOKEN` authenticates **GI only** — it does not apply to
+secondary repos.
+
+### Consuming — routing and the collision guard
+
+When you resolve dependencies, each package name is routed to the repository that
+owns it:
+
+- Found in exactly **one** repository → resolved from there; the lockfile records
+  the source (`"registry": "acme"`), so installs are reproducible.
+- Found in **more than one** repository → a **hard error**. fglpkg refuses to
+  guess (this closes the dependency-confusion hole). Disambiguate by pinning the
+  source, or by giving the repo a `packages` allow-list so the name is only ever
+  queried against one repo:
+
+```json
+"dependencies": { "fgl": { "utils": { "version": "^1.0.0", "registry": "acme" } } }
+```
+
+`fglpkg install <pkg> --registry acme` does the same in one step: it resolves the
+package from `acme` and writes that pin into `fglpkg.json`.
+
+**Transitive pins travel.** A package published to Artifactory carries its own
+dependency pins in its sidecar manifest. When you consume such a package, fglpkg
+honours the pins its author declared — so a transitive dependency resolves from
+the repository the author intended even when its name also exists elsewhere. (An
+explicit pin in *your* `fglpkg.json` always wins over a package's declared pin.)
+
+### Publishing
+
+Publish to a secondary repo with `--registry`; the build is identical to a GI
+publish, but the zip and a sidecar `fglpkg.json` are deployed directly (no
+submit/approval step):
+
+```bash
+fglpkg publish --registry acme            # deploy to acme
+fglpkg publish --registry acme --dry-run  # print the exact PUT URLs, no network
+fglpkg publish --registry acme --force    # overwrite an existing variant (guarded by default)
+```
+
+To avoid typing `--registry` every time, set a **default publish target**. It is
+resolved in decreasing precedence: `FGLPKG_PUBLISH_REGISTRY` → the project's
+`defaultRegistry` → the global `defaultRegistry` → GI:
+
+```json
+{ "defaultRegistry": "acme", "registries": [ … ] }
+```
+
+With that, a bare `fglpkg publish` deploys to `acme`; `--registry gi` still
+reaches GI on demand.
+
+### Integrity
+
+Artifactory computes and verifies SHA-256 on deploy and returns it in file
+metadata; `fglpkg install` verifies the checksum on download, exactly as with GI.
+
+For the full design and rationale, see
+[specs/artifactory-secondary-repository.md](specs/artifactory-secondary-repository.md).
 
 ## Releases
 

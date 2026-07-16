@@ -1,6 +1,6 @@
 # Spec: Push rich package metadata on publish
 
-**Status:** Draft
+**Status:** ✅ Implemented — shipped (publish sends repo/author/license/genero/deps + README/USERGUIDE)
 **Date:** 2026-06-06
 **Author:** Mike Folcher
 **Companion:** `4js-genero-intelligence/specs/registry-metadata-fglpkg-alignment.md`

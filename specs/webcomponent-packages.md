@@ -1,6 +1,6 @@
 # Spec: Webcomponent packages (v1.1 — mixed packages)
 
-**Status:** Draft
+**Status:** ✅ Implemented — shipped v2.5.0 (`8f4eb13`, 2026-06-20); mixed BDL+WC follow-up `af35901` (2026-06-30)
 **Date:** 2026-06-19 (v1) · 2026-06-25 (v1.1 — mixed packages)
 **Author:** Mike Folcher
 **Tracking:** Genero webcomponent packaging for fglpkg

@@ -1,6 +1,6 @@
 # Spec: Prepublish validation (v1)
 
-**Status:** Draft
+**Status:** ✅ Implemented — shipped ([internal/cli/publish_validation.go](../internal/cli/publish_validation.go))
 **Date:** 2026-05-14
 **Author:** Mike Folcher
 **Tracking:** P1 #16 in [docs/market-readiness-gaps.md](../docs/market-readiness-gaps.md)

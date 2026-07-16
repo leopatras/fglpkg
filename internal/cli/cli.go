@@ -14,12 +14,14 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"regexp"
 	"runtime"
 	"sort"
 	"strings"
 
+	"github.com/4js-mikefolcher/fglpkg/internal/config"
 	"github.com/4js-mikefolcher/fglpkg/internal/credentials"
 	"github.com/4js-mikefolcher/fglpkg/internal/env"
 	"github.com/4js-mikefolcher/fglpkg/internal/genero"
@@ -28,6 +30,7 @@ import (
 	"github.com/4js-mikefolcher/fglpkg/internal/lockfile"
 	"github.com/4js-mikefolcher/fglpkg/internal/manifest"
 	"github.com/4js-mikefolcher/fglpkg/internal/oauth"
+	"github.com/4js-mikefolcher/fglpkg/internal/provider"
 	"github.com/4js-mikefolcher/fglpkg/internal/registry"
 	"github.com/4js-mikefolcher/fglpkg/internal/semver"
 	"github.com/4js-mikefolcher/fglpkg/internal/workspace"
@@ -153,6 +156,8 @@ func Execute() error {
 		return cmdWhoami(args)
 	case "workspace", "ws":
 		return cmdWorkspace(args)
+	case "registry":
+		return cmdRegistry(args)
 	case "run":
 		return cmdRun(args)
 	case "bdl":
@@ -249,7 +254,10 @@ func cmdInstall(args []string) error {
 	if err != nil {
 		return err
 	}
-	inst := newInstaller(home)
+	// Best-effort manifest load so any configured registries drive resolution.
+	// The authoritative load happens later per install path.
+	regManifest, _ := manifest.Load(".")
+	inst := newInstaller(home, regManifest)
 	projectDir, _ := os.Getwd()
 
 	if isLocal {
@@ -269,7 +277,7 @@ func cmdInstall(args []string) error {
 		}
 	}
 
-	instOpts := installer.Options{Production: flags.production}
+	instOpts := installer.Options{Production: flags.production, NoManifestFallback: flags.noManifestFallback}
 
 	if len(flags.pkgs) == 0 {
 		m, err := manifest.Load(".")
@@ -301,6 +309,34 @@ func cmdInstall(args []string) error {
 	}
 	generoMajor := gv.MajorString()
 
+	// Engage multi-provider routing for the add-package resolve when repositories
+	// beyond the built-in GI registry are configured; otherwise fall back to the
+	// GI-only client. Without this, `install <pkg>` could only ever add packages
+	// from GI even though search/install-from-lock route to secondary repos.
+	globalHome, err := fglpkgHome()
+	if err != nil {
+		globalHome = home
+	}
+	rs, _, rsErr := buildRepositorySet(globalHome, m)
+	if rsErr != nil {
+		fmt.Fprintf(os.Stderr, "warning: ignoring registries config: %v\n", rsErr)
+	}
+
+	// --registry <name> disambiguates a package available from more than one
+	// repository: it restricts this resolve to the named repo and pins that
+	// choice in the manifest so subsequent installs stay deterministic.
+	if flags.registry != "" {
+		if rs == nil {
+			// Only the built-in GI registry is configured. --registry gi is a
+			// harmless no-op; any other name cannot be honoured.
+			if flags.registry != config.GIName {
+				return fmt.Errorf("--registry %q: no repository named %q is configured (add it to fglpkg.json or ~/.fglpkg/config.json)", flags.registry, flags.registry)
+			}
+		} else {
+			rs.Restrict(flags.registry)
+		}
+	}
+
 	scopeLabel := scopeDisplayName(flags.scope)
 	for _, pkg := range flags.pkgs {
 		name, version, err := parsePackageArg(pkg)
@@ -308,7 +344,12 @@ func cmdInstall(args []string) error {
 			return err
 		}
 		fmt.Printf("Resolving %s@%s (Genero %s)...\n", name, version, gv)
-		info, err := registry.Resolve(name, version, generoMajor)
+		var info *registry.PackageInfo
+		if rs != nil {
+			info, err = rs.Resolve(name, version, generoMajor)
+		} else {
+			info, err = registry.Resolve(name, version, generoMajor)
+		}
 		if err != nil {
 			return fmt.Errorf("failed to resolve %s@%s: %w", name, version, privateHint(err, name))
 		}
@@ -318,12 +359,16 @@ func cmdInstall(args []string) error {
 		if info.Name == "" {
 			info.Name = name
 		}
-		m.AddFGLDependencyScoped(info.Name, info.Version, flags.scope)
+		m.AddFGLDependencyPinned(info.Name, info.Version, flags.registry, flags.scope)
 		fmt.Printf("✓ Added %s@%s to %s [%s]\n", info.Name, info.Version, manifest.Filename, scopeLabel)
 	}
 	if err := m.Save("."); err != nil {
 		return err
 	}
+	// Rebuild the installer from the saved manifest so its routing picks up any
+	// freshly-written registry pin — otherwise a pinned (collision) package
+	// would fail the graph install, which was resolved from the pre-add manifest.
+	inst = newInstaller(home, m)
 	fmt.Println()
 	if err := runHook(m, manifest.HookPreInstall, projectDir); err != nil {
 		return err
@@ -448,12 +493,14 @@ func parseFlags(args []string) (remaining []string, local, global, force bool) {
 // (default), ScopeDev, or ScopeOptional, reflecting where newly added
 // packages should be recorded.
 type installFlags struct {
-	local      bool
-	global     bool
-	force      bool
-	production bool
-	scope      manifest.Scope
-	pkgs       []string
+	local              bool
+	global             bool
+	force              bool
+	production         bool
+	noManifestFallback bool
+	scope              manifest.Scope
+	registry           string // --registry <name>: restrict resolution to one repo and pin it
+	pkgs               []string
 }
 
 // parseInstallFlags extends parseFlags with --save-dev/-D, --save-optional/-O,
@@ -461,7 +508,12 @@ type installFlags struct {
 func parseInstallFlags(args []string) (installFlags, error) {
 	f := installFlags{scope: manifest.ScopeProd}
 	devSeen, optSeen := false, false
-	for _, a := range args {
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if val, ok := strings.CutPrefix(a, "--registry="); ok {
+			f.registry = val
+			continue
+		}
 		switch a {
 		case "--local", "-l":
 			f.local = true
@@ -471,6 +523,8 @@ func parseInstallFlags(args []string) (installFlags, error) {
 			f.force = true
 		case "--production", "--prod":
 			f.production = true
+		case "--no-manifest-fallback":
+			f.noManifestFallback = true
 		case "--save-dev", "-D":
 			devSeen = true
 			f.scope = manifest.ScopeDev
@@ -479,6 +533,12 @@ func parseInstallFlags(args []string) (installFlags, error) {
 			f.scope = manifest.ScopeOptional
 		case "--save-prod", "-P":
 			f.scope = manifest.ScopeProd
+		case "--registry":
+			if i+1 >= len(args) {
+				return f, fmt.Errorf("--registry requires a value")
+			}
+			i++
+			f.registry = args[i]
 		default:
 			f.pkgs = append(f.pkgs, a)
 		}
@@ -488,6 +548,9 @@ func parseInstallFlags(args []string) (installFlags, error) {
 	}
 	if f.production && (devSeen || optSeen) {
 		return f, fmt.Errorf("--production cannot be combined with --save-dev or --save-optional")
+	}
+	if f.registry != "" && len(f.pkgs) == 0 {
+		return f, fmt.Errorf("--registry requires a package to install (it pins that package's source repository)")
 	}
 	return f, nil
 }
@@ -499,7 +562,7 @@ func cmdRemove(args []string) error {
 	if len(pkgArgs) == 0 {
 		return fmt.Errorf("usage: fglpkg remove <package>")
 	}
-	home, _, err := resolveHome(forceLocal, forceGlobal)
+	home, isLocal, err := resolveHome(forceLocal, forceGlobal)
 	if err != nil {
 		return err
 	}
@@ -511,25 +574,54 @@ func cmdRemove(args []string) error {
 	if err := runHook(m, manifest.HookPreUninstall, projectDir); err != nil {
 		return err
 	}
-	inst := newInstaller(home)
+
+	// Update the manifest first. Pruning of installed files (below) is driven
+	// by re-resolving the *updated* manifest, so nothing is deleted until the
+	// dependency it belongs to is actually gone from the graph.
 	for _, pkg := range pkgArgs {
-		if err := inst.Remove(pkg); err != nil {
-			return fmt.Errorf("failed to remove %s: %w", pkg, err)
-		}
 		if scope := m.RemoveFGLDependency(pkg); scope != "" {
 			fmt.Printf("✓ Removed %s from %s\n", pkg, scopeDisplayName(scope))
 		} else {
 			fmt.Printf("✓ Removed %s (not declared in manifest)\n", pkg)
 		}
 	}
-	return m.Save(".")
+	if err := m.Save("."); err != nil {
+		return err
+	}
+
+	// Reconcile installed state with the shrunk manifest: rewrite the lock and
+	// (for local installs only) prune packages/JARs the graph no longer needs.
+	inst := newInstaller(home, m)
+	pruned, err := inst.ReconcileAfterRemove(m, projectDir, isLocal)
+	if err != nil {
+		fmt.Printf("warning: could not re-resolve to prune orphaned dependencies: %v\n", err)
+		fmt.Println("  The manifest was updated; run 'fglpkg install' when able to reconcile installed files.")
+		// Best-effort so the named packages at least leave disk. Only touch a
+		// local home — a global home is shared with other projects.
+		if isLocal {
+			for _, pkg := range pkgArgs {
+				_ = inst.Remove(pkg)
+			}
+		}
+		return nil
+	}
+	if !isLocal && len(pkgArgs) > 0 {
+		fmt.Println("  Note: global packages/JARs are shared across projects and were not pruned from disk.")
+	}
+	for _, p := range pruned {
+		fmt.Printf("  pruned %s\n", p)
+	}
+	return nil
 }
 
 // ─── update ───────────────────────────────────────────────────────────────────
 
 func cmdUpdate(args []string) error {
-	_, forceLocal, forceGlobal, _ := parseFlags(args)
-	home, _, err := resolveHome(forceLocal, forceGlobal)
+	flags, err := parseInstallFlags(args)
+	if err != nil {
+		return err
+	}
+	home, _, err := resolveHome(flags.local, flags.global)
 	if err != nil {
 		return err
 	}
@@ -539,7 +631,8 @@ func cmdUpdate(args []string) error {
 	}
 	projectDir, _ := os.Getwd()
 	fmt.Println("Ignoring lock file and re-resolving all dependencies...")
-	return newInstaller(home).InstallAll(m, projectDir, true)
+	instOpts := installer.Options{Production: flags.production, NoManifestFallback: flags.noManifestFallback}
+	return newInstaller(home, m).InstallAllWithOptions(m, projectDir, true, instOpts)
 }
 
 // ─── list ─────────────────────────────────────────────────────────────────────
@@ -550,7 +643,7 @@ func cmdList(args []string) error {
 	if err != nil {
 		return err
 	}
-	pkgs, err := newInstaller(home).List()
+	pkgs, err := newInstaller(home, nil).List()
 	if err != nil {
 		return err
 	}
@@ -633,6 +726,16 @@ func cmdSearch(args []string) error {
 		return err
 	}
 
+	// Multi-provider fan-out when secondary repositories are configured.
+	home, _ := fglpkgHome()
+	var m *manifest.Manifest
+	if mm, mErr := manifest.Load("."); mErr == nil {
+		m = mm
+	}
+	if rs, _, rErr := buildRepositorySet(home, m); rErr == nil && rs != nil {
+		return searchAcrossProviders(rs, term, all)
+	}
+
 	results, err := registry.Search(term)
 	if err != nil {
 		// Older registry servers reject an empty q with 400 — surface a
@@ -665,6 +768,42 @@ func cmdSearch(args []string) error {
 	return nil
 }
 
+// searchAcrossProviders fans out a search to every configured provider, tags
+// each result with its source repository, and prints a source-tagged table.
+func searchAcrossProviders(rs *provider.RepositorySet, term string, all bool) error {
+	var results []registry.SearchResult
+	for _, p := range rs.Providers() {
+		rr, err := p.Search(term)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: search in %q failed: %v\n", p.Name(), err)
+			continue
+		}
+		for i := range rr {
+			rr[i].Source = p.Name()
+		}
+		results = append(results, rr...)
+	}
+	if len(results) == 0 {
+		if all {
+			fmt.Println("No packages in any configured repository.")
+		} else {
+			fmt.Printf("No packages found matching %q\n", term)
+		}
+		return nil
+	}
+	if all {
+		fmt.Printf("All packages (%d):\n", len(results))
+	} else {
+		fmt.Printf("Results for %q:\n", term)
+	}
+	fmt.Printf("  %-28s %-12s %-14s %s\n", "NAME", "VERSION", "SOURCE", "DESCRIPTION")
+	fmt.Printf("  %-28s %-12s %-14s %s\n", "----", "-------", "------", "-----------")
+	for _, r := range results {
+		fmt.Printf("  %-28s %-12s %-14s %s\n", r.Name, r.LatestVersion, r.Source, r.Description)
+	}
+	return nil
+}
+
 // parseSearchArgs returns the keyword term plus an --all flag. Errors on
 // `search` with no args + no --all (the historical "missing keyword" error),
 // and on conflicting `search --all <term>`.
@@ -691,41 +830,329 @@ func parseSearchArgs(args []string) (term string, all bool, err error) {
 
 // ─── publish ──────────────────────────────────────────────────────────────────
 
+// isValidYesNo reports whether s begins with a "y" or "n" (case-insensitive),
+// i.e. whether it is a recognizable yes/no answer. The caller guarantees s is
+// non-empty.
+func isValidYesNo(s string) bool {
+	return strings.ToLower(string(s[0])) == "y" || strings.ToLower(string(s[0])) == "n"
+}
+
+// promptYesNo asks a yes/no question and returns the answer. A bare enter
+// accepts yesDefault (rendered as [Y/n] or [y/N]); an unrecognized answer
+// re-prompts. A closed or interrupted stdin (e.g. Ctrl+C) returns false
+// regardless of the default — a broken stream can never be affirmative consent,
+// so an interrupted confirmation must not be treated as a yes.
+func promptYesNo(prompt string, yesDefault bool) bool {
+	defaultRes := "y"
+	fullPrompt := prompt + " [Y/n]"
+	if !yesDefault {
+		defaultRes = "n"
+		fullPrompt = prompt + " [y/N]"
+	}
+
+	for {
+		fmt.Printf("%s: ", fullPrompt)
+		res, err := reader.ReadString('\n')
+		// Trim CR and LF to handle both Unix (\n) and Windows (\r\n) endings.
+		res = strings.TrimRight(res, "\r\n")
+		switch {
+		case err != nil && res == "":
+			// stdin closed or interrupted (e.g. Ctrl+C): treat as "not
+			// confirmed" and return false regardless of the default. A
+			// broken/closed stream can never be affirmative consent, so honoring
+			// a yes-default here would let an interrupted publish proceed. This
+			// also avoids re-prompting a stream that only ever returns EOF.
+			return false
+		case res == "":
+			// Bare enter accepts the default.
+			return defaultRes == "y"
+		case isValidYesNo(res):
+			return strings.ToLower(string(res[0])) == "y"
+		}
+		// Anything else was a typo at an interactive prompt: ask again.
+	}
+}
+
+// binaryToSourceExt maps each compiled binary extension to the source
+// extension it is produced from. checkForRecompile pairs a packaged binary
+// with the source it must be newer than, to warn when a binary looks stale.
+var binaryToSourceExt = map[string]string{
+	".42m": ".4gl",
+	".42f": ".per",
+	".42s": ".str",
+}
+
+// checkForRecompile warns when a compiled file about to be published looks
+// older than the source it was built from — a common "forgot to recompile"
+// mistake. Binaries come from the package zip (so nested paths are covered);
+// their sources are located anywhere in the project via a one-pass index, so
+// split src/ vs build/ layouts are handled, not just compile-in-place.
+func checkForRecompile(m *manifest.Manifest) {
+	zipData, _, err := buildPackageZip(m)
+	if err != nil {
+		return
+	}
+	entries, err := listZipEntries(zipData)
+	if err != nil {
+		return
+	}
+
+	ignore, err := loadIgnore(".")
+	if err != nil {
+		ignore = &ignoreSet{}
+	}
+	index := buildSourceIndex(ignore)
+
+	var stale []string
+	seen := make(map[string]bool)
+	for _, e := range entries {
+		binPath := e.name
+		if _, known := binaryToSourceExt[path.Ext(binPath)]; !known {
+			continue
+		}
+		binInfo, err := os.Stat(filepath.FromSlash(binPath))
+		if err != nil {
+			continue
+		}
+		binMTime := binInfo.ModTime()
+
+		sources, ok := resolveSource(binPath, index)
+		if !ok {
+			continue
+		}
+		// Compare against every plausible source: if any is newer than the
+		// binary, the binary may be stale. When the match is ambiguous this
+		// errs toward warning, which is the safer failure for a publish guard.
+		for _, src := range sources {
+			srcInfo, statErr := os.Stat(filepath.FromSlash(src))
+			if statErr != nil {
+				continue
+			}
+			if srcInfo.ModTime().After(binMTime) && !seen[src] {
+				seen[src] = true
+				stale = append(stale, src)
+				break
+			}
+		}
+	}
+
+	if len(stale) == 0 {
+		return
+	}
+	fmt.Printf("warning: %s may not have been recompiled\n", joinWithAnd(stale))
+	if !promptYesNo("Continue?", true) {
+		os.Exit(1)
+	}
+}
+
+// buildSourceIndex walks the project tree once and indexes every source file
+// (any extension appearing as a value in binaryToSourceExt) by its basename.
+// Paths are project-relative and slash-normalized so they compare cleanly
+// against zip entry names. The .fglpkg artifact dir and any files matched by
+// .fglpkgignore are skipped, so vendored/installed packages and deliberately
+// excluded files don't produce phantom source matches.
+func buildSourceIndex(ignore *ignoreSet) map[string][]string {
+	sourceExts := make(map[string]bool, len(binaryToSourceExt))
+	for _, ext := range binaryToSourceExt {
+		sourceExts[ext] = true
+	}
+
+	index := make(map[string][]string)
+	_ = filepath.Walk(".", func(p string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil // best-effort: skip unreadable subtrees
+		}
+		if info.IsDir() {
+			if isPackArtifactDir(p) {
+				return filepath.SkipDir
+			}
+			// Prune whole ignored subtrees (e.g. a "test/" rule) so their
+			// sources never enter the index.
+			if rel, relErr := filepath.Rel(".", p); relErr == nil && rel != "." {
+				if ignore.shouldExclude(filepath.ToSlash(rel), true) {
+					return filepath.SkipDir
+				}
+			}
+			return nil
+		}
+		if !sourceExts[filepath.Ext(p)] {
+			return nil
+		}
+		rel, relErr := filepath.Rel(".", p)
+		if relErr != nil {
+			rel = p
+		}
+		rel = filepath.ToSlash(rel)
+		if ignore.shouldExclude(rel, false) {
+			return nil
+		}
+		base := path.Base(rel)
+		index[base] = append(index[base], rel)
+		return nil
+	})
+	return index
+}
+
+// resolveSource picks the source file(s) most likely to have produced the
+// binary at binPath (a slash-separated, project-relative zip entry name),
+// choosing from the sources indexed by buildSourceIndex. It tries, in order:
+//  1. an exact sibling — a source at the identical relative path (compile-in-place);
+//  2. the candidate(s) sharing the longest trailing path-segment run with the
+//     binary — handles split layouts like src/… compiled to lib/…;
+//  3. a lone basename match anywhere in the tree — handles a flattened build dir.
+//
+// When several candidates tie on the best path-suffix score, all tied paths are
+// returned so the caller can compare against each. ok is false when the binary
+// extension is unknown or no source with the expected basename exists.
+func resolveSource(binPath string, index map[string][]string) (sources []string, ok bool) {
+	binExt := path.Ext(binPath)
+	sourceExt, known := binaryToSourceExt[binExt]
+	if !known {
+		return nil, false
+	}
+	wantBase := strings.TrimSuffix(path.Base(binPath), binExt) + sourceExt
+	candidates := index[wantBase]
+	if len(candidates) == 0 {
+		return nil, false
+	}
+
+	binDir := path.Dir(binPath)
+
+	// Tier 1: exact sibling path (compile-in-place). Unambiguous, so return it.
+	sibling := path.Join(binDir, wantBase)
+	for _, c := range candidates {
+		if c == sibling {
+			return []string{c}, true
+		}
+	}
+
+	// Tier 2/3: rank by longest shared trailing path segments. A single
+	// candidate naturally wins (tier 3); genuine ties are all returned.
+	bestScore := -1
+	var best []string
+	for _, c := range candidates {
+		score := commonSuffixSegments(path.Dir(c), binDir)
+		switch {
+		case score > bestScore:
+			bestScore = score
+			best = []string{c}
+		case score == bestScore:
+			best = append(best, c)
+		}
+	}
+	return best, true
+}
+
+// commonSuffixSegments counts how many trailing path segments two
+// slash-separated directory paths share. "src/com/foo" and "lib/com/foo"
+// share 2 ("com", "foo"). Empty or "." dirs contribute no segments.
+func commonSuffixSegments(a, b string) int {
+	as, bs := splitDirSegments(a), splitDirSegments(b)
+	n := 0
+	for n < len(as) && n < len(bs) && as[len(as)-1-n] == bs[len(bs)-1-n] {
+		n++
+	}
+	return n
+}
+
+// splitDirSegments splits a slash-separated directory path into its segments,
+// treating an empty path or "." as having none.
+func splitDirSegments(p string) []string {
+	if p == "" || p == "." {
+		return nil
+	}
+	return strings.Split(p, "/")
+}
+
+// joinWithAnd renders a slice as a human list: "a", "a and b",
+// "a, b, and c".
+func joinWithAnd(items []string) string {
+	switch len(items) {
+	case 0:
+		return ""
+	case 1:
+		return items[0]
+	case 2:
+		return items[0] + " and " + items[1]
+	default:
+		return strings.Join(items[:len(items)-1], ", ") + ", and " + items[len(items)-1]
+	}
+}
+
 // parsePublishFlags reads the publish flags: --dry-run/-n (preview, no
-// network), --ci (non-interactive pipeline mode), and --private/--public
-// (visibility override on first publish).
-func parsePublishFlags(args []string) (dryRun, ci bool, visibilityOverride string, err error) {
+// network), --ci (non-interactive pipeline mode), --private/--public
+// (visibility override on first publish), and --changelog <text> (inline
+// changelog for this version, overriding the auto CHANGELOG.md extraction
+// done at publish time).
+// publishFlags is the parsed flag surface of `fglpkg publish`.
+type publishFlags struct {
+	dryRun     bool
+	ci         bool
+	force      bool   // Artifactory: overwrite an existing variant
+	registry   string // target repository ("" or "gi" = GI)
+	visibility string // "private"/"public" (GI only)
+	changelog  string
+}
+
+func parsePublishFlags(args []string) (publishFlags, error) {
+	var pf publishFlags
 	var wantPrivate, wantPublic bool
-	for _, a := range args {
+	// Loop by index so --changelog/--registry can consume the following
+	// argument. Both "--flag value" and "--flag=value" forms are accepted.
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if val, ok := strings.CutPrefix(a, "--changelog="); ok {
+			pf.changelog = val
+			continue
+		}
+		if val, ok := strings.CutPrefix(a, "--registry="); ok {
+			pf.registry = val
+			continue
+		}
 		switch a {
 		case "--dry-run", "-n":
-			dryRun = true
+			pf.dryRun = true
 		case "--ci":
-			ci = true
+			pf.ci = true
+		case "--force", "-f":
+			pf.force = true
 		case "--private":
 			wantPrivate = true
 		case "--public":
 			wantPublic = true
+		case "--changelog":
+			if i+1 >= len(args) {
+				return publishFlags{}, fmt.Errorf("%s requires a value", a)
+			}
+			i++
+			pf.changelog = args[i]
+		case "--registry":
+			if i+1 >= len(args) {
+				return publishFlags{}, fmt.Errorf("%s requires a value", a)
+			}
+			i++
+			pf.registry = args[i]
 		default:
-			return false, false, "", fmt.Errorf("unexpected argument %q", a)
+			return publishFlags{}, fmt.Errorf("unexpected argument %q", a)
 		}
 	}
 	if wantPrivate && wantPublic {
-		return false, false, "", fmt.Errorf("--private and --public are mutually exclusive")
+		return publishFlags{}, fmt.Errorf("--private and --public are mutually exclusive")
 	}
 	if wantPrivate {
-		visibilityOverride = "private"
+		pf.visibility = "private"
 	} else if wantPublic {
-		visibilityOverride = "public"
+		pf.visibility = "public"
 	}
-	return dryRun, ci, visibilityOverride, nil
+	return pf, nil
 }
 
 func cmdPublish(args []string) error {
-	dryRun, ci, visibilityOverride, err := parsePublishFlags(args)
+	pf, err := parsePublishFlags(args)
 	if err != nil {
 		return err
 	}
+	dryRun, ci, visibilityOverride, changelogText := pf.dryRun, pf.ci, pf.visibility, pf.changelog
 
 	home, err := fglpkgHome()
 	if err != nil {
@@ -747,6 +1174,29 @@ func cmdPublish(args []string) error {
 		return fmt.Errorf("cannot detect Genero version: %w", err)
 	}
 	generoMajor := gv.MajorString()
+
+	// With no explicit --registry, fall back to the configured default publish
+	// target (FGLPKG_PUBLISH_REGISTRY, then the project/global defaultRegistry),
+	// so a team publishing to their own Artifactory need not pass --registry
+	// every time. An empty result keeps the historical default of publishing to
+	// GI. --registry, when given, always wins (it is already in pf.registry).
+	if pf.registry == "" {
+		pf.registry = resolveDefaultPublishRegistry(home, m)
+	}
+
+	// Publishing to a secondary (Artifactory) repository takes a distinct,
+	// direct-PUT path — no GI variant pre-check, no submit/approval step.
+	if pf.registry != "" && pf.registry != config.GIName {
+		projectDir, _ := os.Getwd()
+		if err := runHook(m, manifest.HookPrePublish, projectDir); err != nil {
+			return err
+		}
+		if err := publishToArtifactory(home, m, generoMajor, pf); err != nil {
+			return fmt.Errorf("publish failed: %w", err)
+		}
+		return runHook(m, manifest.HookPostPublish, projectDir)
+	}
+
 	if err := checkVariantNotPublished(m, generoMajor); err != nil {
 		return err
 	}
@@ -774,13 +1224,16 @@ func cmdPublish(args []string) error {
 	if dryRun {
 		fmt.Printf("DRY RUN — no network calls will be made\n\n")
 	}
+	if !ci {
+		checkForRecompile(m)
+	}
 	variant := artifactVariant(m, generoMajor)
 	fmt.Printf("Publishing %s@%s (%s) to %s...\n", m.Name, m.Version, variantDescription(variant), registryURL)
 	projectDir, _ := os.Getwd()
 	if err := runHook(m, manifest.HookPrePublish, projectDir); err != nil {
 		return err
 	}
-	if err := publishPackage(m, registryURL, generoMajor, dryRun, visibilityOverride); err != nil {
+	if err := publishPackage(m, registryURL, generoMajor, dryRun, visibilityOverride, changelogText); err != nil {
 		return fmt.Errorf("publish failed: %w", err)
 	}
 	if dryRun {
@@ -794,6 +1247,66 @@ func cmdPublish(args []string) error {
 		}
 	}
 	return runHook(m, manifest.HookPostPublish, projectDir)
+}
+
+// publishToArtifactory deploys the built package + sidecar manifest to a
+// configured Artifactory generic repository via direct PUTs (spec §10).
+func publishToArtifactory(home string, m *manifest.Manifest, generoMajor string, pf publishFlags) error {
+	reg, err := resolveRegistry(home, pf.registry)
+	if err != nil {
+		return err
+	}
+	if reg.Type != config.TypeArtifactory {
+		return fmt.Errorf("registry %q is type %q, not artifactory", reg.Name, reg.Type)
+	}
+	if pf.visibility != "" {
+		fmt.Fprintf(os.Stderr, "  note: --private/--public is ignored when publishing to Artifactory (access is governed by the repository)\n")
+	}
+
+	creds, _ := credentials.Load(home)
+	var headers map[string]string
+	if creds != nil {
+		headers = creds.AuthHeaders(reg.URL, reg.Auth)
+	}
+	if len(headers) == 0 && reg.Auth != config.AuthAnonymous {
+		return fmt.Errorf("no credentials for registry %q — run 'fglpkg login --registry %s'", reg.Name, reg.Name)
+	}
+	p := provider.NewArtifactoryProvider(reg, nil, headersApplier(headers))
+
+	zipData, checksum, err := buildPackageZip(m)
+	if err != nil {
+		return fmt.Errorf("cannot build package zip: %w", err)
+	}
+	sidecar, err := json.MarshalIndent(m.PublishCopy(), "", "  ")
+	if err != nil {
+		return fmt.Errorf("cannot serialize sidecar manifest: %w", err)
+	}
+	variant := artifactVariant(m, generoMajor)
+
+	fmt.Printf("Publishing %s@%s (%s) to %s (%s)...\n", m.Name, m.Version, variantDescription(variant), reg.Name, reg.URL)
+	if pf.dryRun {
+		fmt.Printf("DRY RUN — no network calls will be made\n")
+	} else {
+		fmt.Printf("  Package zip: %d bytes (SHA256: %s)\n", len(zipData), checksum)
+	}
+	if err := p.Publish(provider.PublishRequest{
+		Name:     m.Name,
+		Version:  m.Version,
+		Variant:  variant,
+		Zip:      zipData,
+		Checksum: checksum,
+		Manifest: append(sidecar, '\n'),
+		Force:    pf.force,
+		DryRun:   pf.dryRun,
+	}); err != nil {
+		return err
+	}
+	if pf.dryRun {
+		fmt.Printf("✓ Dry run complete for %s@%s — no changes made\n", m.Name, m.Version)
+	} else {
+		fmt.Printf("✓ Published %s@%s to %s\n", m.Name, m.Version, reg.Name)
+	}
+	return nil
 }
 
 // publishPackage drives the new /registry/* publish flow against the registry
@@ -814,7 +1327,7 @@ func cmdPublish(args []string) error {
 //     streams the zip body. Server computes size + sha256 and stores in R2.
 //  5. POST /registry/packages/:slug/versions/:version/submit — marks the
 //     version pending so an admin reviews and approves.
-func publishPackage(m *manifest.Manifest, registryURL, generoMajor string, dryRun bool, visibilityOverride string) error {
+func publishPackage(m *manifest.Manifest, registryURL, generoMajor string, dryRun bool, visibilityOverride, changelogText string) error {
 	// 1. Build the zip.
 	zipData, checksum, err := buildPackageZip(m)
 	if err != nil {
@@ -852,6 +1365,24 @@ func publishPackage(m *manifest.Manifest, registryURL, generoMajor string, dryRu
 	if err != nil {
 		return err
 	}
+
+	// Resolve the per-version changelog. An inline --changelog overrides
+	// everything; otherwise take the auto path — extract the CHANGELOG.md
+	// section matching this version. If a CHANGELOG exists but has no entry
+	// for m.Version, warn and send an empty changelog (publishing is not
+	// blocked) so the author knows to add one.
+	changelog := changelogText
+	if changelog == "" {
+		var found bool
+		changelog, found, err = collectChangelog(docRoot, m.Version)
+		if err != nil {
+			return err
+		}
+		if found && changelog == "" {
+			fmt.Printf("  ⚠ CHANGELOG found but has no entry for %s — publishing with an empty changelog\n", m.Version)
+		}
+	}
+
 	meta := registry.VersionMeta{
 		Repository:   m.Repository,
 		Author:       m.Author,
@@ -867,7 +1398,8 @@ func publishPackage(m *manifest.Manifest, registryURL, generoMajor string, dryRu
 		fmt.Printf("            body: {slug:%q, name:%q, description:%q, visibility:%q}\n",
 			slug, m.Name, m.Description, visibility)
 		fmt.Printf("  [dry-run] would POST   %s/registry/packages/%s/versions\n", registryURL, slug)
-		fmt.Printf("            body: {version:%q, changelog:\"\"}\n", m.Version)
+		fmt.Printf("            body: {version:%q, changelog:%s}\n",
+			m.Version, docSizeLabel(changelog, changelogTruncationMarker))
 		fmt.Printf("            metadata:\n")
 		fmt.Printf("              repository:   %s\n", dryRunScalar(meta.Repository))
 		fmt.Printf("              author:       %s\n", dryRunScalar(meta.Author))
@@ -894,7 +1426,7 @@ func publishPackage(m *manifest.Manifest, registryURL, generoMajor string, dryRu
 	// 3. Create version. 409 (already exists) is fine — caller is adding
 	//    a new variant to an existing version.
 	fmt.Println("  → POST   /registry/packages/" + slug + "/versions")
-	if err := registry.PublishCreateVersion(slug, m.Version, "", nil, meta); err != nil {
+	if err := registry.PublishCreateVersion(slug, m.Version, changelog, nil, meta); err != nil {
 		if !errors.Is(err, registry.ErrVersionExists) {
 			return err
 		}
@@ -922,14 +1454,21 @@ func dryRunScalar(v string) string {
 	return v
 }
 
-// docSizeLabel renders a README/USERGUIDE body for the dry-run preview as a
-// human size, "(none)" when empty, and flags "(truncated)" when the cap
-// marker was appended.
+// docSizeLabel renders a README/USERGUIDE/changelog body for the dry-run
+// preview as a human size, "(none)" when empty, and flags "(truncated)" when
+// the cap marker was appended. Sub-kilobyte content is shown in bytes so a
+// short-but-present body reads as e.g. "48 B" rather than a misleading
+// "0.0 KB".
 func docSizeLabel(content, marker string) string {
 	if content == "" {
 		return "(none)"
 	}
-	label := fmt.Sprintf("%.1f KB", float64(len(content))/1024)
+	var label string
+	if n := len(content); n < 1024 {
+		label = fmt.Sprintf("%d B", n)
+	} else {
+		label = fmt.Sprintf("%.1f KB", float64(n)/1024)
+	}
 	if strings.HasSuffix(content, marker) {
 		label += " (truncated)"
 	}
@@ -965,79 +1504,93 @@ func variantDescription(variant string) string {
 }
 
 func buildPackageZip(m *manifest.Manifest) ([]byte, string, error) {
-	var buf bytes.Buffer
-	h := sha256.New()
-	zw := zip.NewWriter(io.MultiWriter(&buf, h))
+	// Package by staging the exact archive layout in a throwaway temp
+	// directory and zipping that — the publisher's source tree is never
+	// written to. See specs/import-root.md.
+	stageDir, err := os.MkdirTemp("", "fglpkg-pack-")
+	if err != nil {
+		return nil, "", fmt.Errorf("cannot create staging directory: %w", err)
+	}
+	defer os.RemoveAll(stageDir)
 
+	if err := stagePackage(stageDir, m); err != nil {
+		return nil, "", err
+	}
+	return zipStageDir(stageDir)
+}
+
+// stagePackage materializes the full publishable layout under stageDir:
+// rebased BDL/bin files, webcomponents (with their "webcomponents/" strip),
+// docs at the archive root, explicit include files folded into the root by
+// basename, and the publish-safe manifest.
+func stagePackage(stageDir string, m *manifest.Manifest) error {
 	// Load .fglpkgignore from the project root (current directory). The
-	// manifest field is never excluded; everything else can be filtered.
+	// manifest is never excluded; everything else can be filtered.
 	ignore, err := loadIgnore(".")
 	if err != nil {
-		return nil, "", fmt.Errorf("cannot read %s: %w", ignoreFilename, err)
+		return fmt.Errorf("cannot read %s: %w", ignoreFilename, err)
 	}
 
-	added := make(map[string]bool)
+	// staged maps an archive path to the source it came from, so a second
+	// distinct source claiming the same path is reported as a collision
+	// (while the same source matched twice is a harmless no-op).
+	staged := make(map[string]string)
 
-	// Mixed packages run BOTH walkers — BDL files go in at project-relative
-	// paths; webcomponents go in at <COMPONENTTYPE>/<file> with the
-	// "webcomponents/" prefix stripped. A pure-WC manifest skips the BDL
-	// walk (HasBDLContent returns false); a pure-BDL manifest skips the
-	// webcomponent walk (HasWebcomponents returns false).
+	// include entries are folded in explicitly (below) and skipped by the
+	// BDL walk so they are not also picked up at a rebased path.
+	includeSet := make(map[string]bool)
+	for _, inc := range m.Include {
+		includeSet[filepath.Clean(inc)] = true
+	}
+
+	// Mixed packages run BOTH walkers. A pure-WC manifest skips the BDL walk
+	// (HasBDLContent returns false); a pure-BDL manifest skips the webcomponent
+	// walk (HasWebcomponents returns false).
 	if m.HasBDLContent() || !m.HasWebcomponents() {
-		if err := collectBDLFiles(zw, m, ignore, added); err != nil {
-			return nil, "", err
+		if err := stageBDLFiles(stageDir, m, ignore, staged, includeSet); err != nil {
+			return err
 		}
 	}
 	if m.HasWebcomponents() {
-		if err := collectWebcomponentFiles(zw, m, ignore, added); err != nil {
-			return nil, "", err
+		if err := stageWebcomponentFiles(stageDir, m, ignore, staged); err != nil {
+			return err
 		}
+	}
+	if err := stageDocFiles(stageDir, m, ignore, staged); err != nil {
+		return err
+	}
+	if err := stageIncludeFiles(stageDir, m, staged); err != nil {
+		return err
 	}
 
-	// Include doc files matching the docs glob patterns (kind-agnostic).
-	if err := addDocFilesToZip(zw, m, ignore, added); err != nil {
-		return nil, "", err
+	// Always write the manifest last, using a publish-safe copy so the shipped
+	// fglpkg.json omits devDependencies and reflects the post-strip layout.
+	// This is authoritative — it overwrites any file already staged at
+	// fglpkg.json rather than colliding.
+	mfData, err := json.MarshalIndent(m.PublishCopy(), "", "  ")
+	if err != nil {
+		return fmt.Errorf("cannot serialize publishable %s: %w", manifest.Filename, err)
 	}
-
-	// Always include the manifest, but use a publish-safe copy so the
-	// shipped fglpkg.json does not advertise devDependencies.
-	if !added[manifest.Filename] {
-		mfData, err := json.MarshalIndent(m.PublishCopy(), "", "  ")
-		if err != nil {
-			return nil, "", fmt.Errorf("cannot serialize publishable %s: %w", manifest.Filename, err)
-		}
-		fw, err := zw.Create(manifest.Filename)
-		if err != nil {
-			return nil, "", fmt.Errorf("cannot add %s to zip: %w", manifest.Filename, err)
-		}
-		if _, err := fw.Write(append(mfData, '\n')); err != nil {
-			return nil, "", fmt.Errorf("cannot write %s to zip: %w", manifest.Filename, err)
-		}
+	if err := os.WriteFile(filepath.Join(stageDir, manifest.Filename), append(mfData, '\n'), 0o644); err != nil {
+		return fmt.Errorf("cannot stage %s: %w", manifest.Filename, err)
 	}
-
-	if err := zw.Close(); err != nil {
-		return nil, "", err
-	}
-	return buf.Bytes(), hex.EncodeToString(h.Sum(nil)), nil
+	return nil
 }
 
-// collectBDLFiles walks the BDL package source tree, applying the manifest's
-// `files` patterns (defaulting to *.42m/*.42f/*.sch), and includes declared
-// `bin` scripts. The walked tree is m.Root (default ".").
-func collectBDLFiles(zw *zip.Writer, m *manifest.Manifest, ignore *ignoreSet, added map[string]bool) error {
-	// Determine the root directory for package files.
+// stageBDLFiles walks the BDL source tree (m.Root, default "."), applying the
+// manifest's `files` patterns (defaulting to *.42m/*.42f/*.sch) and declared
+// `bin` scripts, and stages each match at its path rebased under importRoot.
+// Files listed in `include` are skipped here — they are folded in separately.
+func stageBDLFiles(stageDir string, m *manifest.Manifest, ignore *ignoreSet, staged map[string]string, includeSet map[string]bool) error {
 	root := m.Root
 	if root == "" {
 		root = "."
 	}
-
-	// Use manifest's files list if specified, otherwise use defaults.
 	patterns := m.Files
 	if len(patterns) == 0 {
 		patterns = []string{"*.42m", "*.42f", "*.sch"}
 	}
 
-	// Walk the root directory tree and collect files matching the patterns.
 	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
@@ -1051,23 +1604,24 @@ func collectBDLFiles(zw *zip.Writer, m *manifest.Manifest, ignore *ignoreSet, ad
 		base := filepath.Base(path)
 		for _, pattern := range patterns {
 			matched, _ := filepath.Match(pattern, base)
-			if matched && !added[path] {
-				// Keep the path relative to the project directory (not
-				// root) so the full directory structure is preserved in
-				// the zip.  When extracted into ~/.fglpkg/packages/<name>/,
-				// files like com/fourjs/poiapi/Module.42m stay intact.
-				relPath, relErr := filepath.Rel(".", path)
-				if relErr != nil {
-					relPath = path
-				}
-				if ignore.shouldExclude(relPath, false) {
-					continue
-				}
-				added[path] = true
-				if err := addFileToZip(zw, path, relPath); err != nil {
-					return fmt.Errorf("cannot add %s to zip: %w", path, err)
-				}
+			if !matched {
+				continue
 			}
+			relPath, relErr := filepath.Rel(".", path)
+			if relErr != nil {
+				relPath = path
+			}
+			if includeSet[filepath.Clean(relPath)] {
+				return nil // folded in explicitly at the archive root
+			}
+			if ignore.shouldExclude(relPath, false) {
+				return nil
+			}
+			archivePath, err := stagePathFor(m.ImportRoot, relPath)
+			if err != nil {
+				return err
+			}
+			return stageFile(stageDir, archivePath, path, staged)
 		}
 		return nil
 	})
@@ -1075,14 +1629,10 @@ func collectBDLFiles(zw *zip.Writer, m *manifest.Manifest, ignore *ignoreSet, ad
 		return fmt.Errorf("error walking root %q: %w", root, err)
 	}
 
-	// Include bin script files so they are present in the installed package.
-	// Bin scripts named in the manifest take precedence over .fglpkgignore —
-	// dropping a declared `bin` script would silently break the package.
+	// Bin scripts are always shipped, even if .fglpkgignore would exclude them
+	// — dropping a declared `bin` script would silently break the package.
 	for _, scriptPath := range m.BinFiles() {
 		fullPath := filepath.Join(root, scriptPath)
-		if added[fullPath] {
-			continue
-		}
 		info, err := os.Stat(fullPath)
 		if err != nil {
 			return fmt.Errorf("bin script %q not found: %w", scriptPath, err)
@@ -1094,20 +1644,22 @@ func collectBDLFiles(zw *zip.Writer, m *manifest.Manifest, ignore *ignoreSet, ad
 		if relErr != nil {
 			relPath = fullPath
 		}
-		if err := addFileToZip(zw, fullPath, relPath); err != nil {
-			return fmt.Errorf("cannot add bin script %s to zip: %w", scriptPath, err)
+		archivePath, err := stagePathFor(m.ImportRoot, relPath)
+		if err != nil {
+			return err
 		}
-		added[fullPath] = true
+		if err := stageFile(stageDir, archivePath, fullPath, staged); err != nil {
+			return err
+		}
 	}
 	return nil
 }
 
-// collectWebcomponentFiles walks each declared webcomponents/<COMPONENTTYPE>/
-// directory and adds its contents to the zip with the leading "webcomponents/"
-// prefix stripped — so a source file at webcomponents/3DChart/3DChart.html
-// is stored in the zip as 3DChart/3DChart.html. Each declared COMPONENTTYPE
-// must have a directory and a <COMPONENTTYPE>.html entry point.
-func collectWebcomponentFiles(zw *zip.Writer, m *manifest.Manifest, ignore *ignoreSet, added map[string]bool) error {
+// stageWebcomponentFiles stages each declared webcomponents/<COMPONENTTYPE>/
+// tree with the leading "webcomponents/" prefix stripped — so a source file at
+// webcomponents/3DChart/3DChart.html is stored as 3DChart/3DChart.html. Each
+// declared COMPONENTTYPE must have a directory and a <COMPONENTTYPE>.html entry.
+func stageWebcomponentFiles(stageDir string, m *manifest.Manifest, ignore *ignoreSet, staged map[string]string) error {
 	for _, name := range m.Webcomponents {
 		srcDir := filepath.Join("webcomponents", name)
 		info, err := os.Stat(srcDir)
@@ -1127,9 +1679,6 @@ func collectWebcomponentFiles(zw *zip.Writer, m *manifest.Manifest, ignore *igno
 			if info.IsDir() {
 				return nil
 			}
-			if added[path] {
-				return nil
-			}
 			relPath, relErr := filepath.Rel(".", path)
 			if relErr != nil {
 				relPath = path
@@ -1137,20 +1686,14 @@ func collectWebcomponentFiles(zw *zip.Writer, m *manifest.Manifest, ignore *igno
 			if ignore.shouldExclude(relPath, false) {
 				return nil
 			}
-			// Strip the leading "webcomponents/" so the in-zip path is
+			// Strip the leading "webcomponents/" so the archive path is
 			// <COMPONENTTYPE>/<file> — matching the layout the installer
 			// extracts directly into .fglpkg/webcomponents/.
 			zipPath, relErr := filepath.Rel("webcomponents", relPath)
 			if relErr != nil {
-				return fmt.Errorf("cannot compute zip path for %s: %w", relPath, relErr)
+				return fmt.Errorf("cannot compute archive path for %s: %w", relPath, relErr)
 			}
-			// Zip paths use forward slashes regardless of host OS.
-			zipPath = filepath.ToSlash(zipPath)
-			if err := addFileToZip(zw, path, zipPath); err != nil {
-				return fmt.Errorf("cannot add %s to zip: %w", path, err)
-			}
-			added[path] = true
-			return nil
+			return stageFile(stageDir, filepath.ToSlash(zipPath), path, staged)
 		})
 		if err != nil {
 			return fmt.Errorf("error walking webcomponent %q: %w", name, err)
@@ -1159,10 +1702,9 @@ func collectWebcomponentFiles(zw *zip.Writer, m *manifest.Manifest, ignore *igno
 	return nil
 }
 
-// addDocFilesToZip adds files matching the manifest's Docs globs at their
-// project-relative paths (no prefix stripping; docs live at the zip root).
-// Kind-agnostic — applies to both BDL and webcomponent packages.
-func addDocFilesToZip(zw *zip.Writer, m *manifest.Manifest, ignore *ignoreSet, added map[string]bool) error {
+// stageDocFiles stages files matching the manifest's Docs globs at their
+// project-relative path (no rebasing; docs live at the archive root).
+func stageDocFiles(stageDir string, m *manifest.Manifest, ignore *ignoreSet, staged map[string]string) error {
 	if len(m.Docs) == 0 {
 		return nil
 	}
@@ -1176,9 +1718,6 @@ func addDocFilesToZip(zw *zip.Writer, m *manifest.Manifest, ignore *ignoreSet, a
 			}
 			return nil
 		}
-		if added[path] {
-			return nil
-		}
 		relPath, relErr := filepath.Rel(".", path)
 		if relErr != nil {
 			relPath = path
@@ -1188,15 +1727,134 @@ func addDocFilesToZip(zw *zip.Writer, m *manifest.Manifest, ignore *ignoreSet, a
 				if ignore.shouldExclude(relPath, false) {
 					break
 				}
-				if err := addFileToZip(zw, path, relPath); err != nil {
-					return fmt.Errorf("cannot add doc file %s to zip: %w", path, err)
+				if err := stageFile(stageDir, relPath, path, staged); err != nil {
+					return err
 				}
-				added[path] = true
 				break
 			}
 		}
 		return nil
 	})
+}
+
+// stageIncludeFiles folds each `include` entry into the archive root under its
+// basename ("copy into the top of importRoot"). A basename that collides with
+// another staged file is reported by stageFile.
+func stageIncludeFiles(stageDir string, m *manifest.Manifest, staged map[string]string) error {
+	for _, inc := range m.Include {
+		info, err := os.Stat(inc)
+		if err != nil {
+			return fmt.Errorf("include %q not found: %w", inc, err)
+		}
+		if info.IsDir() {
+			return fmt.Errorf("include %q is a directory, not a file", inc)
+		}
+		if err := stageFile(stageDir, filepath.Base(inc), inc, staged); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// stagePathFor returns the archive path for a packaged file, rebased under
+// importRoot when set. It errors if the file lies outside importRoot (which
+// would otherwise produce a "../" escape) — the caller must fix root/importRoot
+// or fold the file in via `include`.
+func stagePathFor(importRoot, relPath string) (string, error) {
+	base := importRoot
+	if base == "" {
+		base = "."
+	}
+	rel, err := filepath.Rel(base, relPath)
+	if err != nil {
+		return "", fmt.Errorf("cannot place %q under importRoot %q: %w", relPath, importRoot, err)
+	}
+	rel = filepath.ToSlash(rel)
+	if rel == ".." || strings.HasPrefix(rel, "../") {
+		return "", fmt.Errorf("file %q is outside importRoot %q — fix root/importRoot/files or add it to include", relPath, importRoot)
+	}
+	return rel, nil
+}
+
+// stageFile copies srcDiskPath into stageDir at archivePath, creating parent
+// directories. Staging two distinct sources at the same archive path is a
+// collision (hard error); staging the same source twice is a no-op.
+func stageFile(stageDir, archivePath, srcDiskPath string, staged map[string]string) error {
+	archivePath = filepath.ToSlash(archivePath)
+	if prev, ok := staged[archivePath]; ok {
+		if filepath.Clean(prev) == filepath.Clean(srcDiskPath) {
+			return nil
+		}
+		return fmt.Errorf("archive path %q is claimed by both %q and %q", archivePath, prev, srcDiskPath)
+	}
+	dest := filepath.Join(stageDir, filepath.FromSlash(archivePath))
+	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+		return err
+	}
+	if err := copyFile(srcDiskPath, dest); err != nil {
+		return fmt.Errorf("cannot stage %s: %w", srcDiskPath, err)
+	}
+	staged[archivePath] = srcDiskPath
+	return nil
+}
+
+// copyFile copies the contents of src into dst (created/truncated).
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		return err
+	}
+	return out.Close()
+}
+
+// zipStageDir walks the staged tree, adds every file to a deterministic zip in
+// sorted archive-path order, and returns the zip bytes and their SHA256.
+// Entries are written with zip.Writer.Create (constant metadata) so the archive
+// is reproducible — do NOT switch to a FileInfo-derived header, which would
+// stamp the staged copies' mtimes into the archive.
+func zipStageDir(stageDir string) ([]byte, string, error) {
+	type stagedEntry struct{ archivePath, diskPath string }
+	var entries []stagedEntry
+	err := filepath.Walk(stageDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			return nil
+		}
+		rel, err := filepath.Rel(stageDir, path)
+		if err != nil {
+			return err
+		}
+		entries = append(entries, stagedEntry{filepath.ToSlash(rel), path})
+		return nil
+	})
+	if err != nil {
+		return nil, "", fmt.Errorf("cannot read staging directory: %w", err)
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].archivePath < entries[j].archivePath })
+
+	var buf bytes.Buffer
+	h := sha256.New()
+	zw := zip.NewWriter(io.MultiWriter(&buf, h))
+	for _, e := range entries {
+		if err := addFileToZip(zw, e.diskPath, e.archivePath); err != nil {
+			return nil, "", fmt.Errorf("cannot add %s to zip: %w", e.archivePath, err)
+		}
+	}
+	if err := zw.Close(); err != nil {
+		return nil, "", err
+	}
+	return buf.Bytes(), hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // isPackArtifactDir reports whether a directory should never appear in
@@ -1414,9 +2072,8 @@ func cmdLogin(args []string) error {
 	if err != nil {
 		return err
 	}
-	registryURL := defaultRegistry()
 
-	pat, err := parseLoginArgs(args)
+	la, err := parseLoginArgs(args)
 	if err != nil {
 		return err
 	}
@@ -1426,7 +2083,22 @@ func cmdLogin(args []string) error {
 		return err
 	}
 
-	if pat != "" {
+	// A --registry naming a non-GI (Artifactory) repository stores credentials
+	// per its configured auth scheme, keyed by the repo URL.
+	if la.registry != "" && la.registry != config.GIName {
+		return loginToRegistry(home, creds, la)
+	}
+
+	registryURL := defaultRegistry()
+	// FGLPKG_TOKEN is resolved ahead of stored credentials, so a login to GI has
+	// no visible effect until the env var is unset. Warn rather than silently
+	// storing credentials the user won't see take effect.
+	if credentials.ConsumerEnvBearer() != "" {
+		fmt.Fprintln(os.Stderr, "  Warning: FGLPKG_TOKEN is set and overrides stored credentials;")
+		fmt.Fprintln(os.Stderr, "           this login will not take effect until you unset FGLPKG_TOKEN.")
+	}
+	if la.token != "" {
+		pat := la.token
 		if !strings.HasPrefix(pat, "gpr_") {
 			fmt.Fprintln(os.Stderr, "  Warning: PAT does not start with 'gpr_' — storing anyway.")
 		}
@@ -1469,23 +2141,112 @@ func cmdLogin(args []string) error {
 	return nil
 }
 
-// parseLoginArgs reads the (very small) flag surface of `fglpkg login`.
-func parseLoginArgs(args []string) (pat string, err error) {
+// loginToRegistry stores credentials for a configured (non-GI) repository
+// according to its auth scheme, keyed by the repository URL.
+func loginToRegistry(home string, creds *credentials.File, la loginArgs) error {
+	reg, err := resolveRegistry(home, la.registry)
+	if err != nil {
+		return err
+	}
+	switch reg.Auth {
+	case config.AuthBearer:
+		if la.token == "" {
+			return fmt.Errorf("registry %q uses bearer auth; pass --token <access-token>", reg.Name)
+		}
+		creds.Set(reg.URL, la.token, "")
+	case config.AuthBasic:
+		if la.user == "" || la.password == "" {
+			return fmt.Errorf("registry %q uses basic auth; pass --user <u> --password <p|token>", reg.Name)
+		}
+		creds.SetBasic(reg.URL, la.user, la.password)
+	case config.AuthAPIKey:
+		if la.apiKey == "" {
+			return fmt.Errorf("registry %q uses apikey auth; pass --api-key <key>", reg.Name)
+		}
+		creds.SetAPIKey(reg.URL, la.apiKey)
+	case config.AuthAnonymous:
+		fmt.Printf("Registry %q uses anonymous access — no login needed.\n", reg.Name)
+		return nil
+	default:
+		return fmt.Errorf("registry %q has unknown auth scheme %q", reg.Name, reg.Auth)
+	}
+	if err := creds.Save(home); err != nil {
+		return err
+	}
+	fmt.Printf("✓ Credentials saved for registry %q (%s, %s auth)\n", reg.Name, reg.URL, reg.Auth)
+	return nil
+}
+
+// resolveRegistry finds a configured registry descriptor by logical name,
+// consulting the built-in GI entry, the global config, and the project manifest.
+func resolveRegistry(home, name string) (config.Registry, error) {
+	var projRegs []config.Registry
+	if m, err := manifest.Load("."); err == nil {
+		projRegs = m.Registries
+	}
+	regs, err := config.Load(home, os.Getenv("FGLPKG_REGISTRY"), projRegs)
+	if err != nil {
+		return config.Registry{}, err
+	}
+	r, ok := config.Find(regs, name)
+	if !ok {
+		return config.Registry{}, fmt.Errorf(
+			"registry %q is not configured (add it to fglpkg.json or ~/.fglpkg/config.json)", name)
+	}
+	return r, nil
+}
+
+// loginArgs is the parsed flag surface of `fglpkg login`.
+type loginArgs struct {
+	registry string // --registry <name>; "" or "gi" = the default GI registry
+	token    string // --token: GI PAT, or an Artifactory bearer access token
+	user     string // --user: Artifactory basic username
+	password string // --password: Artifactory basic secret (password or token)
+	apiKey   string // --api-key: Artifactory API key
+}
+
+// parseLoginArgs reads the flag surface of `fglpkg login`/`logout`.
+func parseLoginArgs(args []string) (la loginArgs, err error) {
 	i := 0
 	for i < len(args) {
 		a := args[i]
-		switch a {
-		case "--token":
+		need := func() (string, error) {
 			if i+1 >= len(args) {
-				return "", fmt.Errorf("--token requires a value")
+				return "", fmt.Errorf("%s requires a value", a)
 			}
-			pat = strings.TrimSpace(args[i+1])
+			return strings.TrimSpace(args[i+1]), nil
+		}
+		switch a {
+		case "--registry":
+			if la.registry, err = need(); err != nil {
+				return loginArgs{}, err
+			}
+			i += 2
+		case "--token":
+			if la.token, err = need(); err != nil {
+				return loginArgs{}, err
+			}
+			i += 2
+		case "--user":
+			if la.user, err = need(); err != nil {
+				return loginArgs{}, err
+			}
+			i += 2
+		case "--password":
+			if la.password, err = need(); err != nil {
+				return loginArgs{}, err
+			}
+			i += 2
+		case "--api-key":
+			if la.apiKey, err = need(); err != nil {
+				return loginArgs{}, err
+			}
 			i += 2
 		default:
-			return "", fmt.Errorf("unknown argument %q\nusage: fglpkg login [--token <PAT>]", a)
+			return loginArgs{}, fmt.Errorf("unknown argument %q\nusage: fglpkg login [--registry <name>] [--token <PAT>] [--user <u> --password <p>] [--api-key <k>]", a)
 		}
 	}
-	return pat, nil
+	return la, nil
 }
 
 // whoamiSubject returns a one-line subject for "Logged in as …" messages.
@@ -1509,18 +2270,40 @@ func whoamiSubject(w whoamiResult) string {
 
 // ─── logout ───────────────────────────────────────────────────────────────────
 
-func cmdLogout(_ []string) error {
+func cmdLogout(args []string) error {
 	home, err := fglpkgHome()
 	if err != nil {
 		return err
 	}
-	registryURL := defaultRegistry()
+	la, err := parseLoginArgs(args)
+	if err != nil {
+		return err
+	}
 	creds, err := credentials.Load(home)
 	if err != nil {
 		return err
 	}
+	registryURL := defaultRegistry()
+	isGI := la.registry == "" || la.registry == config.GIName
+	if !isGI {
+		reg, err := resolveRegistry(home, la.registry)
+		if err != nil {
+			return err
+		}
+		registryURL = reg.URL
+	}
+	// FGLPKG_TOKEN authenticates GI ahead of stored credentials and cannot be
+	// removed by fglpkg (it lives in the environment). Warn so the user isn't
+	// surprised that whoami still works after logging out.
+	envNote := func() {
+		if isGI && credentials.ConsumerEnvBearer() != "" {
+			fmt.Fprintln(os.Stderr, "  Note: FGLPKG_TOKEN is set in your environment and still authenticates you.")
+			fmt.Fprintln(os.Stderr, "        Unset FGLPKG_TOKEN to fully log out.")
+		}
+	}
 	if _, ok := creds.Get(registryURL); !ok {
 		fmt.Printf("Not logged in to %s\n", registryURL)
+		envNote()
 		return nil
 	}
 	creds.Delete(registryURL)
@@ -1528,6 +2311,7 @@ func cmdLogout(_ []string) error {
 		return err
 	}
 	fmt.Printf("✓ Logged out from %s\n", registryURL)
+	envNote()
 	return nil
 }
 
@@ -1552,6 +2336,13 @@ func cmdWhoami(_ []string) error {
 	}
 	fmt.Printf("Registry: %s\n", registryURL)
 	fmt.Printf("User:     %s\n", whoamiSubject(who))
+	// Report where the active credential came from — the env var overrides
+	// stored login, which is why logout/login can appear to have no effect.
+	if credentials.ConsumerEnvBearer() != "" {
+		fmt.Println("Auth:     FGLPKG_TOKEN (environment variable)")
+	} else {
+		fmt.Println("Auth:     stored login (~/.fglpkg/credentials.json)")
+	}
 	if who.Partner != nil {
 		fmt.Printf("Partner:  %s\n", who.Partner.Name)
 	} else {
@@ -1571,6 +2362,62 @@ func parseOwnerRepo(s string) (owner, repo string, err error) {
 		return "", "", fmt.Errorf("expected owner/repo format, got %q", s)
 	}
 	return parts[0], parts[1], nil
+}
+
+// ─── registry ───────────────────────────────────────────────────────────────
+
+func cmdRegistry(args []string) error {
+	if len(args) == 0 || args[0] == "list" {
+		return cmdRegistryList()
+	}
+	return fmt.Errorf("unknown registry subcommand %q\nusage: fglpkg registry list", args[0])
+}
+
+func cmdRegistryList() error {
+	home, err := fglpkgHome()
+	if err != nil {
+		return err
+	}
+	var projRegs []config.Registry
+	if m, err := manifest.Load("."); err == nil {
+		projRegs = m.Registries
+	}
+	regs, err := config.Load(home, os.Getenv("FGLPKG_REGISTRY"), projRegs)
+	if err != nil {
+		return err
+	}
+	creds, _ := credentials.Load(home)
+
+	fmt.Printf("%-16s %-12s %-4s %-9s %-6s %s\n", "NAME", "TYPE", "PRIO", "AUTH", "LOGIN", "URL")
+	for _, r := range regs {
+		fmt.Printf("%-16s %-12s %-4d %-9s %-6s %s\n",
+			r.Name, r.Type, r.Priority, r.Auth, registryLoginStatus(creds, r), r.URL)
+	}
+	return nil
+}
+
+// registryLoginStatus reports whether usable credentials exist for a registry.
+func registryLoginStatus(creds *credentials.File, r config.Registry) string {
+	if r.Auth == config.AuthAnonymous {
+		return "anon"
+	}
+	// FGLPKG_TOKEN is the GI/consumer bearer honoured first by ActiveBearer, so
+	// a genero registry is authenticated by it even with no stored credentials.
+	// It does not apply to Artifactory repos (those auth via stored headers).
+	if r.Type == config.TypeGenero && credentials.ConsumerEnvBearer() != "" {
+		return "env"
+	}
+	if creds == nil {
+		return "no"
+	}
+	if len(creds.AuthHeaders(r.URL, r.Auth)) > 0 {
+		return "yes"
+	}
+	// GI bearer may be OAuth, which AuthHeaders does not cover.
+	if e, ok := creds.Get(r.URL); ok && (e.OAuth != nil || e.Pat != "" || e.APIKey != "") {
+		return "yes"
+	}
+	return "no"
 }
 
 // ─── workspace ────────────────────────────────────────────────────────────────
@@ -2117,9 +2964,12 @@ Run 'fglpkg <command> --help' for command-specific options.
 
 ENVIRONMENT:
   FGLPKG_HOME              Override ~/.fglpkg
-  FGLPKG_REGISTRY          Registry URL for install/search/audit/whoami/publish.
+  FGLPKG_REGISTRY          GI registry URL for install/search/audit/whoami/publish.
                            Default: https://service.generointelligence.ai
-  FGLPKG_TOKEN             Bearer token for the registry (overrides stored OAuth)
+  FGLPKG_TOKEN             Bearer token for the GI registry. Takes precedence over
+                           stored login; cannot be cleared by 'fglpkg logout'.
+  FGLPKG_PUBLISH_REGISTRY  Name of the repository 'fglpkg publish' targets when no
+                           --registry is given (overrides fglpkg.json defaultRegistry)
   FGLPKG_GENERO_VERSION    Override Genero version detection
   FGLPKG_INSTALL_CONCURRENCY  Cap parallel downloads during install (default 4)
 
@@ -2149,7 +2999,7 @@ func fglpkgHome() (string, error) {
 	return filepath.Join(home, ".fglpkg"), nil
 }
 
-func newInstaller(home string) *installer.Installer {
+func newInstaller(home string, m *manifest.Manifest) *installer.Installer {
 	// Always look up credentials from the global home directory, even when
 	// installing to a local project directory (--local).
 	globalHome, err := fglpkgHome()
@@ -2159,7 +3009,82 @@ func newInstaller(home string) *installer.Installer {
 	registryURL := defaultRegistry()
 	githubToken := credentials.GitHubTokenFor(globalHome, registryURL)
 	registryToken, _ := credentials.ActiveBearer(context.Background(), globalHome, registryURL, oauth.Refresh)
-	return installer.New(home, githubToken, registryToken)
+	inst := installer.New(home, githubToken, registryToken)
+
+	// Engage multi-provider routing only when repositories beyond the built-in
+	// GI registry are configured — otherwise the single-registry path stays
+	// byte-identical (no Source stamped in the lockfile).
+	if rs, repoAuth, err := buildRepositorySet(globalHome, m); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: ignoring registries config: %v\n", err)
+	} else if rs != nil {
+		inst = inst.WithFetchers(rs.Versions, rs.Info).WithRepoAuth(repoAuth).WithPinDeclarer(rs)
+	}
+	return inst
+}
+
+// buildRepositorySet resolves the configured registries and, when more than the
+// built-in GI registry is present, builds a RepositorySet plus the per-repo
+// download auth. Returns (nil, nil, nil) for the single-registry case.
+func buildRepositorySet(globalHome string, m *manifest.Manifest) (*provider.RepositorySet, []installer.RepoAuth, error) {
+	var projRegs []config.Registry
+	var pins map[string]string
+	if m != nil {
+		projRegs = m.Registries
+		pins = collectFGLPins(m)
+	}
+	regs, err := config.Load(globalHome, os.Getenv("FGLPKG_REGISTRY"), projRegs)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(regs) <= 1 {
+		return nil, nil, nil // only the built-in gi — keep legacy behaviour
+	}
+
+	creds, _ := credentials.Load(globalHome)
+	var provs []provider.Provider
+	var repoAuth []installer.RepoAuth
+	for _, r := range regs {
+		switch r.Type {
+		case config.TypeArtifactory:
+			var headers map[string]string
+			if creds != nil {
+				headers = creds.AuthHeaders(r.URL, r.Auth)
+			}
+			provs = append(provs, provider.NewArtifactoryProvider(r, nil, headersApplier(headers)))
+			// Register the repo's URL prefix even when anonymous (headers may be
+			// empty): the installer must recognise the host as a configured
+			// secondary repo so it never falls back to sending the GI registry
+			// bearer there (GIS-267).
+			repoAuth = append(repoAuth, installer.RepoAuth{URLPrefix: r.URL, Headers: headers})
+		default: // genero
+			provs = append(provs, provider.NewGeneroProvider(r.Name))
+		}
+	}
+	return provider.NewRepositorySet(provs, regs, pins), repoAuth, nil
+}
+
+// headersApplier turns a fixed header map into a provider.AuthApplier (nil when
+// there are no headers, i.e. anonymous).
+func headersApplier(headers map[string]string) provider.AuthApplier {
+	if len(headers) == 0 {
+		return nil
+	}
+	return func(req *http.Request) {
+		for k, v := range headers {
+			req.Header.Set(k, v)
+		}
+	}
+}
+
+// collectFGLPins merges the per-dependency registry pins from every scope.
+func collectFGLPins(m *manifest.Manifest) map[string]string {
+	pins := map[string]string{}
+	for _, d := range []manifest.Dependencies{m.Dependencies, m.DevDependencies, m.OptionalDependencies} {
+		for name, reg := range d.FGLPins {
+			pins[name] = reg
+		}
+	}
+	return pins
 }
 
 // defaultRegistry returns the consumer registry URL — install, search,
@@ -2174,6 +3099,25 @@ func defaultRegistry() string {
 
 func defaultPublishRegistry() string {
 	return defaultRegistry()
+}
+
+// resolveDefaultPublishRegistry returns the logical name of the repository
+// `fglpkg publish` should target when no --registry flag is given, in
+// decreasing precedence: FGLPKG_PUBLISH_REGISTRY, the project manifest's
+// defaultRegistry, then the global config's defaultRegistry. Returns "" when
+// none is set — the caller then publishes to GI as before. This is a
+// publish-only default and never influences consume-side routing.
+func resolveDefaultPublishRegistry(home string, m *manifest.Manifest) string {
+	if v := strings.TrimSpace(os.Getenv("FGLPKG_PUBLISH_REGISTRY")); v != "" {
+		return v
+	}
+	if m != nil && m.DefaultRegistry != "" {
+		return m.DefaultRegistry
+	}
+	if v, err := config.GlobalDefaultRegistry(home); err == nil && v != "" {
+		return v
+	}
+	return ""
 }
 
 func parsePackageArg(arg string) (name, version string, err error) {
@@ -2204,13 +3148,15 @@ func filepathBase() string {
 // (Earlier versions silently fell back to matching pattern against the
 // basename, which let a devDependency's USERGUIDE.md sneak into a parent
 // project's published zip — see buildPackageZip.)
-func matchGlob(pattern, path string) bool {
-	// Normalise separators.
+func matchGlob(pattern, p string) bool {
+	// Normalise separators, then match with the "path" package (always
+	// "/"-based) rather than "path/filepath", whose separator is "\" on
+	// Windows — there "*" would match across "/" and over-match.
 	pattern = filepath.ToSlash(pattern)
-	path = filepath.ToSlash(path)
+	p = filepath.ToSlash(p)
 
 	if !strings.Contains(pattern, "**") {
-		matched, _ := filepath.Match(pattern, path)
+		matched, _ := path.Match(pattern, p)
 		return matched
 	}
 
@@ -2221,7 +3167,7 @@ func matchGlob(pattern, path string) bool {
 
 	// Check prefix: the path must start with the prefix directory (if any).
 	if prefix != "" {
-		if !strings.HasPrefix(path, prefix+"/") && path != prefix {
+		if !strings.HasPrefix(p, prefix+"/") && p != prefix {
 			return false
 		}
 	}
@@ -2231,11 +3177,11 @@ func matchGlob(pattern, path string) bool {
 	}
 
 	// The remaining path (after prefix) must end with a segment matching suffix.
-	remaining := path
+	remaining := p
 	if prefix != "" {
-		remaining = strings.TrimPrefix(path, prefix+"/")
+		remaining = strings.TrimPrefix(p, prefix+"/")
 	}
-	matched, _ := filepath.Match(suffix, filepath.Base(remaining))
+	matched, _ := path.Match(suffix, path.Base(remaining))
 	return matched
 }
 

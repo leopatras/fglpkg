@@ -80,6 +80,14 @@ func TestBashCompletionSyntaxValid(t *testing.T) {
 	if _, err := exec.LookPath("bash"); err != nil {
 		t.Skip("bash not in PATH")
 	}
+	// On Windows, "bash" often resolves to the WSL launcher
+	// (C:\Windows\System32\bash.exe), which stays on PATH even with no WSL
+	// distro installed and then fails at exec time ("execvpe(/bin/bash)
+	// failed"). LookPath succeeding doesn't mean bash actually runs, so probe
+	// with a trivial script and skip if bash is present but non-functional.
+	if err := exec.Command("bash", "-n", "-c", "").Run(); err != nil {
+		t.Skipf("bash present but not functional: %v", err)
+	}
 	cmd := exec.Command("bash", "-n", "-c", bashCompletion())
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("bash -n rejected generated script: %v\n%s", err, out)

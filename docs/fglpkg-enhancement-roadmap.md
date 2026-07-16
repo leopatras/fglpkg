@@ -24,15 +24,15 @@ The existing fglpkg implementation is architecturally sound and feature-rich, re
 ### Strengths (What's Working)
 - ✅ **Solid Architecture:** Well-structured Go codebase with proper separation of concerns
 - ✅ **Genero Version Variants:** Innovative solution for cross-version compatibility
-- ✅ **GitHub Integration:** Clever use of GitHub Releases for package storage
+- ✅ **Registry Storage:** Artifacts stored in the Genero Intelligence registry (R2-backed); the legacy GitHub-Releases storage was removed in Workstream A (2026-06-19)
 - ✅ **Semver Resolution:** Proper dependency resolution with lockfile support
 - ✅ **Java JAR Support:** Practical integration with Maven ecosystem
 - ✅ **Workspace Support:** Monorepo capability for complex projects
-- ✅ **Registry API:** Complete REST API for package operations
+- ✅ **Registry API:** Full `/registry/*` protocol against the Genero Intelligence registry (the legacy embedded REST server was removed in Workstream A)
 
 ### Critical Gaps for PS Use
-- ❌ **Discovery Experience:** No web UI for package browsing
-- ❌ **Documentation Integration:** No way to publish/view package docs
+- ✅ **Discovery Experience:** Now addressed — the Genero Intelligence Public/Partner portals provide web browsing & search
+- ✅ **Documentation Integration:** Now addressed — `docs` glob + `fglpkg docs`; README/USERGUIDE rendered in the GI Public Portal
 - ❌ **Professional Services Branding:** Generic tool vs. 4JS professional offering
 - ❌ **Customer Success Metrics:** No usage analytics or ROI measurement
 - ❌ **Enterprise Security:** Basic auth model insufficient for customer environments
@@ -183,7 +183,7 @@ fglpkg publish --telemetry=on           # Track publishing patterns
 ## Phase 2: Customer-Ready Features (6 months)
 
 ### 2.1 Enterprise Authentication & Authorization
-**Status:** ⚠️ Partial — OAuth 2.0 (auth code + PKCE + Dynamic Client Registration) shipped against the Genero Intelligence registry; PAT tokens, refresh, and silent re-auth in the CLI. Still outstanding: LDAP/AD integration, role-based ACLs beyond owner/admin, org/team management, package signing, vulnerability scanning.  
+**Status:** ⚠️ Partial — OAuth 2.0 (auth code + PKCE + Dynamic Client Registration) shipped against the Genero Intelligence registry; PAT tokens, refresh, and silent re-auth in the CLI. **Vulnerability scanning** (`fglpkg audit`, OSV.dev) and **package signing** (Layer 1 & 2, GI-side) have since shipped — the signing **CLI** half is pending (GIS-244/245/246). Still outstanding: LDAP/AD integration, role-based ACLs beyond owner/admin, org/team management (deferred to the GI web portal).  
 **Priority:** High for customer deployments  
 **Effort:** 3-4 weeks  
 **Resources:** 1 backend developer + security review
@@ -312,7 +312,7 @@ spec:
 - Integration with customer CI/CD pipelines
 
 ### 2.4 Advanced Package Features
-**Status:** ⚠️ Partial — `fglpkg audit` and `fglpkg outdated` shipped. Still outstanding: `fglpkg deprecate`, `fglpkg migrate`, and the enhanced deprecation/security/statistics metadata fields.  
+**Status:** ⚠️ Partial — `fglpkg audit` and `fglpkg outdated` shipped. `fglpkg deprecate` is specced with GI endpoints live (CLI pending, GIS-247). The standalone `fglpkg migrate` was **dropped** (folded into `deprecate --moved-to`, npm model). Still outstanding: the enhanced statistics metadata fields.  
 **Priority:** Medium  
 **Effort:** 3-4 weeks  
 **Resources:** 1 backend developer
@@ -387,7 +387,7 @@ jobs:
 - Integration with Azure Artifacts (alternative storage)
 
 ### 3.2 Advanced Security Features
-**Status:** ❌ Not started.  
+**Status:** ⚠️ Partial — **SBOM generation** shipped (`fglpkg sbom`, CycloneDX) and **package signing** landed on the GI registry (Layer 1 & 2; CLI pending, GIS-244/245/246). Still outstanding: NIST/vuln-DB integration, the signing CLI, FIPS/SOC 2 compliance, and audit-log retention.  
 **Priority:** High for enterprise customers  
 **Effort:** 4-5 weeks  
 **Resources:** 1 security-focused developer + external security audit

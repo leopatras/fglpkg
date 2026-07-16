@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -69,6 +70,11 @@ func TestSaveAndLoad(t *testing.T) {
 }
 
 func TestFilePermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		// Windows maps only the read-only bit; a writable file always
+		// reports 0666 regardless of the 0600 passed at write time.
+		t.Skip("Unix file permissions not enforced on Windows")
+	}
 	home := t.TempDir()
 	f, _ := credentials.Load(home)
 	f.Set(registryURL, testToken, "alice")

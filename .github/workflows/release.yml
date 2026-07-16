@@ -25,6 +25,77 @@ jobs:
           export FGLPKG_VERSION="${GITHUB_REF_NAME#v}"
           ./cmd/build.sh
 
+      # ── macOS signing + notarization ──────────────────────────────────────────
+      # Signs and notarizes the darwin binaries with rcodesign, on the same Linux
+      # runner (no macOS runner needed). See specs/macos-release-signing.md.
+      # Each step is gated on its secret so a build without credentials (e.g. a
+      # fork) still produces an unsigned release instead of failing:
+      #   - MACOS_CERT_P12 / MACOS_CERT_PASSWORD present  -> sign
+      #   - MACOS_NOTARY_API_KEY_JSON present             -> notarize
+      - name: Detect signing secrets
+        id: signing
+        env:
+          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          MACOS_NOTARY_API_KEY_JSON: ${{ secrets.MACOS_NOTARY_API_KEY_JSON }}
+        run: |
+          if [ -n "$MACOS_CERT_P12" ]; then echo "cert=true" >> "$GITHUB_OUTPUT"; else echo "cert=false" >> "$GITHUB_OUTPUT"; fi
+          if [ -n "$MACOS_NOTARY_API_KEY_JSON" ]; then echo "notary=true" >> "$GITHUB_OUTPUT"; else echo "notary=false" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Install rcodesign
+        if: steps.signing.outputs.cert == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # TODO(hardening): pin the rcodesign version (and verify its checksum)
+          # before this pipeline signs with the production 4Js Developer ID.
+          url=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+            https://api.github.com/repos/indygreg/apple-platform-rs/releases/latest \
+            | grep -oE 'https://[^"]+apple-codesign-[^"]+x86_64-unknown-linux-musl\.tar\.gz' | head -1)
+          test -n "$url" || { echo "could not resolve rcodesign download URL"; exit 1; }
+          echo "Installing rcodesign from $url"
+          mkdir -p /tmp/rcodesign
+          curl -fsSL "$url" | tar xz -C /tmp/rcodesign
+          bin=$(find /tmp/rcodesign -type f -name rcodesign | head -1)
+          test -n "$bin" || { echo "rcodesign binary not found in archive"; exit 1; }
+          sudo mv "$bin" /usr/local/bin/rcodesign
+          rcodesign --version
+
+      - name: Sign macOS binaries (Developer ID + hardened runtime)
+        if: steps.signing.outputs.cert == 'true'
+        env:
+          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          echo "$MACOS_CERT_P12" | base64 -d > cert.p12
+          printf '%s' "$MACOS_CERT_PASSWORD" > cert.pw
+          for b in bin/fglpkg-darwin-arm64 bin/fglpkg-darwin-amd64; do
+            rcodesign sign \
+              --p12-file cert.p12 --p12-password-file cert.pw \
+              --for-notarization \
+              "$b"
+          done
+          rm -f cert.p12 cert.pw
+
+      - name: Notarize macOS binaries
+        if: steps.signing.outputs.notary == 'true'
+        env:
+          MACOS_NOTARY_API_KEY_JSON: ${{ secrets.MACOS_NOTARY_API_KEY_JSON }}
+        run: |
+          echo "$MACOS_NOTARY_API_KEY_JSON" | base64 -d > notary-key.json
+          # One submission covers both binaries — Apple notarizes each cdhash, so
+          # the extracted bare binaries are covered even though we ship them
+          # un-zipped. Bare Mach-O cannot be stapled; Gatekeeper checks the
+          # cdhash online on first run (fine for online users). See spec §5.
+          zip -j fglpkg-macos-notarize.zip bin/fglpkg-darwin-arm64 bin/fglpkg-darwin-amd64
+          rcodesign notary-submit --api-key-file notary-key.json --wait fglpkg-macos-notarize.zip
+          rm -f notary-key.json fglpkg-macos-notarize.zip
+
+      - name: Cleanup signing artifacts
+        if: always()
+        run: rm -f cert.p12 cert.pw notary-key.json fglpkg-macos-notarize.zip
+
+      # Checksums MUST come after signing — signing rewrites the Mach-O, which
+      # changes its hash.
       - name: Generate checksums
         run: cd bin && sha256sum * > checksums.txt
 

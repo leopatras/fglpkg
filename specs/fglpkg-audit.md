@@ -1,6 +1,6 @@
 # Spec: `fglpkg audit` (v1)
 
-**Status:** Draft
+**Status:** ✅ Implemented — shipped ([internal/audit/](../internal/audit/))
 **Date:** 2026-05-13
 **Author:** Mike Folcher
 **Tracking:** P0 #5 in [docs/market-readiness-gaps.md](../docs/market-readiness-gaps.md)

@@ -398,3 +398,39 @@ func TestFilterForProduction(t *testing.T) {
 		t.Errorf("expected 1 JAR (prod only), got %d", len(jars))
 	}
 }
+
+// ─── AddManifestJARs ───────────────────────────────────────────────────────────
+
+func TestAddManifestJARs(t *testing.T) {
+	lf := &lockfile.LockFile{
+		JARs: []lockfile.LockedJAR{
+			{Key: "g:existing", GroupID: "g", ArtifactID: "existing", Version: "1.0.0"},
+		},
+	}
+
+	deps := []manifest.JavaDependency{
+		// New coordinate — should be appended, marked "manifest".
+		{GroupID: "org.apache.poi", ArtifactID: "poi", Version: "5.3.0"},
+		// Already present by key — must NOT be added or downgraded to manifest.
+		{GroupID: "g", ArtifactID: "existing", Version: "1.0.0"},
+	}
+
+	if !lf.AddManifestJARs(deps) {
+		t.Fatal("AddManifestJARs should report an addition")
+	}
+	if len(lf.JARs) != 2 {
+		t.Fatalf("expected 2 JARs after add, got %d", len(lf.JARs))
+	}
+	// Sorted by key: g:existing before org.apache.poi:poi.
+	if lf.JARs[0].Key != "g:existing" || lf.JARs[0].Source != "" {
+		t.Errorf("existing JAR must be untouched, got %+v", lf.JARs[0])
+	}
+	if lf.JARs[1].Key != "org.apache.poi:poi" || lf.JARs[1].Source != "manifest" {
+		t.Errorf("new JAR must be manifest-sourced, got %+v", lf.JARs[1])
+	}
+
+	// Idempotent: re-adding the same coordinate is a no-op.
+	if lf.AddManifestJARs(deps) {
+		t.Error("second AddManifestJARs call should report no additions")
+	}
+}

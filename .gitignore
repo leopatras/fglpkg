@@ -26,6 +26,7 @@ go.work.sum
 
 # env file
 .env
+.mcp.json
 
 # Editor/IDE
 # .idea/
@@ -34,6 +35,10 @@ go.work.sum
 # Directories
 bin/
 .fglpkg/
+.private/
+
+# Local manual-test scratch (BDL fixtures, throwaway projects) — not part of the tool
+/test/
 
 # Claude: ignore local settings but track the shared knowledge base
 .claude/*
