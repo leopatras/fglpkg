@@ -135,8 +135,8 @@ func TestPublishPackageDryRunListsMetadata(t *testing.T) {
 		"genero:       ^6.0.0",
 		"dependencies: 1 fgl, 1 java",
 		"readme:       11 B", // "# Meta Test" is 11 bytes, shown in bytes not KB
-		"userguide:",           // size line present
-		"(truncated)",          // oversized USERGUIDE flagged
+		"userguide:",         // size line present
+		"(truncated)",        // oversized USERGUIDE flagged
 	}
 	for _, want := range wantSubstrings {
 		if !strings.Contains(out, want) {
