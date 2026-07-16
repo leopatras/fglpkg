@@ -19,6 +19,7 @@ import (
 
 	"github.com/4js-mikefolcher/fglpkg/internal/manifest"
 	"github.com/4js-mikefolcher/fglpkg/internal/semver"
+	slugutil "github.com/4js-mikefolcher/fglpkg/internal/slug"
 )
 
 // ErrNotFound is returned (via %w wrapping) when the registry responds 404
@@ -51,24 +52,24 @@ var TryRefresh = func() bool { return false }
 // shipped) return empty values for those fields and must be republished to
 // expose them.
 type PackageInfo struct {
-	Name             string                    `json:"name"`
-	Version          string                    `json:"version"`
-	Description      string                    `json:"description"`
-	Author           string                    `json:"author,omitempty"`
-	License          string                    `json:"license,omitempty"`
-	PublishedAt      string                    `json:"publishedAt,omitempty"`
-	DownloadURL      string                    `json:"downloadUrl"`
-	Checksum         string                    `json:"checksum"`
-	GeneroConstraint string                    `json:"genero,omitempty"`
-	FGLDeps          map[string]string         `json:"fglDeps,omitempty"`
+	Name             string            `json:"name"`
+	Version          string            `json:"version"`
+	Description      string            `json:"description"`
+	Author           string            `json:"author,omitempty"`
+	License          string            `json:"license,omitempty"`
+	PublishedAt      string            `json:"publishedAt,omitempty"`
+	DownloadURL      string            `json:"downloadUrl"`
+	Checksum         string            `json:"checksum"`
+	GeneroConstraint string            `json:"genero,omitempty"`
+	FGLDeps          map[string]string `json:"fglDeps,omitempty"`
 	// FGLDepPins carries the per-dependency repository pin this package's own
 	// manifest declared (dep name → registry name), e.g. {"qrcode":"acme"}.
 	// The multi-provider resolver honours these so a package's transitive deps
 	// resolve from the repository the author pinned, even when the name also
 	// exists in another repository. Populated from an Artifactory sidecar's
 	// object-form deps; the GI registry does not carry pins yet (see resolver).
-	FGLDepPins       map[string]string         `json:"fglDepPins,omitempty"`
-	JavaDeps         []manifest.JavaDependency `json:"javaDeps,omitempty"`
+	FGLDepPins map[string]string         `json:"fglDepPins,omitempty"`
+	JavaDeps   []manifest.JavaDependency `json:"javaDeps,omitempty"`
 	// Variant is the artifact variant tag selected by the registry client
 	// when fetching this version — "genero<N>" for BDL packages or
 	// "webcomponent" for webcomponent packages. The installer uses it to
@@ -494,6 +495,9 @@ type apiBrowseResponse struct {
 }
 
 func fetchPackageDetail(slug string) (*apiPackageDetail, error) {
+	// Canonicalize the name to its slug so any spelling (fgl_ai_sdk, Fgl.AI.SDK,
+	// fgl-ai-sdk) resolves to the same /registry/packages/<slug> record (GIS-271).
+	slug = slugutil.Canonical(slug)
 	u := fmt.Sprintf("%s/registry/packages/%s", registryBase(), url.PathEscape(slug))
 	data, err := httpGetAuthed(u)
 	if err != nil {
