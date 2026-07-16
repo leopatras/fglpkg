@@ -9,3 +9,7 @@ Project-local knowledge base for fglpkg (Go package manager for Genero BDL + its
 - [E2E testing how-to](memory/e2e-testing-howto.md) — headless fglrun invocation, byte-diff vs `bin/fglpkg-go`, mock_registry.py (registry + OAuth + mock OSV `/v1/query`), env vars
 - [Upstream Go quirks](memory/upstream-go-quirks.md) — bugs replicated on purpose for byte-parity (pluralY "vulnerabilitie", run vs bdl exit codes); fix both sides together
 - Resolver benchmarks: see `g/BENCHMARKS.md` — Go's buildPlan is accidentally O(N²) (insertion sort over randomized map order), 4GL is linear (insertion-ordered getKeys); fair constant factor ≈ 20× in Go's favor; irrelevant below ~1000 packages
+
+## Registry, publishing, and CLI (applies to either implementation)
+
+- [Registry publishing and variant resolution](memory/registry-publishing-and-variants.md) — live test registry usage, `unpublish` documented-but-not-implemented, `pickArtifact`'s exact-match/`default`/`arts[0]`-fallback algorithm (no version-aware fallback exists), the `bin`/`fglpkg run` Windows one-path-per-command limitation, and the `fglwebrun` example package (source-only self-compiling design)
