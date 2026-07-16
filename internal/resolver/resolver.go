@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 
 	"github.com/4js-mikefolcher/fglpkg/internal/genero"
@@ -668,21 +669,32 @@ func (s *state) buildPlan() *Plan {
 			Source:      entry.info.Source,
 		})
 	}
-	for i := 1; i < len(pkgs); i++ {
-		for j := i; j > 0 && s.resolved[pkgs[j].Name].order < s.resolved[pkgs[j-1].Name].order; j-- {
-			pkgs[j], pkgs[j-1] = pkgs[j-1], pkgs[j]
-		}
-	}
+	// Restore discovery order. Each resolved entry carries a unique,
+	// monotonically increasing order stamp (see markResolved), so this defines a
+	// total order and a non-stable sort is sufficient and fully deterministic —
+	// the output plan is identical regardless of the map's randomized iteration
+	// order. This is O(N log N); the former hand-written insertion sort was
+	// O(N²) on that randomized input and dominated resolution on large graphs
+	// (GIS-258).
+	sort.Slice(pkgs, func(i, j int) bool {
+		return s.resolved[pkgs[i].Name].order < s.resolved[pkgs[j].Name].order
+	})
 
 	jars := make([]manifest.JavaDependency, 0, len(s.jars))
 	for _, dep := range s.jars {
 		jars = append(jars, dep)
 	}
+	// s.jars / s.localMembers are maps, so their iteration order is randomized.
+	// Sort both into a stable order (JARs by Maven key, local members by name)
+	// so the plan — and the lockfile written from it — does not churn run to
+	// run (GIS-258 secondary finding).
+	sort.Slice(jars, func(i, j int) bool { return jars[i].Key() < jars[j].Key() })
 
 	locals := make([]LocalMember, 0, len(s.localMembers))
 	for _, lm := range s.localMembers {
 		locals = append(locals, lm)
 	}
+	sort.Slice(locals, func(i, j int) bool { return locals[i].Name < locals[j].Name })
 
 	scopes := make(map[string]manifest.Scope, len(s.jarScopes))
 	for k, v := range s.jarScopes {
