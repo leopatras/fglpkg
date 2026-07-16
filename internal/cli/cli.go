@@ -16,7 +16,6 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"sort"
 	"strconv"
@@ -34,6 +33,7 @@ import (
 	"github.com/4js-mikefolcher/fglpkg/internal/provider"
 	"github.com/4js-mikefolcher/fglpkg/internal/registry"
 	"github.com/4js-mikefolcher/fglpkg/internal/semver"
+	slugutil "github.com/4js-mikefolcher/fglpkg/internal/slug"
 	"github.com/4js-mikefolcher/fglpkg/internal/workspace"
 )
 
@@ -78,14 +78,12 @@ func privateHint(err error, pkg string) error {
 	return fmt.Errorf("%w\n  hint: if %q is a private package, run: fglpkg login", err, pkg)
 }
 
-// validSlugRe is the regular expression that determines whether a package.
-// slug is valid. Currently, a package slug is valid if it is between
-// 2 and 64 characters and only consists of lowercase letters, digits, or hyphens
-var validSlugRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}[a-z0-9]$`)
-
-// isValidPackageSlug returns whether a package slug is valid. it uses validSlugRe to verify
+// isValidPackageSlug reports whether a string is a well-formed canonical
+// package slug (2-64 chars; lowercase letters, digits, hyphens; start/end
+// alphanumeric). It delegates to internal/slug, the single source of truth for
+// the slug rule (GIS-271).
 func isValidPackageSlug(slug string) bool {
-	return validSlugRe.MatchString(slug)
+	return slugutil.IsValid(slug)
 }
 
 // Execute is the main CLI entry point.
@@ -1383,8 +1381,19 @@ func publishPackage(m *manifest.Manifest, registryURL, generoMajor string, dryRu
 	fmt.Printf("  Package zip: %d bytes (SHA256: %s)\n", len(zipData), checksum)
 
 	variant := artifactVariant(m, generoMajor)
-	filename := artifactFilename(m.Name, m.Version, variant)
-	slug := m.Name
+	// The slug is the canonical (PyPI/PEP 503) form of the name — lowercased,
+	// with runs of '-'/'_'/'.' collapsed to '-' — and is the package's identity
+	// in every /registry/... path. The manifest name is kept as the display
+	// name. Fail early with a clear message rather than letting the registry
+	// reject a non-canonical slug late (GIS-271).
+	slug := slugutil.Canonical(m.Name)
+	if !slugutil.IsValid(slug) {
+		return fmt.Errorf("package name %q normalizes to slug %q, which is not a valid package slug (2-64 chars; lowercase letters, digits, hyphens; must start and end alphanumeric)", m.Name, slug)
+	}
+	if slug != m.Name {
+		fmt.Printf("  Normalized name %q → slug %q\n", m.Name, slug)
+	}
+	filename := artifactFilename(slug, m.Version, variant)
 	visibility := visibilityOverride
 	if visibility == "" {
 		visibility = m.Visibility
@@ -3109,16 +3118,20 @@ func cmdDocs(args []string) error {
 // findInstalledPackage looks for a package by name, checking local then global.
 // Returns the package directory, its manifest, and an error.
 func findInstalledPackage(name string) (string, *manifest.Manifest, error) {
+	// Packages are installed under their canonical slug (GIS-271), so accept any
+	// spelling the user types — under_score_test, Under-Score-Test — and look up
+	// the canonical directory the resolver/installer actually wrote.
+	slug := slugutil.Canonical(name)
 	if isProjectDir() {
 		wd, _ := os.Getwd()
-		localDir := filepath.Join(wd, ".fglpkg", "packages", name)
+		localDir := filepath.Join(wd, ".fglpkg", "packages", slug)
 		if m, err := manifest.Load(localDir); err == nil {
 			return localDir, m, nil
 		}
 	}
 	globalHome, err := fglpkgHome()
 	if err == nil {
-		globalDir := filepath.Join(globalHome, "packages", name)
+		globalDir := filepath.Join(globalHome, "packages", slug)
 		if m, err := manifest.Load(globalDir); err == nil {
 			return globalDir, m, nil
 		}
@@ -3427,7 +3440,7 @@ func collectFGLPins(m *manifest.Manifest) map[string]string {
 	pins := map[string]string{}
 	for _, d := range []manifest.Dependencies{m.Dependencies, m.DevDependencies, m.OptionalDependencies} {
 		for name, reg := range d.FGLPins {
-			pins[name] = reg
+			pins[slugutil.Canonical(name)] = reg
 		}
 	}
 	return pins
@@ -3552,25 +3565,28 @@ func promptWithDefault(label, def string) string {
 	return val
 }
 
-// promptPackageSlug prompts for the package name and re-prompts until the
-// entry is a valid registry slug (2-64 chars: lowercase letters, digits,
-// hyphens), catching invalid names at init instead of at publish time where
-// the registry would reject the slug. The current directory name is offered
-// as the default, but only when it is itself a valid slug — otherwise the
-// default is cleared so the user must type a valid name rather than accept an
-// invalid suggestion by pressing enter.
+// promptPackageSlug prompts for the package name and re-prompts until the entry
+// normalizes to a valid registry slug — after lowercasing and collapsing runs
+// of '.'/'_'/'-' (PEP 503; see internal/slug) it must be 2-64 chars of letters,
+// digits, and hyphens. Catching this at init avoids a late rejection at publish.
+// The current directory name is offered as the default, but only when it
+// normalizes to a valid slug. The name is kept verbatim as the display name;
+// its canonical slug is echoed when the two differ.
 func promptPackageSlug() string {
 	const slugPrompt = "Package name"
 
-	defaultSlug := filepathBase()
-	if !isValidPackageSlug(defaultSlug) {
-		defaultSlug = ""
+	defaultName := filepathBase()
+	if !isValidPackageSlug(slugutil.Canonical(defaultName)) {
+		defaultName = ""
 	}
 
-	name := promptWithDefault(slugPrompt, defaultSlug)
-	for !isValidPackageSlug(name) {
-		fmt.Printf("error: Invalid package name \"%s\" - must be 2-64 chars: lowercase letters, digits, hyphens\n", name)
-		name = promptWithDefault(slugPrompt, defaultSlug)
+	name := promptWithDefault(slugPrompt, defaultName)
+	for !isValidPackageSlug(slugutil.Canonical(name)) {
+		fmt.Printf("error: %q does not normalize to a valid package slug — after lowercasing and collapsing '.'/'_'/'-' it must be 2-64 chars of letters, digits, and hyphens\n", name)
+		name = promptWithDefault(slugPrompt, defaultName)
+	}
+	if s := slugutil.Canonical(name); s != name {
+		fmt.Printf("  → will publish under slug %q\n", s)
 	}
 	return name
 }

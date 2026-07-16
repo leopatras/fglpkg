@@ -28,6 +28,7 @@ import (
 	"github.com/4js-mikefolcher/fglpkg/internal/manifest"
 	"github.com/4js-mikefolcher/fglpkg/internal/registry"
 	"github.com/4js-mikefolcher/fglpkg/internal/semver"
+	"github.com/4js-mikefolcher/fglpkg/internal/slug"
 	"github.com/4js-mikefolcher/fglpkg/internal/workspace"
 )
 
@@ -558,7 +559,13 @@ func (s *state) skipOptional(name, reason string) {
 	fmt.Fprintf(os.Stderr, "warning: skipping optional dependency %s: %s\n", name, reason)
 }
 
-func (s *state) enqueue(item workItem)         { s.queue = append(s.queue, item) }
+func (s *state) enqueue(item workItem) {
+	// Canonicalize the dependency name (GIS-271) so every spelling of a package
+	// collapses to one identity for fetch, dedup, conflict detection, and the
+	// resulting plan / lockfile.
+	item.name = slug.Canonical(item.name)
+	s.queue = append(s.queue, item)
+}
 func (s *state) dequeue() workItem             { item := s.queue[0]; s.queue = s.queue[1:]; return item }
 func (s *state) hasWork() bool                 { return len(s.queue) > 0 }
 func (s *state) isResolved(n string) bool      { _, ok := s.resolved[n]; return ok }
