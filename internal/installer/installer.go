@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -34,6 +35,7 @@ type Installer struct {
 	webcomponentsDir string // ~/.fglpkg/webcomponents
 	githubToken      string // GitHub PAT for downloading from private GitHub Releases
 	registryToken    string // bearer for the consumer registry when it serves zips directly
+	giOrigin         string // scheme+host of the GI registry; gates where registryToken may be sent
 	repoAuth         []RepoAuth
 	// versionFetcher/infoFetcher, when non-nil, replace the default live GI
 	// registry fetchers with a multi-provider routing layer (RepositorySet).
@@ -64,7 +66,12 @@ type RepoAuth struct {
 //   - registryToken: bearer for non-GitHub download URLs (the new
 //     service.generointelligence.ai flow serves zips itself, possibly
 //     behind auth). Pass "" for anonymous fetches.
-func New(home, githubToken, registryToken string) *Installer {
+//   - giOrigin: the GI registry's base URL (e.g. https://service.generointelligence.ai
+//     or FGLPKG_REGISTRY's override). registryToken is only ever sent to a
+//     download URL whose origin matches this — never to an arbitrary
+//     absolute host (e.g. an R2/CDN target) — to avoid leaking the GI
+//     bearer to a third party (GIS-267 / GIS-249 S1).
+func New(home, githubToken, registryToken, giOrigin string) *Installer {
 	return &Installer{
 		home:             home,
 		packagesDir:      filepath.Join(home, "packages"),
@@ -72,6 +79,7 @@ func New(home, githubToken, registryToken string) *Installer {
 		webcomponentsDir: filepath.Join(home, "webcomponents"),
 		githubToken:      githubToken,
 		registryToken:    registryToken,
+		giOrigin:         giOrigin,
 	}
 }
 
@@ -129,15 +137,66 @@ func (i *Installer) newResolver(gv genero.Version) (*resolver.Resolver, error) {
 // reports matched=true, so the caller knows the host belongs to a configured
 // repository and must NOT be sent the GI registry token (which would leak the
 // GI bearer to a third-party host — see GIS-267).
-func (i *Installer) matchRepoAuth(url string) (headers map[string]string, matched bool) {
+//
+// Matching is by parsed-URL origin (scheme+host) plus a path prefix on a "/"
+// boundary — a raw string prefix would let
+// "https://acme.jfrog.io.attacker.com/…" match a repo configured as
+// "https://acme.jfrog.io" (GIS-249 S1).
+func (i *Installer) matchRepoAuth(downloadURL string) (headers map[string]string, matched bool) {
 	var best RepoAuth
 	for _, ra := range i.repoAuth {
-		if strings.HasPrefix(url, ra.URLPrefix) && len(ra.URLPrefix) > len(best.URLPrefix) {
+		if urlHasOriginPrefix(downloadURL, ra.URLPrefix) && len(ra.URLPrefix) > len(best.URLPrefix) {
 			best = ra
 			matched = true
 		}
 	}
 	return best.Headers, matched
+}
+
+// urlHasOriginPrefix reports whether rawURL is served by the same origin
+// (scheme+host, case-insensitive) as prefix, and its path starts with
+// prefix's path on a "/" boundary (equal, or the next rune is "/"). This is
+// stricter than strings.HasPrefix(rawURL, prefix): it rejects a host that
+// merely has prefix's host as a string prefix, e.g. a repo configured as
+// "https://acme.jfrog.io" must not match "https://acme.jfrog.io.attacker.com/…"
+// (GIS-249 S1), nor "https://acme.jfrog.io/repo" match ".../repo-other/x".
+func urlHasOriginPrefix(rawURL, prefix string) bool {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	p, err := url.Parse(prefix)
+	if err != nil {
+		return false
+	}
+	if !strings.EqualFold(u.Scheme, p.Scheme) || !strings.EqualFold(u.Host, p.Host) {
+		return false
+	}
+	pPath := strings.TrimSuffix(p.Path, "/")
+	if !strings.HasPrefix(u.Path, pPath) {
+		return false
+	}
+	rest := u.Path[len(pPath):]
+	return rest == "" || strings.HasPrefix(rest, "/")
+}
+
+// sameOrigin reports whether rawURL's scheme+host matches originURL's,
+// ignoring path/query/fragment. Used to gate the GI registry bearer: it must
+// only be sent to the GI registry's own origin, never to an arbitrary
+// absolute download URL (e.g. an R2/CDN target) — GIS-249 S1.
+func sameOrigin(rawURL, originURL string) bool {
+	if originURL == "" {
+		return false
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	o, err := url.Parse(originURL)
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(u.Scheme, o.Scheme) && strings.EqualFold(u.Host, o.Host)
 }
 
 // Options controls optional install behaviour.
@@ -481,7 +540,7 @@ func (i *Installer) installBDL(info *registry.PackageInfo) error {
 
 	// Download and verify in one streaming pass.
 	repoHeaders, repoMatched := i.matchRepoAuth(downloadURL)
-	if err := downloadAndVerify(downloadURL, info.Checksum, info.Name, tmp, i.githubToken, i.registryToken, repoHeaders, repoMatched); err != nil {
+	if err := downloadAndVerify(downloadURL, info.Checksum, info.Name, tmp, i.githubToken, i.registryToken, i.giOrigin, repoHeaders, repoMatched); err != nil {
 		tmp.Close()
 		return err
 	}
@@ -539,7 +598,7 @@ func (i *Installer) installWebcomponent(info *registry.PackageInfo) error {
 
 	downloadURL := registry.AbsoluteDownloadURL(info.DownloadURL)
 	repoHeaders, repoMatched := i.matchRepoAuth(downloadURL)
-	if err := downloadAndVerify(downloadURL, info.Checksum, info.Name, tmp, i.githubToken, i.registryToken, repoHeaders, repoMatched); err != nil {
+	if err := downloadAndVerify(downloadURL, info.Checksum, info.Name, tmp, i.githubToken, i.registryToken, i.giOrigin, repoHeaders, repoMatched); err != nil {
 		tmp.Close()
 		return err
 	}
@@ -572,7 +631,7 @@ func (i *Installer) InstallJar(dep manifest.JavaDependency) error {
 
 	// JavaDependency doesn't carry a checksum field today; pass "" to skip.
 	// JARs come from Maven Central anonymously — no repo auth.
-	if err := downloadAndVerify(url, dep.Checksum, dep.JarFileName(), f, "", "", nil, false); err != nil {
+	if err := downloadAndVerify(url, dep.Checksum, dep.JarFileName(), f, "", "", "", nil, false); err != nil {
 		f.Close()
 		os.Remove(dest)
 		return err
@@ -733,10 +792,14 @@ func (i *Installer) JarsDir() string { return i.jarsDir }
 //     that repo's auth-scheme headers, or NONE for an "anonymous" repo. The GI
 //     registry token is never sent here: doing so would leak the GI bearer to
 //     a third-party (e.g. Artifactory) host (GIS-267).
-//   - Other non-GitHub URL + registryToken non-empty → send registryToken (the
-//     GI service.generointelligence.ai path where the registry serves zips).
+//   - Other non-GitHub URL whose origin matches giOrigin + registryToken
+//     non-empty → send registryToken (the GI service.generointelligence.ai
+//     path where the registry serves zips). registryToken is NEVER sent to a
+//     URL outside giOrigin — e.g. an absolute R2/CDN download target a GI
+//     package resolves to — since that would leak the GI bearer to a third
+//     party (GIS-249 S1).
 //   - Otherwise → no auth (anonymous public download).
-func downloadAndVerify(url, expectedChecksum, name string, w io.Writer, githubToken, registryToken string, repoHeaders map[string]string, repoMatched bool) error {
+func downloadAndVerify(url, expectedChecksum, name string, w io.Writer, githubToken, registryToken, giOrigin string, repoHeaders map[string]string, repoMatched bool) error {
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
 		return fmt.Errorf("download failed for %s: %w", name, err)
@@ -757,7 +820,7 @@ func downloadAndVerify(url, expectedChecksum, name string, w io.Writer, githubTo
 		for k, v := range repoHeaders {
 			req.Header.Set(k, v)
 		}
-	case !isGH && registryToken != "":
+	case !isGH && registryToken != "" && sameOrigin(url, giOrigin):
 		authToken = registryToken
 		req.Header.Set("Authorization", "Bearer "+authToken)
 	}

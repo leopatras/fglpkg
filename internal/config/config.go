@@ -214,7 +214,19 @@ func validate(r Registry) error {
 	}
 	switch r.Type {
 	case TypeGenero:
-		// no extra requirements
+		// Only the built-in GI registry may be type=genero: the Genero client
+		// resolves its base from the process-global registryBase()/FGLPKG_REGISTRY,
+		// so a per-instance URL on any other genero entry would be silently
+		// ignored (dead config) and mis-attribute results to it. Point an
+		// internal GI mirror via FGLPKG_REGISTRY, or use type=artifactory.
+		// (GIS-249 C1)
+		if r.Name != GIName {
+			return fmt.Errorf(
+				"registry %q has type %q but only the built-in %q registry may be type=genero; "+
+					"use type=artifactory, or retarget GI via FGLPKG_REGISTRY",
+				r.Name, TypeGenero, GIName,
+			)
+		}
 	case TypeArtifactory:
 		if r.RepoKey == "" {
 			return fmt.Errorf("registry %q (type=artifactory) requires 'repoKey'", r.Name)

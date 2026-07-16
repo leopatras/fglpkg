@@ -25,6 +25,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/4js-mikefolcher/fglpkg/internal/config"
 	"github.com/4js-mikefolcher/fglpkg/internal/manifest"
 	"github.com/4js-mikefolcher/fglpkg/internal/resolver"
 )
@@ -196,7 +197,7 @@ func FromPlan(plan *resolver.Plan, root *manifest.Manifest) *LockFile {
 				Checksum:    p.Checksum,
 				RequiredBy:  requiredBy,
 				Scope:       scopeLockString(p.Scope),
-				Registry:    p.Source,
+				Registry:    normalizeSource(p.Source),
 			})
 			continue
 		}
@@ -209,7 +210,7 @@ func FromPlan(plan *resolver.Plan, root *manifest.Manifest) *LockFile {
 			GeneroMajor: plan.GeneroVersion.MajorString(),
 			RequiredBy:  requiredBy,
 			Scope:       scopeLockString(p.Scope),
-			Registry:    p.Source,
+			Registry:    normalizeSource(p.Source),
 		})
 	}
 	sort.Slice(pkgs, func(i, j int) bool { return pkgs[i].Name < pkgs[j].Name })
@@ -238,6 +239,19 @@ func FromPlan(plan *resolver.Plan, root *manifest.Manifest) *LockFile {
 		JARs:          jars,
 		Webcomponents: wcs,
 	}
+}
+
+// normalizeSource collapses the explicit GI source name to "" so the lock's
+// "empty registry means GI" convention holds regardless of whether GI packages
+// were resolved via the single-registry path (Source left "") or through
+// GeneroProvider in multi-registry mode (Source stamped "gi"). This keeps
+// fglpkg.lock byte-identical — and diffs clean — when a second registry is
+// added or removed. (GIS-249 C2)
+func normalizeSource(source string) string {
+	if source == config.GIName {
+		return ""
+	}
+	return source
 }
 
 // AddManifestJARs appends Java dependencies recovered by the manifest

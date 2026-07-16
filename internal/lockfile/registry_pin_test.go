@@ -81,6 +81,44 @@ func TestCheckRegistries_WebcomponentSource(t *testing.T) {
 	}
 }
 
+// TestFromPlan_GISourceNormalizedToEmpty is the regression test for GIS-249 C2:
+// a plan entry whose Source is the explicit GI name "gi" (as stamped by
+// GeneroProvider in multi-registry mode) must be recorded with an empty
+// registry — identical to the single-registry path that leaves Source "" — so
+// the lock does not churn when a second registry is added or removed.
+func TestFromPlan_GISourceNormalizedToEmpty(t *testing.T) {
+	plan := &resolver.Plan{
+		GeneroVersion: genero.MustParse("6.00.01"),
+		Packages: []resolver.ResolvedPackage{
+			{Name: "logft", Version: semver.MustParse("2.0.0"), Source: "gi", RequiredBy: []string{"<root>"}},
+			{Name: "chart-3d", Version: semver.MustParse("1.0.0"), Source: "gi", RequiredBy: []string{"<root>"}, Variant: "webcomponent"},
+		},
+	}
+	lf := lockfile.FromPlan(plan, manifest.New("app", "1.0.0", "", ""))
+
+	for i := range lf.Packages {
+		if lf.Packages[i].Registry != "" {
+			t.Fatalf("package %q: gi source must normalize to empty registry, got %q",
+				lf.Packages[i].Name, lf.Packages[i].Registry)
+		}
+	}
+	for i := range lf.Webcomponents {
+		if lf.Webcomponents[i].Registry != "" {
+			t.Fatalf("webcomponent %q: gi source must normalize to empty registry, got %q",
+				lf.Webcomponents[i].Name, lf.Webcomponents[i].Registry)
+		}
+	}
+
+	// And it must be omitted from JSON, exactly like a single-registry lock.
+	data, err := json.Marshal(lf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), `"registry"`) {
+		t.Fatalf("gi source must produce no registry key (byte-identical to single-registry mode): %s", data)
+	}
+}
+
 func TestFromPlan_EmptySourceOmittedInJSON(t *testing.T) {
 	plan := &resolver.Plan{
 		GeneroVersion: genero.MustParse("6.00.01"),

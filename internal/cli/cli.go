@@ -2436,7 +2436,7 @@ type registryEditFlags struct {
 	typ      string
 	repoKey  string
 	auth     string
-	priority int
+	priority *int // nil = unset (auto-assign); an explicit value (incl. 0) is validated
 	packages []string
 	project  bool // write to the project fglpkg.json instead of the global config
 }
@@ -2480,7 +2480,7 @@ func parseRegistryAddFlags(args []string) (registryEditFlags, error) {
 			if err != nil {
 				return f, fmt.Errorf("--priority must be an integer, got %q", v)
 			}
-			f.priority = n
+			f.priority = &n
 		case a == "--packages" || strings.HasPrefix(a, "--packages="):
 			v, err := flagValue(a, &i, args)
 			if err != nil {
@@ -2542,14 +2542,18 @@ func cmdRegistryAdd(args []string) error {
 	if _, dup := config.Find(current, f.name); dup {
 		return fmt.Errorf("a registry named %q already exists; run 'fglpkg registry remove %s' first", f.name, f.name)
 	}
-	if f.priority == 0 {
+	// A nil priority means the flag was omitted → auto-assign max+1 so the common
+	// case needs no --priority. An explicit value (including 0) is left as-is and
+	// validated by config.Resolve, which rejects any priority < 1. (GIS-249)
+	if f.priority == nil {
 		max := 0
 		for _, r := range current {
 			if r.Priority > max {
 				max = r.Priority
 			}
 		}
-		f.priority = max + 1
+		p := max + 1
+		f.priority = &p
 	}
 
 	r := config.Registry{
@@ -2557,7 +2561,7 @@ func cmdRegistryAdd(args []string) error {
 		Type:     f.typ,
 		URL:      f.url,
 		RepoKey:  f.repoKey,
-		Priority: f.priority,
+		Priority: *f.priority,
 		Auth:     f.auth,
 		Packages: f.packages,
 	}
@@ -2636,6 +2640,11 @@ func cmdRegistryRemove(args []string) error {
 			return fmt.Errorf("no registry named %q in %s", name, manifest.Filename)
 		}
 		m.Registries = kept
+		// Clear a now-dangling default, mirroring the global branch below: a bare
+		// `publish` resolving the removed name would otherwise fail. (GIS-249 C3)
+		if m.DefaultRegistry == name {
+			m.DefaultRegistry = ""
+		}
 		if err := m.Save("."); err != nil {
 			return err
 		}
@@ -3335,7 +3344,7 @@ func buildInstaller(home string, m *manifest.Manifest) (*installer.Installer, *p
 	registryURL := defaultRegistry()
 	githubToken := credentials.GitHubTokenFor(globalHome, registryURL)
 	registryToken, _ := credentials.ActiveBearer(context.Background(), globalHome, registryURL, oauth.Refresh)
-	inst := installer.New(home, githubToken, registryToken)
+	inst := installer.New(home, githubToken, registryToken, registryURL)
 
 	// Engage multi-provider routing only when repositories beyond the built-in
 	// GI registry are configured — otherwise the single-registry path stays
