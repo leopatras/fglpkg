@@ -32,6 +32,7 @@ import (
 	"github.com/4js-mikefolcher/fglpkg/internal/oauth"
 	"github.com/4js-mikefolcher/fglpkg/internal/provider"
 	"github.com/4js-mikefolcher/fglpkg/internal/registry"
+	"github.com/4js-mikefolcher/fglpkg/internal/selfupdate"
 	"github.com/4js-mikefolcher/fglpkg/internal/semver"
 	slugutil "github.com/4js-mikefolcher/fglpkg/internal/slug"
 	"github.com/4js-mikefolcher/fglpkg/internal/updatecheck"
@@ -171,6 +172,8 @@ func Execute() error {
 			return cmdDocs(args)
 		case "version":
 			return cmdVersion(args)
+		case "self-update", "upgrade":
+			return cmdSelfUpdate(args)
 		case "help", "--help", "-h":
 			printUsage()
 			return nil
@@ -235,6 +238,30 @@ func isTerminal(f *os.File) bool {
 		return false
 	}
 	return fi.Mode()&os.ModeCharDevice != 0
+}
+
+// cmdSelfUpdate downloads and installs the latest release (GIS-255), verifying
+// the Ed25519 release signature and SHA-256 before atomically replacing the
+// running binary. See internal/selfupdate.
+func cmdSelfUpdate(args []string) error {
+	opts := selfupdate.Options{Current: Version, Stdout: os.Stdout}
+	for _, a := range args {
+		switch a {
+		case "--check":
+			opts.Check = true
+		case "--yes", "-y":
+			opts.Yes = true
+		case "--force":
+			opts.Force = true
+		default:
+			return fmt.Errorf("unknown flag %q\nUsage: fglpkg self-update [--check] [--yes] [--force]", a)
+		}
+	}
+	opts.Confirm = func(prompt string) bool { return promptYesNo(prompt, true) }
+	if home, err := fglpkgHome(); err == nil {
+		opts.HomeForCache = home
+	}
+	return selfupdate.Run(opts)
 }
 
 // ─── init ─────────────────────────────────────────────────────────────────────

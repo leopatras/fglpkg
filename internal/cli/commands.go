@@ -407,6 +407,24 @@ With no arguments, prints the fglpkg tool version. With a bump kind
 `,
 	},
 	{
+		Name:    "self-update",
+		Aliases: []string{"upgrade"},
+		Summary: "Update fglpkg to the latest release",
+		Usage:   "fglpkg self-update [--check] [--yes] [--force]",
+		Long: `FLAGS:
+  --check                  Report whether an update is available and exit;
+                           never downloads or writes
+  --yes, -y                Skip the confirmation prompt (for scripts)
+  --force                  Re-install even if already on the latest version
+
+Downloads the latest stable release for this OS/arch, verifies its Ed25519
+release signature (chained to fglpkg's pinned root) and its SHA-256 checksum,
+then atomically replaces the running executable. Latest-stable only — no
+version pinning, pre-releases, or downgrade. Refuses on 'dev' builds and on
+installs managed by a package manager such as Homebrew.
+`,
+	},
+	{
 		Name:    "help",
 		Summary: "Show this help",
 		Usage:   "fglpkg help [command]",
