@@ -327,6 +327,44 @@ func PublishCreatePackage(slug, name, description, visibility string) error {
 	return fmt.Errorf("create package %q: HTTP %d: %s", slug, status, string(respBody))
 }
 
+// PublishUpdateMetadata pushes the package's current discovery metadata
+// (description and/or keywords) to the registry via the owner-only metadata
+// operation on PATCH /registry/packages/:slug (GIS-268 F/G). The publisher
+// calls this on every publish so a description or keyword edited after the slug
+// was first created still reaches the registry — the GI package description
+// used to be write-once, and manifest keywords were never transmitted at all.
+//
+// Only non-empty fields are sent (so a republish never clears registry metadata
+// the manifest simply omits), and they go in a single request — the server
+// treats description+keywords together as one operation ("one operation at a
+// time"). Keywords are sent verbatim; the registry normalizes them
+// (trim/lowercase/dedupe). When nothing is set, it is a no-op.
+//
+// Returns nil on 200. A non-2xx (e.g. an older registry that does not implement
+// the metadata op) is returned as an error; callers treat a metadata-sync
+// failure as non-fatal to the publish, which has already completed.
+func PublishUpdateMetadata(slug, description string, keywords []string) error {
+	payload := map[string]any{}
+	if description != "" {
+		payload["description"] = description
+	}
+	if len(keywords) > 0 {
+		payload["keywords"] = keywords
+	}
+	if len(payload) == 0 {
+		return nil // nothing declared in the manifest to sync
+	}
+	body, _ := json.Marshal(payload)
+	status, respBody, err := publishJSON(http.MethodPatch, registryBase()+"/registry/packages/"+url.PathEscape(slug), body)
+	if err != nil {
+		return fmt.Errorf("update package metadata for %q: %w", slug, err)
+	}
+	if status == http.StatusOK {
+		return nil
+	}
+	return fmt.Errorf("update package metadata for %q: HTTP %d: %s", slug, status, string(respBody))
+}
+
 // PublishCreateVersion adds version under slug. Returns nil on 201; returns
 // ErrVersionExists (still wrapped) on 409 so callers can choose to upload a
 // new variant against an existing version.

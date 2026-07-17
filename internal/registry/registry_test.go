@@ -316,3 +316,97 @@ func TestPublishCreateVersionOmitsEmptyMetadata(t *testing.T) {
 		}
 	}
 }
+
+// TestPublishUpdateMetadataSendsDescriptionAndKeywords verifies the GIS-268 F/G
+// metadata sync: one PATCH /registry/packages/<slug> carrying the manifest's
+// current description and keywords (keywords verbatim — the registry normalizes).
+func TestPublishUpdateMetadataSendsDescriptionAndKeywords(t *testing.T) {
+	var (
+		gotMethod, gotPath string
+		gotBody            map[string]any
+		calls              int
+	)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		gotMethod, gotPath = r.Method, r.URL.Path
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+	t.Setenv("FGLPKG_REGISTRY", ts.URL)
+
+	if err := registry.PublishUpdateMetadata("demo", "A neat package", []string{"CLI", "Tool"}); err != nil {
+		t.Fatalf("PublishUpdateMetadata: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("expected exactly one request, got %d", calls)
+	}
+	if gotMethod != http.MethodPatch {
+		t.Errorf("method = %s, want PATCH", gotMethod)
+	}
+	if gotPath != "/registry/packages/demo" {
+		t.Errorf("path = %s, want /registry/packages/demo", gotPath)
+	}
+	if got, _ := gotBody["description"].(string); got != "A neat package" {
+		t.Errorf("description = %q, want %q", got, "A neat package")
+	}
+	kw, _ := gotBody["keywords"].([]any)
+	if len(kw) != 2 || kw[0] != "CLI" || kw[1] != "Tool" {
+		t.Errorf("keywords = %v, want [CLI Tool] verbatim", gotBody["keywords"])
+	}
+}
+
+// TestPublishUpdateMetadataDescriptionOnlyOmitsKeywords: a manifest with a
+// description but no keywords sends description only (no keywords key), so an
+// absent keyword list never clears keywords already stored on the registry.
+func TestPublishUpdateMetadataDescriptionOnlyOmitsKeywords(t *testing.T) {
+	var gotBody map[string]any
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+	t.Setenv("FGLPKG_REGISTRY", ts.URL)
+
+	if err := registry.PublishUpdateMetadata("demo", "only a description", nil); err != nil {
+		t.Fatalf("PublishUpdateMetadata: %v", err)
+	}
+	if _, present := gotBody["description"]; !present {
+		t.Error("description should be present in the payload")
+	}
+	if _, present := gotBody["keywords"]; present {
+		t.Error("keywords should be omitted when the manifest declares none")
+	}
+}
+
+// TestPublishUpdateMetadataEmptyIsNoop: nothing declared → no request at all.
+func TestPublishUpdateMetadataEmptyIsNoop(t *testing.T) {
+	calls := 0
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+	t.Setenv("FGLPKG_REGISTRY", ts.URL)
+
+	if err := registry.PublishUpdateMetadata("demo", "", nil); err != nil {
+		t.Fatalf("empty metadata should be a silent no-op, got %v", err)
+	}
+	if calls != 0 {
+		t.Errorf("expected no HTTP request for empty metadata, got %d", calls)
+	}
+}
+
+// TestPublishUpdateMetadataNon2xxIsError: an older registry (or a rejected
+// value) yields an error the publish path can log as non-fatal.
+func TestPublishUpdateMetadataNon2xxIsError(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, `{"error":"unknown operation"}`, http.StatusBadRequest)
+	}))
+	defer ts.Close()
+	t.Setenv("FGLPKG_REGISTRY", ts.URL)
+
+	if err := registry.PublishUpdateMetadata("demo", "x", []string{"y"}); err == nil {
+		t.Fatal("expected an error on HTTP 400, got nil")
+	}
+}

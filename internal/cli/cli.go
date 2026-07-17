@@ -1575,6 +1575,11 @@ func publishPackage(m *manifest.Manifest, registryURL, generoMajor string, dryRu
 		fmt.Printf("            body: <%d bytes zip>\n", len(zipData))
 		fmt.Printf("  [dry-run] would POST   %s/registry/packages/%s/versions/%s/submit\n",
 			registryURL, slug, m.Version)
+		if m.Description != "" || len(m.Keywords) > 0 {
+			fmt.Printf("  [dry-run] would PATCH  %s/registry/packages/%s   (sync search metadata)\n",
+				registryURL, slug)
+			fmt.Printf("            body: {description:%q, keywords:%v}\n", m.Description, m.Keywords)
+		}
 		return nil
 	}
 
@@ -1603,7 +1608,22 @@ func publishPackage(m *manifest.Manifest, registryURL, generoMajor string, dryRu
 
 	// 5. Submit for review.
 	fmt.Println("  → POST   /registry/packages/" + slug + "/versions/" + m.Version + "/submit")
-	return registry.PublishSubmit(slug, m.Version)
+	if err := registry.PublishSubmit(slug, m.Version); err != nil {
+		return err
+	}
+
+	// 6. Sync package discovery metadata (description + keywords) so edits made
+	//    after the slug was first created still reach the registry and feed
+	//    `fglpkg search` (GIS-268 F/G). Best-effort: the version is already
+	//    published, so an older registry without the metadata op — or any
+	//    transient failure — warns rather than failing the publish.
+	if m.Description != "" || len(m.Keywords) > 0 {
+		fmt.Println("  → PATCH  /registry/packages/" + slug + "   (description, keywords)")
+		if err := registry.PublishUpdateMetadata(slug, m.Description, m.Keywords); err != nil {
+			fmt.Printf("    ⚠ could not sync search metadata (description/keywords): %v\n", err)
+		}
+	}
+	return nil
 }
 
 // dryRunScalar renders an optional scalar metadata field for the dry-run
