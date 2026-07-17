@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/4js-mikefolcher/fglpkg/internal/manifest"
@@ -790,6 +791,99 @@ func TestValidateForPublishCollectsAllMissing(t *testing.T) {
 		"repository is required",
 		"author is required",
 	} {
+		if !containsHelper(err.Error(), want) {
+			t.Errorf("err = %q, want one containing %q", err.Error(), want)
+		}
+	}
+}
+
+// TestValidateForPublishBadName verifies that a name which does not normalize
+// to a valid slug is rejected, while a name that merely needs canonicalization
+// (case, or '_'/'.' separators) is accepted — matching the publish path, which
+// canonicalizes before uploading. Note Canonical only collapses '-_.' runs and
+// lowercases; it does NOT turn spaces into hyphens, so "My Package" is invalid.
+func TestValidateForPublishBadName(t *testing.T) {
+	cases := []struct {
+		name    string
+		pkgName string
+		wantErr bool
+	}{
+		{"case_normalization_ok", "Fgl.AI.SDK", false},
+		{"underscore_normalization_ok", "fgl_ai_sdk", false},
+		{"already_canonical_ok", "my-package", false},
+		{"space_not_normalized", "My Package", true},
+		{"too_short", "a", true},
+		{"non_alphanumeric_only", "!!!", true},
+		{"empty_after_trim_handled_by_validate", " ", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newPublishableManifest()
+			m.Name = tc.pkgName
+			err := m.ValidateForPublish()
+			if tc.wantErr && err == nil {
+				t.Fatalf("expected error for name %q", tc.pkgName)
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("unexpected error for name %q: %v", tc.pkgName, err)
+			}
+			if tc.wantErr && err != nil && !containsHelper(err.Error(), "not a valid package name") {
+				// " " is caught by Validate() as a missing name, not the format
+				// check — so only assert the format message for genuine format
+				// failures.
+				if strings.TrimSpace(tc.pkgName) != "" {
+					t.Errorf("err = %q, want one mentioning an invalid package name", err.Error())
+				}
+			}
+		})
+	}
+}
+
+// TestValidateForPublishRejectsBadVersion verifies strict semver enforcement
+// at publish: present-but-malformed versions are rejected.
+func TestValidateForPublishBadVersion(t *testing.T) {
+	cases := []struct {
+		name    string
+		version string
+		wantErr bool
+	}{
+		{"plain_ok", "1.2.3", false},
+		{"prerelease_ok", "1.2.3-rc.1", false},
+		{"leading_v", "v1.2.3", true},
+		{"leading_zero", "1.02.3", true},
+		{"two_component", "1.2", true},
+		{"not_a_number", "latest", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newPublishableManifest()
+			m.Version = tc.version
+			err := m.ValidateForPublish()
+			if tc.wantErr && err == nil {
+				t.Fatalf("expected error for version %q", tc.version)
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("unexpected error for version %q: %v", tc.version, err)
+			}
+			if tc.wantErr && err != nil && !containsHelper(err.Error(), "not valid semver") {
+				t.Errorf("err = %q, want one mentioning invalid semver", err.Error())
+			}
+		})
+	}
+}
+
+// TestValidateForPublishCollectsFormatAndMissing verifies a missing field and
+// a malformed version surface together in one error, not one-at-a-time.
+func TestValidateForPublishCollectsFormatAndMissing(t *testing.T) {
+	m := newPublishableManifest()
+	m.License = ""
+	m.Version = "not-semver"
+
+	err := m.ValidateForPublish()
+	if err == nil {
+		t.Fatal("expected error when license missing and version malformed")
+	}
+	for _, want := range []string{"license is required", "not valid semver"} {
 		if !containsHelper(err.Error(), want) {
 			t.Errorf("err = %q, want one containing %q", err.Error(), want)
 		}

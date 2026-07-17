@@ -12,7 +12,7 @@ import (
 
 	"github.com/4js-mikefolcher/fglpkg/internal/config"
 	"github.com/4js-mikefolcher/fglpkg/internal/semver"
-	"github.com/4js-mikefolcher/fglpkg/internal/slug"
+	slugutil "github.com/4js-mikefolcher/fglpkg/internal/slug"
 )
 
 // componentTypeName matches the Genero COMPONENTTYPE lexical rule:
@@ -816,21 +816,38 @@ func (m *Manifest) ValidateForPublish() error {
 	if err := m.Validate(); err != nil {
 		return err
 	}
-	var missing []string
+	var problems []string
 	for _, f := range publishRequiredFields {
 		if strings.TrimSpace(f.getter(m)) == "" {
 			line := "  - " + f.name + " is required"
 			if f.hintMsg != "" {
 				line += " (" + f.hintMsg + ")"
 			}
-			missing = append(missing, line)
+			problems = append(problems, line)
 		}
 	}
-	if len(missing) == 0 {
+	// Format checks: name and version are present (Validate guaranteed
+	// non-empty) but may be malformed. The backend can't be relied on to
+	// reject these — a secondary Artifactory repo stores whatever it's given
+	// — so enforce them here, the single choke point both publish paths hit.
+	// The name is validated in its normalized form to match the publish
+	// path, which canonicalizes before uploading (GIS-271).
+	if slug := slugutil.Canonical(m.Name); !slugutil.IsValid(slug) {
+		problems = append(problems, fmt.Sprintf(
+			"  - name %q is not a valid package name: normalizes to slug %q "+
+				"(need 2-64 chars; lowercase letters, digits, hyphens; must start and end alphanumeric)",
+			m.Name, slug))
+	}
+	if !semver.ValidateVersion(strings.TrimSpace(m.Version)) {
+		problems = append(problems, fmt.Sprintf(
+			`  - version %q is not valid semver (expected MAJOR.MINOR.PATCH[-prerelease], e.g. "1.2.3")`,
+			m.Version))
+	}
+	if len(problems) == 0 {
 		return nil
 	}
 	return fmt.Errorf("manifest is not ready to publish:\n%s",
-		strings.Join(missing, "\n"))
+		strings.Join(problems, "\n"))
 }
 
 // validateWebcomponentNames enforces the COMPONENTTYPE naming rules on
@@ -869,10 +886,10 @@ func (m *Manifest) validateNoSelfDependency() error {
 	if m.Name == "" {
 		return nil // name is validated separately; nothing to compare against
 	}
-	self := slug.Canonical(m.Name)
+	self := slugutil.Canonical(m.Name)
 	for _, scope := range []Scope{ScopeProd, ScopeDev, ScopeOptional} {
 		for dep := range m.bucket(scope).FGL {
-			if slug.Canonical(dep) == self {
+			if slugutil.Canonical(dep) == self {
 				return fmt.Errorf(
 					"package %q cannot depend on itself (found %q in %s dependencies)",
 					m.Name, dep, scope,
