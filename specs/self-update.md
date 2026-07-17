@@ -1,6 +1,6 @@
 # Spec: `fglpkg self-update` — self-updating binary + periodic update notices
 
-**Status:** 📋 Not started — GIS-255 (spec ready)
+**Status:** ✅ Implemented — GIS-255. The client (`self-update` + `upgrade` alias, passive update check, R1 Ed25519 signature verify against the pinned root, R2 GI-served recovery info) merged to `main` via PR #17. The companion GI endpoint `GET /registry/fglpkg/latest` (GIS-256) shipped and is Closed, so self-update is wired end-to-end. Remaining: macOS delivery is gated on Developer-ID-notarized releases (GIS-257).
 **Date:** 2026-07-14
 **Author:** Mike Folcher
 **Motivation:** fglpkg ships as a standalone binary users copy into `PATH` by hand
