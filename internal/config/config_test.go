@@ -111,6 +111,27 @@ func TestResolve_UnknownAuthError(t *testing.T) {
 	}
 }
 
+// TestResolve_NonGIGeneroRejected is the regression test for GIS-249 C1: a
+// type=genero registry with any name other than the built-in "gi" must be
+// rejected, since its configured URL is dead config (the Genero client only
+// honours the process-global registryBase()) and would mis-attribute results.
+func TestResolve_NonGIGeneroRejected(t *testing.T) {
+	project := []Registry{{Name: "mirror", Type: TypeGenero, URL: "https://other.example", Priority: 2}}
+	_, err := Resolve(BuiltinGI(""), nil, project)
+	if err == nil {
+		t.Fatal("expected a non-gi genero registry to be rejected")
+	}
+}
+
+// TestResolve_GIGeneroRetargetStillAllowed confirms the C1 rule does not block
+// retargeting the built-in GI registry by name (a genero entry named "gi").
+func TestResolve_GIGeneroRetargetStillAllowed(t *testing.T) {
+	project := []Registry{{Name: "gi", Type: TypeGenero, URL: "https://internal-gi.example"}}
+	if _, err := Resolve(BuiltinGI(""), nil, project); err != nil {
+		t.Fatalf("gi genero retarget should be allowed: %v", err)
+	}
+}
+
 func TestLoadGlobal_MissingIsEmpty(t *testing.T) {
 	regs, err := LoadGlobal(t.TempDir())
 	if err != nil {

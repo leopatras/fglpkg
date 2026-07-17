@@ -30,7 +30,7 @@ func mkJar(t *testing.T, jarsDir, name string) {
 
 func TestPruneToPlanRemovesOrphansKeepsWanted(t *testing.T) {
 	home := t.TempDir()
-	inst := New(home, "", "")
+	inst := New(home, "", "", "")
 	if err := inst.ensureDirs(); err != nil {
 		t.Fatal(err)
 	}
@@ -78,7 +78,7 @@ func TestPruneToPlanRemovesOrphansKeepsWanted(t *testing.T) {
 
 func TestPruneToPlanNoopWhenEverythingWanted(t *testing.T) {
 	home := t.TempDir()
-	inst := New(home, "", "")
+	inst := New(home, "", "", "")
 	if err := inst.ensureDirs(); err != nil {
 		t.Fatal(err)
 	}
@@ -103,7 +103,7 @@ func TestPruneToPlanNoopWhenEverythingWanted(t *testing.T) {
 // packagesDir holds only BDL/mixed packages, so a stray dir gets pruned.
 func TestPruneToPlanIgnoresWebcomponentPlanEntries(t *testing.T) {
 	home := t.TempDir()
-	inst := New(home, "", "")
+	inst := New(home, "", "", "")
 	if err := inst.ensureDirs(); err != nil {
 		t.Fatal(err)
 	}

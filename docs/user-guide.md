@@ -1113,6 +1113,21 @@ Descriptor fields:
 | `auth` | No | `bearer` (default) \| `basic` \| `apikey` \| `anonymous` |
 | `packages` | No | Glob allow-list (e.g. `["acme-*"]`); names outside it are never queried against this repo |
 
+Instead of hand-editing JSON, let `fglpkg` manage these entries — it validates
+the result before writing and auto-assigns the priority after `gi` when you omit
+`--priority`:
+
+```bash
+fglpkg registry add acme https://artifactory.acme.example/artifactory \
+    --repo-key fgl-internal-generic --packages "acme-*"   # writes ~/.fglpkg/config.json
+fglpkg registry add acme https://… --repo-key K --project # writes the project fglpkg.json
+fglpkg registry remove acme
+```
+
+`add` defaults `--type` to `artifactory`; pass `--type genero`, `--auth`, or
+`--priority` as needed. It refuses to redefine the built-in `gi` or collide on
+name or priority.
+
 Check the effective configuration and login status any time:
 
 ```bash

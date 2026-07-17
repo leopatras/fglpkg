@@ -1,6 +1,7 @@
 # Spec: Complete `fglpkg search` metadata — descriptions in every result + keyword search
 
-**Status:** 📋 Not started — GIS-268 (spec ready)
+**Status:** 🟡 In progress — GIS-268. Client half of **(E)** shipped (Artifactory `Search` now reads
+the sidecar for description/author). **(F)/(G)** still need the GI-service change.
 **Date:** 2026-07-15
 **Author:** Mike Folcher
 **Motivation:** Two defects surfaced while testing `fglpkg search` after the Artifactory merge

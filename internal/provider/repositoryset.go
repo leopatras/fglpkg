@@ -3,6 +3,7 @@ package provider
 import (
 	"errors"
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -86,6 +87,16 @@ func (rs *RepositorySet) DeclarePin(name, registry string) error {
 		return nil
 	}
 	rs.declaredPins[name] = registry
+	// Warn: an author-declared transitive pin can steer a name toward a specific
+	// repository without the consumer's acknowledgement (spec ISSUE-D, decision:
+	// warn). The consumer's own root pin takes precedence and returned above, so
+	// reaching here means the source was chosen by a dependency, not by the
+	// consumer. Advise pinning explicitly to confirm the intended source.
+	fmt.Fprintf(os.Stderr,
+		"warning: dependency %q is pinned to registry %q by another package's manifest; "+
+			"add an explicit pin in fglpkg.json to confirm this source:\n"+
+			"      \"dependencies\": { \"fgl\": { %q: { \"version\": \"…\", \"registry\": %q } } }\n",
+		name, registry, name, registry)
 	return nil
 }
 
@@ -111,6 +122,22 @@ func (rs *RepositorySet) Versions(name string) ([]resolver.CandidateVersion, err
 		return nil, err
 	}
 	return d.versions, nil
+}
+
+// VersionsFrom lists the versions of name from exactly the named registry,
+// bypassing the routing + collision guard. It honours a lockfile-recorded
+// Source (spec §6/§9): a locked package is re-checked against its own
+// repository only, never re-routed. registryName "" is treated as the built-in
+// GI registry. Returns an error if the named registry is not configured.
+func (rs *RepositorySet) VersionsFrom(registryName, name string) ([]resolver.CandidateVersion, error) {
+	if registryName == "" {
+		registryName = config.GIName
+	}
+	p := rs.byName(registryName)
+	if p == nil {
+		return nil, fmt.Errorf("locked registry %q is not configured", registryName)
+	}
+	return p.FetchVersions(name)
 }
 
 // Info implements resolver.InfoFetcher, routing to the same provider Versions did.

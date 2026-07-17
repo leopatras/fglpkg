@@ -349,14 +349,29 @@ login".
 	},
 	{
 		Name:    "registry",
-		Summary: "List configured package repositories",
-		Usage:   "fglpkg registry list",
+		Summary: "Manage configured package repositories",
+		Usage: "fglpkg registry list\n" +
+			"fglpkg registry add <name> <url> [--type genero|artifactory] [--repo-key K]\n" +
+			"                                 [--auth bearer|basic|apikey|anonymous] [--priority N]\n" +
+			"                                 [--packages 'acme-*,foo-*'] [--project]\n" +
+			"fglpkg registry remove <name> [--project]",
 		Long: `SUBCOMMANDS:
   list                     Show configured repositories, priority, auth scheme, and login status
+  add <name> <url>         Add a repository descriptor (defaults to type=artifactory)
+  remove <name>            Remove a configured repository
+
+FLAGS (add):
+  --type <t>               genero | artifactory (default artifactory)
+  --repo-key <k>           Artifactory generic-repo key (required for type=artifactory)
+  --auth <scheme>          bearer | basic | apikey | anonymous (default bearer)
+  --priority <n>           Lower is tried first; unique. Defaults to max+1 when omitted
+  --packages <globs>       Comma-separated name-scope allow-list (e.g. 'acme-*,foo-*')
+  --project                Write to the project fglpkg.json instead of ~/.fglpkg/config.json
 
 Repositories are configured via a "registries" array in fglpkg.json and/or
 ~/.fglpkg/config.json, alongside the built-in Genero Intelligence registry.
-Lower "priority" is tried first; priorities must be unique.
+Lower "priority" is tried first; priorities must be unique. 'add'/'remove' edit
+these files for you; credentials still flow through 'fglpkg login --registry'.
 
 LOGIN column values:
   yes     credentials are stored for this repo (via 'fglpkg login')
