@@ -347,6 +347,8 @@ fglpkg env --global                      # Print exports for all global packages
 fglpkg env --gst                         # Print in Genero Studio format
 fglpkg search json                       # Search the registry (matches name/description)
 fglpkg search --all                      # List every package in the registry
+                                         #   a STATUS column appears only when a match is
+                                         #   deprecated, e.g. "chart-3d  1.2.3  deprecated -> chart-3d-ng  3D charts"
 fglpkg audit signatures                  # Verify registry signatures of locked packages
 fglpkg bdl <pkg> <module> [args...]      # Run a BDL program from a package
 fglpkg bdl --list                        # List available BDL programs
@@ -366,6 +368,12 @@ fglpkg publish --ci                      # Non-interactive publish (CI): needs F
 fglpkg publish --private                 # Publish as private (overrides fglpkg.json visibility)
 fglpkg publish --public                  # Publish as public (overrides fglpkg.json visibility)
 fglpkg publish --changelog "notes..."    # Set this version's changelog inline (overrides CHANGELOG.md)
+
+# Deprecating & relocating (npm-style; stays installable, warns consumers)
+fglpkg deprecate chart-3d@1.2.3 "reason"       # Deprecate one version with a message
+fglpkg deprecate chart-3d@1.2.3 --moved-to chart-3d-ng  # Deprecate + point at a successor
+fglpkg deprecate chart-3d --moved-to chart-3d-ng        # Relocate the whole package (rename)
+fglpkg deprecate chart-3d@1.2.3 --undo         # Lift the deprecation
 
 # Secondary repositories (JFrog Artifactory) — see section below
 fglpkg registry list                     # Show configured repositories + auth status
@@ -432,6 +440,47 @@ The publish flow:
 Authentication uses the same OAuth/PAT bearer as the other consumer commands
 (`FGLPKG_TOKEN` overrides stored credentials). No GitHub token is involved in
 publishing.
+
+### Deprecating & relocating packages
+
+`fglpkg deprecate` marks a published version (or a whole package) as
+deprecated, following the **npm model**: the version stays **fully installable
+and listed** — consumers just get a non-fatal warning pointing at the
+successor. This is how a **rename or relocation** is expressed; there is no
+separate `rename`/`migrate` command.
+
+```bash
+# Deprecate one version with a message (owner-only; requires login)
+fglpkg deprecate chart-3d@1.2.3 "security fix in 1.2.4; please upgrade"
+
+# Rename / relocate — message auto-fills to "chart-3d has moved to chart-3d-ng"
+fglpkg deprecate chart-3d@1.2.3 --moved-to chart-3d-ng
+
+# Relocate the whole package (every version), pinning a successor version
+fglpkg deprecate chart-3d --moved-to chart-3d-ng@2.0.0
+
+# Lift a deprecation
+fglpkg deprecate chart-3d@1.2.3 --undo
+```
+
+A bare `<pkg>` (no `@version`) deprecates/relocates the whole package; with
+`@<version>` it targets that one version. A message is required unless
+`--moved-to` is given (which auto-fills one). `--json` prints a machine-readable
+result. Re-running `deprecate` edits the existing message/successor
+(idempotent).
+
+Deprecation is **not** withdrawal: it never hides or un-lists the package, and
+it never renames the slug in place — it records an advisory pointer to a
+separately-published successor. What consumers see:
+
+- **`install` / `update`** — a `warning:` line on stderr for each deprecated
+  resolved dependency (including transitive ones), with a `→ consider: fglpkg
+  install <successor>` hint when a successor is set. The install still
+  succeeds; deprecation never blocks it. (Warnings fire on a fresh resolve, not
+  on a lock-file-only reinstall.)
+- **`info`** — a `Deprecated:` / `Moved to:` block under the header.
+- **`outdated`** — a `deprecated → <successor>` note in a `Notes` column for any
+  installed dependency that is deprecated.
 
 ### Private Packages
 

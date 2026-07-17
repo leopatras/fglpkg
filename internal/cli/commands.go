@@ -275,6 +275,32 @@ CHANGELOG:
 `,
 	},
 	{
+		Name:       "deprecate",
+		Summary:    "Mark a published version or package deprecated",
+		ListDetail: "\n(npm-style: stays installable, warns consumers;\n --moved-to <pkg> records a successor/rename; --undo lifts it)",
+		Args:       "<pkg>",
+		Usage: "fglpkg deprecate <pkg>[@<version>] [<message>] [--moved-to <newpkg>[@<version>]]\n" +
+			"fglpkg deprecate <pkg>[@<version>] --message <text> [--moved-to <newpkg>]\n" +
+			"fglpkg deprecate <pkg>[@<version>] --undo",
+		Long: `FLAGS:
+  --message <text>         The deprecation message (npm-style). Alternative to
+                           passing the message as a positional argument.
+  --moved-to <newpkg>[@<version>]
+                           Record a successor package (the rename/relocation
+                           case). Auto-fills the message "<pkg> has moved to
+                           <newpkg>" when no message is given.
+  --undo                   Lift the deprecation. Forbids a message / --moved-to.
+  --json                   Emit a machine-readable result instead of text.
+
+Deprecation is advisory (the npm model): a deprecated version stays fully
+installable and listed — consumers just get a non-fatal warning on install,
+'info', and 'outdated', pointing at the successor when --moved-to is set. With
+a bare <pkg> (no @version) the whole package is deprecated/relocated. This is
+an owner-only write and requires login. Deprecation does NOT withdraw or hide a
+package (that is a separate operation).
+`,
+	},
+	{
 		Name:       "pack",
 		Summary:    "Build the publishable zip locally without uploading",
 		ListDetail: "\n(--list prints contents without writing a file)",

@@ -27,6 +27,17 @@ import (
 // with errors.Is(err, registry.ErrNotFound).
 var ErrNotFound = errors.New("package not found in registry")
 
+// ErrUnauthorized / ErrForbidden / ErrMessageTooLong let publisher-side
+// callers map a write's HTTP status to an actionable message. They are
+// wrapped (%w) so callers detect them with errors.Is. ErrUnauthorized is a
+// 401 (no/expired credentials), ErrForbidden a 403 (authenticated but not the
+// owning partner), ErrMessageTooLong a 400 from the registry's scalar cap.
+var (
+	ErrUnauthorized   = errors.New("not authorized")
+	ErrForbidden      = errors.New("forbidden")
+	ErrMessageTooLong = errors.New("value exceeds the registry length limit")
+)
+
 const (
 	defaultRegistryBase = "https://service.generointelligence.ai"
 )
@@ -92,6 +103,17 @@ type PackageInfo struct {
 	UploadedAt string     `json:"uploadedAt,omitempty"`
 	Uploader   string     `json:"uploader,omitempty"`
 	Signature  *Signature `json:"signature,omitempty"`
+
+	// ── npm-style deprecation (advisory; the version stays installable) ──
+	// Deprecated is true when either this version OR the whole package is
+	// deprecated (whole-package relocation applies to every version). The CLI
+	// surfaces these as a non-fatal warning + successor hint; it never filters
+	// or blocks on them. DeprecationMessage/MovedTo carry the version-level
+	// values when present, otherwise the package-level ones. See
+	// specs/deprecate-cli.md.
+	Deprecated         bool   `json:"deprecated,omitempty"`
+	DeprecationMessage string `json:"deprecationMessage,omitempty"`
+	MovedTo            string `json:"movedTo,omitempty"`
 }
 
 // Signature is the Ed25519 signature envelope for a registry-signed artifact.
@@ -135,6 +157,11 @@ type SearchResult struct {
 	// Source is the logical repository this result came from, set by the
 	// multi-provider search fan-out. Empty for single-registry results.
 	Source string `json:"source,omitempty"`
+	// Deprecated flags an npm-style deprecated package (package-level / latest
+	// version, per the browse listing). MovedTo carries the successor slug when
+	// the deprecation records a relocation.
+	Deprecated bool   `json:"deprecated,omitempty"`
+	MovedTo    string `json:"movedTo,omitempty"`
 }
 
 // RegistryConfig is returned by the publisher registry's /config endpoint.
@@ -221,6 +248,21 @@ func FetchInfoForGenero(name, version, generoMajor string) (*PackageInfo, error)
 		Uploader:         art.Uploader,
 		Signature:        art.Signature.toSignature(),
 	}
+	// npm-style deprecation: a version is deprecated if the version-level flag
+	// OR the package-level flag is set (whole-package relocation applies to
+	// every version). Version-level message/successor win; the package-level
+	// values fill in when the version itself carries none.
+	info.Deprecated = v.Deprecated || d.Deprecated
+	if info.Deprecated {
+		info.DeprecationMessage = v.DeprecationMessage
+		if info.DeprecationMessage == "" {
+			info.DeprecationMessage = d.DeprecationMessage
+		}
+		info.MovedTo = v.MovedTo
+		if info.MovedTo == "" {
+			info.MovedTo = d.MovedTo
+		}
+	}
 	for _, a := range v.Artifacts {
 		info.Variants = append(info.Variants, VariantInfo{
 			GeneroMajor: strings.TrimPrefix(a.Variant, "genero"),
@@ -297,6 +339,8 @@ func Search(term string) ([]SearchResult, error) {
 			LatestVersion: p.LatestVersion,
 			Description:   p.Description,
 			Author:        p.Owner.Name,
+			Deprecated:    p.Deprecated,
+			MovedTo:       p.MovedTo,
 		})
 	}
 	return results, nil
@@ -469,6 +513,73 @@ func PublishSubmit(slug, version string) error {
 	return fmt.Errorf("submit %s@%s: HTTP %d: %s", slug, version, status, string(respBody))
 }
 
+// deprecationBody builds the JSON PATCH body shared by the two deprecate
+// writers. undo takes precedence: an undo request sends only {deprecated:false}
+// (the registry clears the message + successor). Otherwise it sends
+// {deprecated:true, deprecationMessage, movedTo}, omitting movedTo when empty.
+func deprecationBody(message, movedTo string, undo bool) []byte {
+	if undo {
+		b, _ := json.Marshal(map[string]any{"deprecated": false})
+		return b
+	}
+	payload := map[string]any{
+		"deprecated":         true,
+		"deprecationMessage": message,
+	}
+	if movedTo != "" {
+		payload["movedTo"] = movedTo
+	}
+	b, _ := json.Marshal(payload)
+	return b
+}
+
+// deprecateResultError maps a non-2xx status from a deprecate PATCH to a typed
+// error so the CLI can render the actionable message. 200/204 → nil.
+func deprecateResultError(what string, status int, respBody []byte) error {
+	switch {
+	case status >= 200 && status < 300:
+		return nil
+	case status == http.StatusUnauthorized:
+		return fmt.Errorf("%s: %w", what, ErrUnauthorized)
+	case status == http.StatusForbidden:
+		return fmt.Errorf("%s: %w", what, ErrForbidden)
+	case status == http.StatusNotFound:
+		return fmt.Errorf("%s: %w", what, ErrNotFound)
+	case status == http.StatusBadRequest:
+		return fmt.Errorf("%s: %w: %s", what, ErrMessageTooLong, strings.TrimSpace(string(respBody)))
+	default:
+		return fmt.Errorf("%s: HTTP %d: %s", what, status, string(respBody))
+	}
+}
+
+// PublishDeprecateVersion sets or clears npm-style deprecation on one version
+// via PATCH /registry/packages/{slug}/versions/{version} (owner-only). The
+// version stays fully installable and listed; this only attaches (or clears)
+// the advisory message + optional successor. undo=true lifts the deprecation.
+func PublishDeprecateVersion(slug, version, message, movedTo string, undo bool) error {
+	slug = slugutil.Canonical(slug)
+	u := fmt.Sprintf("%s/registry/packages/%s/versions/%s",
+		registryBase(), url.PathEscape(slug), url.PathEscape(version))
+	status, respBody, err := publishJSON(http.MethodPatch, u, deprecationBody(message, movedTo, undo))
+	if err != nil {
+		return fmt.Errorf("deprecate %s@%s: %w", slug, version, err)
+	}
+	return deprecateResultError(fmt.Sprintf("deprecate %s@%s", slug, version), status, respBody)
+}
+
+// PublishDeprecatePackage sets or clears npm-style deprecation on the whole
+// package via PATCH /registry/packages/{slug} (owner-only) — the whole-package
+// relocation case, applied to every version. undo=true lifts it.
+func PublishDeprecatePackage(slug, message, movedTo string, undo bool) error {
+	slug = slugutil.Canonical(slug)
+	u := fmt.Sprintf("%s/registry/packages/%s", registryBase(), url.PathEscape(slug))
+	status, respBody, err := publishJSON(http.MethodPatch, u, deprecationBody(message, movedTo, undo))
+	if err != nil {
+		return fmt.Errorf("deprecate %s: %w", slug, err)
+	}
+	return deprecateResultError(fmt.Sprintf("deprecate %s", slug), status, respBody)
+}
+
 // VariantsFor reports which variants are already published for (slug, version).
 // Returns ErrNotFound wrapped if the package or version doesn't exist yet,
 // which the publish flow treats as "nothing to clobber". On the new protocol
@@ -545,6 +656,10 @@ type apiVersionSummary struct {
 	Dependencies  apiVersionDeps      `json:"dependencies"`
 	Readme        string              `json:"readme"`
 	Userguide     string              `json:"userguide"`
+	// npm-style deprecation, per-version (advisory; version stays installable).
+	Deprecated         bool   `json:"deprecated"`
+	DeprecationMessage string `json:"deprecation_message"`
+	MovedTo            string `json:"moved_to"`
 }
 
 type apiVersionDeps struct {
@@ -567,6 +682,11 @@ type apiListedPackage struct {
 	LatestVersion string              `json:"latest_version"`
 	Downloads     int64               `json:"downloads"`
 	Tags          map[string][]string `json:"tags"`
+	// Package-level npm-style deprecation (whole-package relocation). Applies
+	// to every version of the package.
+	Deprecated         bool   `json:"deprecated"`
+	DeprecationMessage string `json:"deprecation_message"`
+	MovedTo            string `json:"moved_to"`
 }
 
 type apiPackageDetail struct {

@@ -1,6 +1,6 @@
 # Spec: `fglpkg deprecate` — CLI (publisher + consumer surfacing)
 
-**Status:** 📋 Not started — GIS-247 (spec ready; GI-side endpoints already implemented)
+**Status:** ✅ Implemented — GIS-247 (CLI shipped: `deprecate` command + consumer surfacing on install/info/outdated; GI-side endpoints already live)
 **Date:** 2026-07-02
 **Author:** Mike Folcher
 **Tracking:** Workstream C in [docs/outstanding-work.md](../docs/outstanding-work.md) §4;
