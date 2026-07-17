@@ -357,6 +357,15 @@ func Exists(dir string) bool {
 	return err == nil
 }
 
+// Remove deletes dir/fglpkg.lock. A missing file is not an error, so callers
+// may remove unconditionally without racing Exists.
+func Remove(dir string) error {
+	if err := os.Remove(filepath.Join(dir, Filename)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
 // ─── Validation ───────────────────────────────────────────────────────────────
 
 // ValidationResult is returned by Validate, describing any problems found.

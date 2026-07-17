@@ -760,10 +760,10 @@ func (i *Installer) Remove(name string) error {
 
 // ReconcileAfterRemove brings the install state back in line with a manifest
 // that has just had one or more dependencies removed. It re-resolves the
-// remaining graph, rewrites the lock file (so the removed package and its now
-// unreferenced JARs no longer reappear on the next install), and — when prune
-// is true — deletes installed packages and JARs that the resolved graph no
-// longer requires.
+// remaining graph, rewrites the lock file — or deletes it when the last
+// dependency is gone — so the removed package and its now unreferenced JARs no
+// longer reappear on the next install, and — when prune is true — deletes
+// installed packages and JARs that the resolved graph no longer requires.
 //
 // prune MUST be false for a global (~/.fglpkg) home: those package and JAR
 // directories are shared across every project, so pruning against a single
@@ -791,18 +791,52 @@ func (i *Installer) ReconcileAfterRemove(m *manifest.Manifest, projectDir string
 		return nil, fmt.Errorf("dependency resolution failed:\n%w", err)
 	}
 
-	// Rewrite the lock only if the project already had one; a `remove` should
-	// not conjure a lock for a project that was never installed.
-	if lockfile.Exists(projectDir) {
-		if err := lockfile.FromPlan(plan, m).Save(projectDir); err != nil {
-			return nil, fmt.Errorf("cannot write lock file: %w", err)
-		}
+	// Reconcile the lock first, before mutating disk: rewrite it from the
+	// re-resolved graph, or delete it when that graph is now empty. Always
+	// safe regardless of prune — the lock is project-local wherever artifacts
+	// live.
+	lockNote, err := reconcileLock(plan, m, projectDir)
+	if err != nil {
+		return nil, err
 	}
 
-	if !prune {
-		return nil, nil
+	var pruned []string
+	if prune {
+		diskPruned, err := i.pruneToPlan(plan)
+		if err != nil {
+			return pruned, err
+		}
+		pruned = append(pruned, diskPruned...)
 	}
-	return i.pruneToPlan(plan)
+	if lockNote != "" {
+		pruned = append(pruned, lockNote) // reported after the pruned artifacts
+	}
+	return pruned, nil
+}
+
+// reconcileLock brings the project lock file in line with a freshly re-resolved
+// plan after a dependency removal. It is a no-op when the project has no lock
+// (a `remove` must never conjure one for a project that was never installed).
+// When the removal empties the graph — exactly the case where the lock would
+// otherwise be rewritten with empty package and JAR lists — the lock is deleted
+// instead: a project with no dependencies has nothing to pin, and a leftover
+// empty fglpkg.lock is confusing (GIS-273). Otherwise the lock is rewritten
+// from the plan. Returns a human-readable note when the lock was deleted (for
+// the caller's summary), or "" when it was rewritten or absent.
+func reconcileLock(plan *resolver.Plan, m *manifest.Manifest, projectDir string) (string, error) {
+	if !lockfile.Exists(projectDir) {
+		return "", nil
+	}
+	if len(plan.Packages) == 0 && len(plan.JARs) == 0 {
+		if err := lockfile.Remove(projectDir); err != nil {
+			return "", fmt.Errorf("cannot remove empty lock file: %w", err)
+		}
+		return lockfile.Filename + " (no dependencies remain)", nil
+	}
+	if err := lockfile.FromPlan(plan, m).Save(projectDir); err != nil {
+		return "", fmt.Errorf("cannot write lock file: %w", err)
+	}
+	return "", nil
 }
 
 // pruneToPlan deletes installed BDL packages and JARs that are absent from

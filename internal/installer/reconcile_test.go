@@ -6,8 +6,11 @@ import (
 	"sort"
 	"testing"
 
+	"github.com/4js-mikefolcher/fglpkg/internal/genero"
+	"github.com/4js-mikefolcher/fglpkg/internal/lockfile"
 	"github.com/4js-mikefolcher/fglpkg/internal/manifest"
 	"github.com/4js-mikefolcher/fglpkg/internal/resolver"
+	"github.com/4js-mikefolcher/fglpkg/internal/semver"
 )
 
 func mkPkgDir(t *testing.T, packagesDir, name string) {
@@ -120,5 +123,80 @@ func TestPruneToPlanIgnoresWebcomponentPlanEntries(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(inst.packagesDir, "bdlpkg")); err != nil {
 		t.Errorf("BDL package must be retained: %v", err)
+	}
+}
+
+func writeStubLock(t *testing.T, dir string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, lockfile.Filename), []byte("{}\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Removing the last dependency empties the graph, so reconcileLock must delete
+// fglpkg.lock rather than leave an empty one behind (GIS-273).
+func TestReconcileLockDeletesLockWhenGraphEmpty(t *testing.T) {
+	dir := t.TempDir()
+	writeStubLock(t, dir)
+
+	m := &manifest.Manifest{Name: "proj", Version: "0.1.0"}
+	note, err := reconcileLock(&resolver.Plan{}, m, dir)
+	if err != nil {
+		t.Fatalf("reconcileLock: %v", err)
+	}
+	if lockfile.Exists(dir) {
+		t.Error("an empty graph must delete fglpkg.lock, but it still exists")
+	}
+	if note == "" {
+		t.Error("expected a deletion note for the caller's summary")
+	}
+}
+
+// A still-populated graph must rewrite (keep) the lock, never delete it, and
+// the rewrite must reflect the surviving package.
+func TestReconcileLockKeepsLockWhenGraphNonEmpty(t *testing.T) {
+	dir := t.TempDir()
+	writeStubLock(t, dir)
+
+	m := &manifest.Manifest{Name: "proj", Version: "0.1.0"}
+	plan := &resolver.Plan{
+		GeneroVersion: genero.MustParse("6.00.01"),
+		Packages: []resolver.ResolvedPackage{
+			{Name: "keeper", Version: semver.MustParse("1.0.0"), Scope: manifest.ScopeProd},
+		},
+	}
+	note, err := reconcileLock(plan, m, dir)
+	if err != nil {
+		t.Fatalf("reconcileLock: %v", err)
+	}
+	if note != "" {
+		t.Errorf("no deletion note expected when the lock is kept, got %q", note)
+	}
+	if !lockfile.Exists(dir) {
+		t.Fatal("a non-empty graph must keep fglpkg.lock")
+	}
+	lf, err := lockfile.Load(dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(lf.Packages) != 1 || lf.Packages[0].Name != "keeper" {
+		t.Errorf("rewritten lock = %+v, want a single package %q", lf.Packages, "keeper")
+	}
+}
+
+// reconcileLock must not conjure a lock for a project that never had one, even
+// when the graph is empty.
+func TestReconcileLockNoopWhenNoLock(t *testing.T) {
+	dir := t.TempDir()
+	m := &manifest.Manifest{Name: "proj", Version: "0.1.0"}
+	note, err := reconcileLock(&resolver.Plan{}, m, dir)
+	if err != nil {
+		t.Fatalf("reconcileLock: %v", err)
+	}
+	if lockfile.Exists(dir) {
+		t.Error("reconcileLock must not create a lock when none existed")
+	}
+	if note != "" {
+		t.Errorf("no note expected, got %q", note)
 	}
 }
