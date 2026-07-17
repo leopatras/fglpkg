@@ -1,7 +1,10 @@
 # Spec: Complete `fglpkg search` metadata — descriptions in every result + keyword search
 
-**Status:** 🟡 In progress — GIS-268. Client half of **(E)** shipped (Artifactory `Search` now reads
-the sidecar for description/author). **(F)/(G)** still need the GI-service change.
+**Status:** ✅ Done — GIS-268 (closed 2026-07-17). All three fixes shipped: **(E)** Artifactory
+`Search` sidecar enrichment (PR #12/#13); **(F)/(G)** the GI service side — updatable package
+description + keyword storage and `q` matching — on `package-management`, plus the fglpkg client
+push of the manifest's current `description` + `keywords` on every publish
+(`registry.PublishUpdateMetadata`, PR #22, merged to `main`).
 **Date:** 2026-07-15
 **Author:** Mike Folcher
 **Motivation:** Two defects surfaced while testing `fglpkg search` after the Artifactory merge
