@@ -159,6 +159,47 @@ func TestSearchMapsBrowseResponse(t *testing.T) {
 	}
 }
 
+// A package-level deprecation on the browse listing must surface on the
+// SearchResult so `search` can flag it inline without a detail fetch.
+func TestSearchSurfacesDeprecation(t *testing.T) {
+	ts := newPackagesServer(t, nil, map[string]any{
+		"packages": []map[string]any{
+			{
+				"slug":           "chart-3d",
+				"name":           "chart-3d",
+				"description":    "3D charts",
+				"latest_version": "1.2.3",
+				"owner":          map[string]any{"name": "ACME"},
+				"deprecated":     true,
+				"moved_to":       "chart-3d-ng",
+			},
+			{
+				"slug":           "chart-lite",
+				"name":           "chart-lite",
+				"latest_version": "0.9.0",
+				"owner":          map[string]any{"name": "ACME"},
+			},
+		},
+		"total": 2,
+	})
+	defer ts.Close()
+	t.Setenv("FGLPKG_REGISTRY", ts.URL)
+
+	results, err := registry.Search("chart")
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("got %d results, want 2", len(results))
+	}
+	if !results[0].Deprecated || results[0].MovedTo != "chart-3d-ng" {
+		t.Errorf("deprecated result = %+v, want Deprecated=true MovedTo=chart-3d-ng", results[0])
+	}
+	if results[1].Deprecated || results[1].MovedTo != "" {
+		t.Errorf("live result = %+v, want no deprecation", results[1])
+	}
+}
+
 func TestFetchVersionListMissingPackage(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)

@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/4js-mikefolcher/fglpkg/internal/config"
 	"github.com/4js-mikefolcher/fglpkg/internal/lockfile"
 	"github.com/4js-mikefolcher/fglpkg/internal/manifest"
 	"github.com/4js-mikefolcher/fglpkg/internal/provider"
@@ -22,6 +23,10 @@ type outdatedRow struct {
 	Wanted     string `json:"wanted"`
 	Latest     string `json:"latest"`
 	Status     string `json:"status"`
+	// Deprecated/MovedTo flag an installed version the registry marks
+	// npm-style deprecated (advisory). Surfaced as a Notes column + JSON.
+	Deprecated bool   `json:"deprecated,omitempty"`
+	MovedTo    string `json:"movedTo,omitempty"`
 }
 
 // cmdOutdated compares each FGL dependency declared in fglpkg.json
@@ -173,7 +178,24 @@ func buildOutdatedRow(rs *provider.RepositorySet, name, constraint, currentVer, 
 	default:
 		row.Status = "ok"
 	}
+
+	// Flag an installed version the registry marks deprecated. Best-effort and
+	// GI-only: deprecation is a GI-registry concept (an Artifactory-sourced
+	// package has none), and a fetch failure just leaves the row unflagged so
+	// `outdated` never fails because of an advisory lookup.
+	if currentVer != "" && isGISource(sourceReg) {
+		if info, err := registry.FetchInfo(name, currentVer); err == nil && info.Deprecated {
+			row.Deprecated = true
+			row.MovedTo = info.MovedTo
+		}
+	}
 	return row
+}
+
+// isGISource reports whether a locked source repository name refers to the
+// built-in GI registry ("" is the historical default; config.GIName is "gi").
+func isGISource(sourceReg string) bool {
+	return sourceReg == "" || sourceReg == config.GIName
 }
 
 // outdatedVersionList lists a package's versions from its locked source repo
@@ -227,10 +249,26 @@ func newestStable(vs []semver.Version) *semver.Version {
 }
 
 func printOutdatedTable(rows []outdatedRow) {
+	// The Notes column only appears when at least one row carries a note (a
+	// deprecated installed version), so the common case is unchanged.
+	showNotes := false
+	for _, r := range rows {
+		if r.Deprecated {
+			showNotes = true
+			break
+		}
+	}
+
 	headers := []string{"Package", "Current", "Wanted", "Latest", "Status"}
+	if showNotes {
+		headers = append(headers, "Notes")
+	}
 	cells := make([][]string, len(rows))
 	for i, r := range rows {
 		cells[i] = []string{r.Name, r.Current, r.Wanted, r.Latest, r.Status}
+		if showNotes {
+			cells[i] = append(cells[i], deprecationNote(r))
+		}
 	}
 	widths := make([]int, len(headers))
 	for i, h := range headers {
@@ -260,6 +298,19 @@ func printOutdatedTable(rows []outdatedRow) {
 	for _, row := range cells {
 		printRow(row)
 	}
+}
+
+// deprecationNote renders the Notes-column text for a row: "" when not
+// deprecated, "deprecated" alone, or "deprecated → <successor>" with a
+// --moved-to target.
+func deprecationNote(r outdatedRow) string {
+	if !r.Deprecated {
+		return ""
+	}
+	if r.MovedTo != "" {
+		return "deprecated → " + r.MovedTo
+	}
+	return "deprecated"
 }
 
 func pluralY(n int) string {

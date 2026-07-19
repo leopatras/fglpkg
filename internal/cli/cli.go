@@ -154,6 +154,8 @@ func Execute() error {
 			return cmdCompletion(args)
 		case "publish":
 			return cmdPublish(args)
+		case "deprecate":
+			return cmdDeprecate(args)
 		case "pack":
 			return cmdPack(args)
 		case "login":
@@ -842,6 +844,22 @@ func cmdEnv(args []string) error {
 
 // ─── search ───────────────────────────────────────────────────────────────────
 
+// searchDeprecatedStatus returns the value for a search row's STATUS column: ""
+// for a live package (leaving the column blank), "deprecated" when there is no
+// successor, or "deprecated -> <slug>" when the deprecation records a
+// relocation. The status rides in its own column next to the package identity
+// rather than being appended to the publisher-authored description, so it stays
+// scannable and can't be mistaken for the description text.
+func searchDeprecatedStatus(deprecated bool, movedTo string) string {
+	if !deprecated {
+		return ""
+	}
+	if movedTo != "" {
+		return "deprecated -> " + movedTo
+	}
+	return "deprecated"
+}
+
 func cmdSearch(args []string) error {
 	term, all, err := parseSearchArgs(args)
 	if err != nil {
@@ -882,10 +900,29 @@ func cmdSearch(args []string) error {
 	} else {
 		fmt.Printf("Results for %q:\n", term)
 	}
-	fmt.Printf("  %-30s %-12s %s\n", "NAME", "VERSION", "DESCRIPTION")
-	fmt.Printf("  %-30s %-12s %s\n", "----", "-------", "-----------")
+	// Only show the STATUS column when at least one match is deprecated;
+	// otherwise the common all-live listing keeps its original layout with no
+	// blank column wasting width.
+	showStatus := false
 	for _, r := range results {
-		fmt.Printf("  %-30s %-12s %s\n", r.Name, r.LatestVersion, r.Description)
+		if r.Deprecated {
+			showStatus = true
+			break
+		}
+	}
+	if showStatus {
+		fmt.Printf("  %-30s %-12s %-24s %s\n", "NAME", "VERSION", "STATUS", "DESCRIPTION")
+		fmt.Printf("  %-30s %-12s %-24s %s\n", "----", "-------", "------", "-----------")
+		for _, r := range results {
+			fmt.Printf("  %-30s %-12s %-24s %s\n", r.Name, r.LatestVersion,
+				searchDeprecatedStatus(r.Deprecated, r.MovedTo), r.Description)
+		}
+	} else {
+		fmt.Printf("  %-30s %-12s %s\n", "NAME", "VERSION", "DESCRIPTION")
+		fmt.Printf("  %-30s %-12s %s\n", "----", "-------", "-----------")
+		for _, r := range results {
+			fmt.Printf("  %-30s %-12s %s\n", r.Name, r.LatestVersion, r.Description)
+		}
 	}
 	return nil
 }
@@ -899,6 +936,8 @@ func searchAcrossProviders(rs *provider.RepositorySet, term string, all bool) er
 		name        string
 		version     string
 		description string
+		deprecated  bool     // package-level deprecation, from the highest-priority source
+		movedTo     string   // successor slug when the deprecation is a relocation
 		sources     []string // every repo the name appears in, priority order
 	}
 	var order []string
@@ -920,6 +959,8 @@ func searchAcrossProviders(rs *provider.RepositorySet, term string, all bool) er
 				name:        r.Name,
 				version:     r.LatestVersion,
 				description: r.Description,
+				deprecated:  r.Deprecated,
+				movedTo:     r.MovedTo,
 				sources:     []string{p.Name()},
 			}
 			order = append(order, r.Name)
@@ -938,8 +979,22 @@ func searchAcrossProviders(rs *provider.RepositorySet, term string, all bool) er
 	} else {
 		fmt.Printf("Results for %q:\n", term)
 	}
-	fmt.Printf("  %-28s %-12s %-24s %s\n", "NAME", "VERSION", "SOURCE", "DESCRIPTION")
-	fmt.Printf("  %-28s %-12s %-24s %s\n", "----", "-------", "------", "-----------")
+	// Only show the STATUS column when at least one match is deprecated;
+	// otherwise keep the original source-tagged layout with no blank column.
+	showStatus := false
+	for _, name := range order {
+		if byName[name].deprecated {
+			showStatus = true
+			break
+		}
+	}
+	if showStatus {
+		fmt.Printf("  %-28s %-12s %-24s %-24s %s\n", "NAME", "VERSION", "STATUS", "SOURCE", "DESCRIPTION")
+		fmt.Printf("  %-28s %-12s %-24s %-24s %s\n", "----", "-------", "------", "------", "-----------")
+	} else {
+		fmt.Printf("  %-28s %-12s %-24s %s\n", "NAME", "VERSION", "SOURCE", "DESCRIPTION")
+		fmt.Printf("  %-28s %-12s %-24s %s\n", "----", "-------", "------", "-----------")
+	}
 	collisions := 0
 	for _, name := range order {
 		m := byName[name]
@@ -947,7 +1002,12 @@ func searchAcrossProviders(rs *provider.RepositorySet, term string, all bool) er
 		if len(m.sources) > 1 {
 			collisions++
 		}
-		fmt.Printf("  %-28s %-12s %-24s %s\n", m.name, m.version, source, m.description)
+		if showStatus {
+			fmt.Printf("  %-28s %-12s %-24s %-24s %s\n", m.name, m.version,
+				searchDeprecatedStatus(m.deprecated, m.movedTo), source, m.description)
+		} else {
+			fmt.Printf("  %-28s %-12s %-24s %s\n", m.name, m.version, source, m.description)
+		}
 	}
 	if collisions > 0 {
 		fmt.Printf("\nnote: %d package name(s) are available from more than one repository (shown with all sources).\n"+

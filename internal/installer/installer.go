@@ -360,6 +360,7 @@ func (i *Installer) InstallAllWithOptions(m *manifest.Manifest, projectDir strin
 		return fmt.Errorf("dependency resolution failed:\n%w", err)
 	}
 	fmt.Printf("Resolved %d package(s), %d JAR(s)\n\n", len(plan.Packages), len(plan.JARs))
+	warnDeprecations(plan, os.Stderr)
 
 	// Write the lock file before installing so it's always present even if
 	// installation is interrupted partway through.
@@ -531,6 +532,37 @@ func (i *Installer) installFromLock(lf *lockfile.LockFile, root *manifest.Manife
 		i.recordManifestJARs(projectDir, supplemental)
 	}
 	return nil
+}
+
+// warnDeprecations writes a non-fatal stderr warning for each deprecated
+// package in the resolved plan, pointing at the successor when --moved-to was
+// set. npm-style deprecation is advisory: this NEVER blocks the install. Only
+// fires on a fresh resolve — a lock-file install carries no deprecation state
+// (the lockfile is deliberately not extended), matching specs/deprecate-cli.md.
+// Warnings are de-duplicated per (name, version) so a package reached by
+// multiple paths in the transitive graph warns exactly once.
+func warnDeprecations(plan *resolver.Plan, w io.Writer) {
+	seen := make(map[string]bool)
+	for _, p := range plan.Packages {
+		if !p.Deprecated {
+			continue
+		}
+		key := p.Name + "@" + p.Version.String()
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+
+		if p.DeprecationMessage != "" {
+			fmt.Fprintf(w, "warning: %s@%s is deprecated: %s\n", p.Name, p.Version.String(), p.DeprecationMessage)
+		} else {
+			fmt.Fprintf(w, "warning: %s@%s is deprecated\n", p.Name, p.Version.String())
+		}
+		if p.MovedTo != "" {
+			fmt.Fprintf(w, "warning: %s has moved to %s\n", p.Name, p.MovedTo)
+			fmt.Fprintf(w, "         → consider: fglpkg install %s\n", p.MovedTo)
+		}
+	}
 }
 
 // installFromPlan installs every entry in a freshly resolved Plan.

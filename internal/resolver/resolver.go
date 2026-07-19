@@ -65,6 +65,14 @@ type ResolvedPackage struct {
 	UploadedAt string
 	Uploader   string
 	Signature  *registry.Signature
+
+	// ── npm-style deprecation (advisory) ──
+	// Carried from the registry record so the install path can warn the
+	// consumer that a resolved dependency is deprecated (and point at its
+	// successor) without ever blocking the install. See specs/deprecate-cli.md.
+	Deprecated         bool
+	DeprecationMessage string
+	MovedTo            string
 }
 
 // IsWebcomponent reports whether this resolved entry is a webcomponent
@@ -686,6 +694,10 @@ func (s *state) buildPlan() *Plan {
 			UploadedAt:  entry.info.UploadedAt,
 			Uploader:    entry.info.Uploader,
 			Signature:   entry.info.Signature,
+
+			Deprecated:         entry.info.Deprecated,
+			DeprecationMessage: entry.info.DeprecationMessage,
+			MovedTo:            entry.info.MovedTo,
 		})
 	}
 	// Restore discovery order. Each resolved entry carries a unique,

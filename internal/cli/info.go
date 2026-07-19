@@ -167,6 +167,18 @@ func printInfo(info *registry.PackageInfo, versions *registry.VersionList, isLat
 	fmt.Println(strings.Repeat("─", len(header)))
 	fmt.Println()
 
+	// npm-style deprecation block — placed right under the header so it's the
+	// first thing seen. Advisory only; the version is still installable.
+	if info.Deprecated {
+		val := "yes"
+		if info.DeprecationMessage != "" {
+			val = "yes — " + info.DeprecationMessage
+		}
+		printField("Deprecated", val)
+		printField("Moved to", info.MovedTo)
+		fmt.Println()
+	}
+
 	printField("Description", info.Description)
 	printField("Author", info.Author)
 	// Source is the owning repository ("gi", "acme-internal"); populated only
