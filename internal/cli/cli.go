@@ -861,7 +861,16 @@ func searchDeprecatedStatus(deprecated bool, movedTo string) string {
 }
 
 func cmdSearch(args []string) error {
-	term, all, err := parseSearchArgs(args)
+	term, all, generoFlag, err := parseSearchArgs(args)
+	if err != nil {
+		return err
+	}
+
+	// Resolve the target Genero version once, up front, for compatibility
+	// grading. Search is a discovery command that must run anywhere, so a
+	// failed detection is not fatal — it leaves target nil and every result is
+	// graded "?". An explicit but malformed --genero is a user typo, so error.
+	target, err := resolveSearchTarget(generoFlag)
 	if err != nil {
 		return err
 	}
@@ -873,7 +882,7 @@ func cmdSearch(args []string) error {
 		m = mm
 	}
 	if rs, _, _, rErr := buildRepositorySet(home, m); rErr == nil && rs != nil {
-		return searchAcrossProviders(rs, term, all)
+		return searchAcrossProviders(rs, term, all, target)
 	}
 
 	results, err := registry.Search(term)
@@ -896,13 +905,13 @@ func cmdSearch(args []string) error {
 		return nil
 	}
 	if all {
-		fmt.Printf("All packages (%d):\n", len(results))
+		fmt.Printf("All packages (%d)%s:\n", len(results), searchVersionSuffix(target))
 	} else {
-		fmt.Printf("Results for %q:\n", term)
+		fmt.Printf("Results for %q%s:\n", term, searchVersionSuffix(target))
 	}
-	// Only show the STATUS column when at least one match is deprecated;
-	// otherwise the common all-live listing keeps its original layout with no
-	// blank column wasting width.
+	// The GENERO + verdict columns are always shown. The STATUS column only
+	// appears when at least one match is deprecated; otherwise the common
+	// all-live listing keeps its narrower layout with no blank column.
 	showStatus := false
 	for _, r := range results {
 		if r.Deprecated {
@@ -911,25 +920,90 @@ func cmdSearch(args []string) error {
 		}
 	}
 	if showStatus {
-		fmt.Printf("  %-30s %-12s %-24s %s\n", "NAME", "VERSION", "STATUS", "DESCRIPTION")
-		fmt.Printf("  %-30s %-12s %-24s %s\n", "----", "-------", "------", "-----------")
+		fmt.Printf("  %-30s %-12s %-12s %s  %-24s %s\n", "NAME", "VERSION", "GENERO", "?", "STATUS", "DESCRIPTION")
+		fmt.Printf("  %-30s %-12s %-12s %s  %-24s %s\n", "----", "-------", "------", "-", "------", "-----------")
 		for _, r := range results {
-			fmt.Printf("  %-30s %-12s %-24s %s\n", r.Name, r.LatestVersion,
+			fmt.Printf("  %-30s %-12s %-12s %s  %-24s %s\n",
+				r.Name, r.LatestVersion, displayConstraint(r.GeneroConstraint),
+				gradeCompat(target, r.GeneroConstraint),
 				searchDeprecatedStatus(r.Deprecated, r.MovedTo), r.Description)
 		}
 	} else {
-		fmt.Printf("  %-30s %-12s %s\n", "NAME", "VERSION", "DESCRIPTION")
-		fmt.Printf("  %-30s %-12s %s\n", "----", "-------", "-----------")
+		fmt.Printf("  %-30s %-12s %-12s %s  %s\n", "NAME", "VERSION", "GENERO", "?", "DESCRIPTION")
+		fmt.Printf("  %-30s %-12s %-12s %s  %s\n", "----", "-------", "------", "-", "-----------")
 		for _, r := range results {
-			fmt.Printf("  %-30s %-12s %s\n", r.Name, r.LatestVersion, r.Description)
+			fmt.Printf("  %-30s %-12s %-12s %s  %s\n",
+				r.Name, r.LatestVersion, displayConstraint(r.GeneroConstraint),
+				gradeCompat(target, r.GeneroConstraint), r.Description)
 		}
 	}
 	return nil
 }
 
+// resolveSearchTarget resolves the Genero version used to grade search results.
+// An explicit --genero override is parsed leniently (a bare "4" or "4.01" is
+// accepted — a patch level is not required for grading) and a malformed value
+// is a fatal error; otherwise genero.Detect() is used and a failure is
+// tolerated by returning a nil target (every result then grades as "?").
+func resolveSearchTarget(generoFlag string) (*genero.Version, error) {
+	if generoFlag != "" {
+		gv, err := genero.ParseLoose(generoFlag)
+		if err != nil {
+			return nil, fmt.Errorf("invalid --genero version %q: %w", generoFlag, err)
+		}
+		return &gv, nil
+	}
+	if gv, err := genero.Detect(); err == nil {
+		return &gv, nil
+	}
+	return nil, nil
+}
+
+// searchVersionSuffix renders the parenthetical shown after the results header,
+// naming the resolved Genero version or explaining how to set one.
+func searchVersionSuffix(target *genero.Version) string {
+	if target != nil {
+		return fmt.Sprintf(" (Genero %s)", target.String())
+	}
+	return " (Genero version unknown — set FGLPKG_GENERO_VERSION or pass --genero)"
+}
+
+// gradeCompat returns a one-column compatibility marker for a result's Genero
+// constraint against the target version: "✓" compatible, "✗" incompatible, "?"
+// unknown. Unknown covers no resolved target, no declared constraint, and an
+// unparseable constraint — a malformed constraint degrades that one row to "?"
+// rather than aborting the search.
+func gradeCompat(target *genero.Version, constraint string) string {
+	if target == nil || constraint == "" {
+		return "?"
+	}
+	ok, err := target.Satisfies(constraint)
+	if err != nil {
+		return "?"
+	}
+	if ok {
+		return "✓"
+	}
+	return "✗"
+}
+
+// displayConstraint renders a Genero constraint for the GENERO column, showing
+// "-" when the registry reported none.
+func displayConstraint(constraint string) string {
+	if constraint == "" {
+		return "-"
+	}
+	return constraint
+}
+
 // searchAcrossProviders fans out a search to every configured provider, tags
 // each result with its source repository, and prints a source-tagged table.
-func searchAcrossProviders(rs *provider.RepositorySet, term string, all bool) error {
+//
+// Genero compatibility grading is scoped out of this path: the provider
+// abstraction does not carry a per-package Genero constraint, so every row
+// renders "-"/"?" (unknown). The columns are still shown to keep the output
+// shape consistent with single-registry search.
+func searchAcrossProviders(rs *provider.RepositorySet, term string, all bool, target *genero.Version) error {
 	// Gather in provider priority order so the first-seen version/description
 	// for a colliding name comes from the highest-priority repository.
 	type merged struct {
@@ -975,12 +1049,13 @@ func searchAcrossProviders(rs *provider.RepositorySet, term string, all bool) er
 		return nil
 	}
 	if all {
-		fmt.Printf("All packages (%d):\n", len(order))
+		fmt.Printf("All packages (%d)%s:\n", len(order), searchVersionSuffix(target))
 	} else {
-		fmt.Printf("Results for %q:\n", term)
+		fmt.Printf("Results for %q%s:\n", term, searchVersionSuffix(target))
 	}
-	// Only show the STATUS column when at least one match is deprecated;
-	// otherwise keep the original source-tagged layout with no blank column.
+	// The GENERO + verdict columns are always shown (grading is scoped out of
+	// the multi-provider path, so they render "-"/"?"); the STATUS column only
+	// appears when at least one match is deprecated.
 	showStatus := false
 	for _, name := range order {
 		if byName[name].deprecated {
@@ -989,11 +1064,11 @@ func searchAcrossProviders(rs *provider.RepositorySet, term string, all bool) er
 		}
 	}
 	if showStatus {
-		fmt.Printf("  %-28s %-12s %-24s %-24s %s\n", "NAME", "VERSION", "STATUS", "SOURCE", "DESCRIPTION")
-		fmt.Printf("  %-28s %-12s %-24s %-24s %s\n", "----", "-------", "------", "------", "-----------")
+		fmt.Printf("  %-28s %-12s %-12s %s  %-24s %-24s %s\n", "NAME", "VERSION", "GENERO", "?", "STATUS", "SOURCE", "DESCRIPTION")
+		fmt.Printf("  %-28s %-12s %-12s %s  %-24s %-24s %s\n", "----", "-------", "------", "-", "------", "------", "-----------")
 	} else {
-		fmt.Printf("  %-28s %-12s %-24s %s\n", "NAME", "VERSION", "SOURCE", "DESCRIPTION")
-		fmt.Printf("  %-28s %-12s %-24s %s\n", "----", "-------", "------", "-----------")
+		fmt.Printf("  %-28s %-12s %-12s %s  %-24s %s\n", "NAME", "VERSION", "GENERO", "?", "SOURCE", "DESCRIPTION")
+		fmt.Printf("  %-28s %-12s %-12s %s  %-24s %s\n", "----", "-------", "------", "-", "------", "-----------")
 	}
 	collisions := 0
 	for _, name := range order {
@@ -1002,11 +1077,14 @@ func searchAcrossProviders(rs *provider.RepositorySet, term string, all bool) er
 		if len(m.sources) > 1 {
 			collisions++
 		}
+		// Constraint is unavailable through the provider layer → always "-"/"?".
 		if showStatus {
-			fmt.Printf("  %-28s %-12s %-24s %-24s %s\n", m.name, m.version,
+			fmt.Printf("  %-28s %-12s %-12s %s  %-24s %-24s %s\n",
+				m.name, m.version, displayConstraint(""), gradeCompat(target, ""),
 				searchDeprecatedStatus(m.deprecated, m.movedTo), source, m.description)
 		} else {
-			fmt.Printf("  %-28s %-12s %-24s %s\n", m.name, m.version, source, m.description)
+			fmt.Printf("  %-28s %-12s %-12s %s  %-24s %s\n",
+				m.name, m.version, displayConstraint(""), gradeCompat(target, ""), source, m.description)
 		}
 	}
 	if collisions > 0 {
@@ -1016,28 +1094,41 @@ func searchAcrossProviders(rs *provider.RepositorySet, term string, all bool) er
 	return nil
 }
 
-// parseSearchArgs returns the keyword term plus an --all flag. Errors on
+// parseSearchArgs returns the keyword term, the --all flag, and an optional
+// --genero <version> override used to grade result compatibility. Errors on
 // `search` with no args + no --all (the historical "missing keyword" error),
 // and on conflicting `search --all <term>`.
-func parseSearchArgs(args []string) (term string, all bool, err error) {
-	for _, a := range args {
-		switch a {
-		case "--all":
+func parseSearchArgs(args []string) (term string, all bool, generoFlag string, err error) {
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "--all":
 			all = true
+		case a == "--genero":
+			if i+1 >= len(args) {
+				return "", false, "", fmt.Errorf("--genero requires a version argument (e.g. --genero 4.01)")
+			}
+			i++
+			generoFlag = args[i]
+		case strings.HasPrefix(a, "--genero="):
+			generoFlag = strings.TrimPrefix(a, "--genero=")
+			if generoFlag == "" {
+				return "", false, "", fmt.Errorf("--genero requires a version argument (e.g. --genero 4.01)")
+			}
 		default:
 			if term != "" {
-				return "", false, fmt.Errorf("unexpected extra argument %q", a)
+				return "", false, "", fmt.Errorf("unexpected extra argument %q", a)
 			}
 			term = a
 		}
 	}
 	if all && term != "" {
-		return "", false, fmt.Errorf("--all and <term> are mutually exclusive")
+		return "", false, "", fmt.Errorf("--all and <term> are mutually exclusive")
 	}
 	if !all && term == "" {
-		return "", false, fmt.Errorf("usage: fglpkg search <term>   |   fglpkg search --all")
+		return "", false, "", fmt.Errorf("usage: fglpkg search <term>   |   fglpkg search --all")
 	}
-	return term, all, nil
+	return term, all, generoFlag, nil
 }
 
 // ─── publish ──────────────────────────────────────────────────────────────────

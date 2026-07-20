@@ -351,13 +351,34 @@ Installed packages:
 
 ### Searching the Registry
 
+`fglpkg search` annotates every result with its compatibility against the Genero version
+you are running. The version is detected automatically (honoring `FGLPKG_GENERO_VERSION`)
+and can be overridden with `--genero <version>`. The marker is advisory — nothing is hidden
+or reordered:
+
+- `✓` — the package's latest version is compatible with your Genero version
+- `✗` — the latest version requires a different Genero version
+- `?` — unknown: the registry reports no constraint, or no Genero version could be resolved
+
 ```bash
 $ fglpkg search json
-Results for "json":
-  NAME                           VERSION      DESCRIPTION
-  ----                           -------      -----------
-  jsonutils                      2.0.1        JSON utility functions for BDL
+Results for "json" (Genero 4.01):
+  NAME                           VERSION      GENERO       ?  DESCRIPTION
+  ----                           -------      ------       -  -----------
+  jsonutils                      2.0.1        ^4.0.0       ✓  JSON utility functions for BDL
+  legacyjson                     1.4.0        ^3.0.0       ✗  JSON helpers for Genero 3
+  mystery                        0.9.0        -            ?  registry reports no constraint
 ```
+
+Grade against a specific version instead of the detected one:
+
+```bash
+$ fglpkg search json --genero 3.20
+```
+
+If no Genero version can be detected (no `fglcomp`, no `$FGLDIR`, no override), search still
+runs — every result shows `?` and the header explains how to set the version. Results from
+secondary (non-GI) repositories are not graded and always show `?`.
 
 ## Publishing a Package
 

@@ -139,10 +139,19 @@ Prints shell export lines. Evaluate the output to load them, e.g.
 		Usage:      "fglpkg search <term>\nfglpkg search --all",
 		Long: `FLAGS:
   --all                    List every package in the registry (no term)
+  --genero <version>       Grade results against this Genero version instead
+                           of the detected one (overrides FGLPKG_GENERO_VERSION)
+
+Each result is annotated with a compatibility marker against the running Genero
+version (detected, or overridden with --genero / FGLPKG_GENERO_VERSION):
+  ✓  compatible    ✗  incompatible    ?  unknown (no constraint / version)
+Nothing is hidden or reordered — the marker is advisory. Registries that don't
+report a Genero constraint, or a version that can't be detected, show ?.
 
 When secondary repositories are configured, search fans out to every repository
 and tags each result with its source repo. A repository that fails to respond
-is reported as a warning without failing the whole search.
+is reported as a warning without failing the whole search. (Compatibility is
+not graded for secondary-repository results — they always show ?.)
 `,
 	},
 	{

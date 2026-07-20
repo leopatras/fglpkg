@@ -335,10 +335,11 @@ fglpkg list                              # List installed packages
 fglpkg env                               # Print export statements (auto-detects scope)
 fglpkg env --global                      # Print exports for all global packages
 fglpkg env --gst                         # Print in Genero Studio format
-fglpkg search json                       # Search the registry (matches name/description)
+fglpkg search json                       # Search (annotates ✓/✗/? vs your Genero version)
 fglpkg search --all                      # List every package in the registry
                                          #   a STATUS column appears only when a match is
                                          #   deprecated, e.g. "chart-3d  1.2.3  deprecated -> chart-3d-ng  3D charts"
+fglpkg search json --genero 4.01         # Grade results against a specific Genero version
 fglpkg audit signatures                  # Verify registry signatures of locked packages
 fglpkg bdl <pkg> <module> [args...]      # Run a BDL program from a package
 fglpkg bdl --list                        # List available BDL programs
