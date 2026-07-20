@@ -75,6 +75,37 @@ FOR /F "tokens=*" %%i IN ('fglpkg env --global') DO %%i
 
 Use `--global` in shell profiles so all installed packages are available regardless of your current directory.
 
+### Keeping fglpkg up to date
+
+Once installed, fglpkg can update itself — no need to re-download by hand:
+
+```bash
+fglpkg self-update            # download, verify, and install the latest release
+fglpkg self-update --check    # just report whether a newer version exists
+```
+
+`self-update` fetches the latest stable build for your OS/architecture and verifies its
+**Ed25519 release signature** (chained to a key pinned in the binary) **and** its SHA-256
+checksum before atomically replacing the running executable. It never installs an unverified
+binary; on any verification failure it prints a manual-download link instead. Scope is
+latest-stable only — no version pinning, pre-releases, or downgrades. `--yes` skips the
+confirmation prompt (for scripts); `--force` reinstalls even when you are already current.
+
+fglpkg also **passively notices** new releases: at most once every 24h, after a command
+finishes, it prints a one-line "a new version is available" hint to stderr. It never blocks a
+command, changes an exit code, or reports network errors. Turn it off with
+`FGLPKG_NO_UPDATE_CHECK=1`, or in `~/.fglpkg/config.json`:
+
+```json
+{
+  "updateCheck": false,
+  "updateCheckInterval": "24h"
+}
+```
+
+Self-update is unavailable for `dev` builds (built from source) and for installs managed by a
+package manager such as Homebrew — update those with the tool that installed them.
+
 ## Building from Source
 
 ```bash
@@ -230,6 +261,8 @@ eval "$(fglpkg env --global)"
 | `FGLPKG_PUBLISH_REGISTRY` | Name of the repository `fglpkg publish` targets when no `--registry` is given. Overrides the manifest's `defaultRegistry`. See [Secondary Package Repositories](#secondary-package-repositories-jfrog-artifactory) |
 | `FGLPKG_GENERO_VERSION` | Override Genero version detection |
 | `FGLPKG_INSTALL_CONCURRENCY` | Cap parallel downloads during install (default 4) |
+| `FGLPKG_SIGNING` | Layer 1 signature enforcement: `require`, `warn`, or `off`. Overrides `signing.enforce` in `config.json` |
+| `FGLPKG_NO_UPDATE_CHECK` | Set to disable the passive "new version available" notice (also configurable via `updateCheck` in `~/.fglpkg/config.json`). Always off for `dev` builds, in CI, and for non-interactive output |
 | `FGLLDPATH` | Auto-managed by `fglpkg env` (prepends, preserves existing value) |
 | `CLASSPATH` | Auto-managed by `fglpkg env` (prepends, preserves existing value) |
 
@@ -244,6 +277,52 @@ fglpkg login --token gpr_…       # or: export FGLPKG_TOKEN=gpr_…
 ```
 
 All commands authenticate using the same OAuth/PAT credentials stored by `fglpkg login`.
+
+## Signature verification (Layer 1)
+
+Every artifact the registry serves is signed with **Ed25519** over a canonical
+(RFC 8785 / JCS) payload of its identity and `sha256`. On install, `fglpkg`
+reconstructs that payload and verifies the signature — proving the bytes you
+received are exactly what the registry stored (defence against transport,
+mirror, and cache tampering), a layer above the plain SHA256 integrity check.
+
+**How trust is anchored.** The registry's working public keys are published in
+a signed manifest at `GET /registry/.well-known/keys.json`. That manifest is
+itself signed by a **root key whose public half is pinned in the fglpkg binary**
+(`internal/signing/root.go`) — it is never fetched, so a rogue registry cannot
+substitute its own keys. The verified manifest is cached at `~/.fglpkg/keys.json`
+so reinstalls and `--production` deploys work offline.
+
+**What it does not do.** It does not prove *who built* the package (that is
+Layer 2, Sigstore provenance — opt-in, not in this release), and Java JARs pulled
+from Maven Central keep their existing checksum-only trust.
+
+### Enforcement modes
+
+Set `signing.enforce` in `~/.fglpkg/config.json` (or the `FGLPKG_SIGNING` env
+var, which wins):
+
+```json
+{ "signing": { "enforce": "warn" } }
+```
+
+| Mode | Behaviour |
+|---|---|
+| `warn` *(default)* | A bad or missing signature prints a warning but the install continues. |
+| `require` | A bad or missing signature aborts the install. |
+| `off` | Signature verification is skipped entirely. |
+
+`fglpkg install --no-verify-signature` skips verification for a single run
+(discouraged; for emergencies).
+
+### Auditing
+
+```bash
+fglpkg audit signatures        # re-verify every locked package against the keys manifest
+```
+
+Prints one line per package and exits non-zero if any package is unsigned or
+fails to verify — suitable as a CI gate.
 
 ## Usage
 
@@ -268,6 +347,9 @@ fglpkg env --global                      # Print exports for all global packages
 fglpkg env --gst                         # Print in Genero Studio format
 fglpkg search json                       # Search the registry (matches name/description)
 fglpkg search --all                      # List every package in the registry
+                                         #   a STATUS column appears only when a match is
+                                         #   deprecated, e.g. "chart-3d  1.2.3  deprecated -> chart-3d-ng  3D charts"
+fglpkg audit signatures                  # Verify registry signatures of locked packages
 fglpkg bdl <pkg> <module> [args...]      # Run a BDL program from a package
 fglpkg bdl --list                        # List available BDL programs
 
@@ -287,8 +369,17 @@ fglpkg publish --private                 # Publish as private (overrides fglpkg.
 fglpkg publish --public                  # Publish as public (overrides fglpkg.json visibility)
 fglpkg publish --changelog "notes..."    # Set this version's changelog inline (overrides CHANGELOG.md)
 
+# Deprecating & relocating (npm-style; stays installable, warns consumers)
+fglpkg deprecate chart-3d@1.2.3 "reason"       # Deprecate one version with a message
+fglpkg deprecate chart-3d@1.2.3 --moved-to chart-3d-ng  # Deprecate + point at a successor
+fglpkg deprecate chart-3d --moved-to chart-3d-ng        # Relocate the whole package (rename)
+fglpkg deprecate chart-3d@1.2.3 --undo         # Lift the deprecation
+
 # Secondary repositories (JFrog Artifactory) — see section below
 fglpkg registry list                     # Show configured repositories + auth status
+fglpkg registry add acme https://a.example --repo-key GeneroBDL   # Add a repo (global)
+fglpkg registry add acme https://a.example --repo-key K --project # Add to fglpkg.json instead
+fglpkg registry remove acme              # Remove a configured repo
 fglpkg login --registry acme --token …   # Sign in to a secondary repo
 fglpkg install pkg --registry acme        # Add a package, pinning its source repo
 fglpkg publish --registry acme            # Publish to a secondary repo
@@ -314,6 +405,8 @@ fglpkg docs <package>                    # List documentation files
 fglpkg docs <package> <file>             # Display a documentation file
 
 # Misc
+fglpkg self-update                       # Update fglpkg to the latest release
+fglpkg self-update --check               # Report whether an update is available
 fglpkg version                           # Print version and build info
 fglpkg help                              # Show help
 ```
@@ -347,6 +440,47 @@ The publish flow:
 Authentication uses the same OAuth/PAT bearer as the other consumer commands
 (`FGLPKG_TOKEN` overrides stored credentials). No GitHub token is involved in
 publishing.
+
+### Deprecating & relocating packages
+
+`fglpkg deprecate` marks a published version (or a whole package) as
+deprecated, following the **npm model**: the version stays **fully installable
+and listed** — consumers just get a non-fatal warning pointing at the
+successor. This is how a **rename or relocation** is expressed; there is no
+separate `rename`/`migrate` command.
+
+```bash
+# Deprecate one version with a message (owner-only; requires login)
+fglpkg deprecate chart-3d@1.2.3 "security fix in 1.2.4; please upgrade"
+
+# Rename / relocate — message auto-fills to "chart-3d has moved to chart-3d-ng"
+fglpkg deprecate chart-3d@1.2.3 --moved-to chart-3d-ng
+
+# Relocate the whole package (every version), pinning a successor version
+fglpkg deprecate chart-3d --moved-to chart-3d-ng@2.0.0
+
+# Lift a deprecation
+fglpkg deprecate chart-3d@1.2.3 --undo
+```
+
+A bare `<pkg>` (no `@version`) deprecates/relocates the whole package; with
+`@<version>` it targets that one version. A message is required unless
+`--moved-to` is given (which auto-fills one). `--json` prints a machine-readable
+result. Re-running `deprecate` edits the existing message/successor
+(idempotent).
+
+Deprecation is **not** withdrawal: it never hides or un-lists the package, and
+it never renames the slug in place — it records an advisory pointer to a
+separately-published successor. What consumers see:
+
+- **`install` / `update`** — a `warning:` line on stderr for each deprecated
+  resolved dependency (including transitive ones), with a `→ consider: fglpkg
+  install <successor>` hint when a successor is set. The install still
+  succeeds; deprecation never blocks it. (Warnings fire on a fresh resolve, not
+  on a lock-file-only reinstall.)
+- **`info`** — a `Deprecated:` / `Moved to:` block under the header.
+- **`outdated`** — a `deprecated → <successor>` note in a `Notes` column for any
+  installed dependency that is deprecated.
 
 ### Private Packages
 
@@ -447,6 +581,21 @@ ops team can set it for every project:
 | `priority` | Yes | Lower is tried first; must be unique. Ordering/diagnostics only — it is **not** a precedence tiebreak (see collision guard) |
 | `auth` | No | `bearer` (default) \| `basic` \| `apikey` \| `anonymous` |
 | `packages` | No | Glob allow-list (e.g. `["acme-*"]`) — names outside it are never queried against this repo |
+
+Rather than editing JSON by hand, `fglpkg registry add`/`remove` manage these
+entries for you (validated before write, with the priority auto-assigned after
+`gi` when omitted):
+
+```bash
+fglpkg registry add acme https://artifactory.acme.example/artifactory \
+    --repo-key fgl-internal-generic --packages "acme-*"   # → ~/.fglpkg/config.json
+fglpkg registry add acme https://… --repo-key K --project # → project fglpkg.json
+fglpkg registry remove acme
+```
+
+`add` defaults `--type` to `artifactory`; pass `--type genero`, `--auth`,
+`--priority`, and repeatable/comma-separated `--packages` as needed. It refuses
+to redefine the built-in `gi` or collide on name/priority.
 
 The built-in GI registry is always present as if declared `{ "name": "gi", "type": "genero", "priority": 1 }`. `FGLPKG_REGISTRY`, if set, retargets the GI URL.
 

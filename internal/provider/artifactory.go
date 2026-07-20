@@ -178,8 +178,8 @@ func (a *ArtifactoryProvider) FetchInfo(name, version, generoMajor string) (*reg
 	}
 
 	// Sidecar manifest — best effort. Supplies deps + genero constraint.
-	var side manifest.Manifest
-	if err := a.getJSON(a.contentURL(name, version, manifest.Filename), &side); err == nil {
+	side, err := a.fetchSidecar(name, version)
+	if err == nil {
 		info.Description = side.Description
 		info.Author = side.Author
 		info.License = side.License
@@ -195,6 +195,17 @@ func (a *ArtifactoryProvider) FetchInfo(name, version, generoMajor string) (*reg
 	}
 
 	return info, nil
+}
+
+// fetchSidecar reads the per-version sidecar fglpkg.json. It returns ErrNotFound
+// (unwrapped) when the sidecar is absent so callers can treat that as
+// non-fatal; any other transport/auth error is returned as-is.
+func (a *ArtifactoryProvider) fetchSidecar(name, version string) (*manifest.Manifest, error) {
+	var side manifest.Manifest
+	if err := a.getJSON(a.contentURL(name, version, manifest.Filename), &side); err != nil {
+		return nil, err
+	}
+	return &side, nil
 }
 
 // Search enumerates the repository's top-level package folders and returns
@@ -221,9 +232,18 @@ func (a *ArtifactoryProvider) Search(term string) ([]registry.SearchResult, erro
 		if !a.reg.Admits(name) {
 			continue
 		}
-		res := registry.SearchResult{Name: name}
+		res := registry.SearchResult{Name: name, Source: a.reg.Name}
 		if versions, err := a.FetchVersions(name); err == nil {
-			res.LatestVersion = highestVersion(versions).String()
+			latest := highestVersion(versions).String()
+			res.LatestVersion = latest
+			// Best-effort: read the latest version's sidecar so the result carries
+			// a description/author like the GI path does (spec ISSUE-E). A missing
+			// or unparseable sidecar leaves the fields blank rather than failing
+			// the whole search.
+			if side, err := a.fetchSidecar(name, latest); err == nil {
+				res.Description = side.Description
+				res.Author = side.Author
+			}
 		}
 		results = append(results, res)
 	}

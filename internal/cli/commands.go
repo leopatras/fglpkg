@@ -63,8 +63,15 @@ Prompts for name, version, description, and author, then writes fglpkg.json.
   --no-manifest-fallback   Do not install Java dependencies a package's bundled
                            manifest declares but its registry record omits; the
                            divergence is still reported
+  --no-verify-signature    Skip Layer 1 registry signature verification for this
+                           install (discouraged; overrides signing.enforce)
 
 With no package arguments, installs everything declared in fglpkg.json.
+
+Installed packages are verified against the registry's Ed25519 signature by
+default (mode "warn": a bad or missing signature warns but does not block).
+Set signing.enforce to "require" in ~/.fglpkg/config.json, or FGLPKG_SIGNING=
+require|warn|off, to change this.
 With one or more <package>[@<version>] arguments, resolves and adds them.
 Without --local/--global, the target is auto-detected: local when a
 .fglpkg/ directory or fglpkg.json exists in the current directory.
@@ -164,8 +171,8 @@ Java dependencies are not checked (they use exact version pins).
 	{
 		Name:       "audit",
 		Summary:    "Check installed Java JARs for known vulnerabilities",
-		ListDetail: "\n(--json, --severity=<level>, --production)",
-		Usage:      "fglpkg audit [flags]",
+		ListDetail: "\n(--json, --severity=<level>, --production; or `audit signatures`)",
+		Usage:      "fglpkg audit [flags]   |   fglpkg audit signatures",
 		Long: `FLAGS:
   --json                          Emit a JSON report on stdout
   --severity=<low|medium|high|critical>
@@ -173,9 +180,15 @@ Java dependencies are not checked (they use exact version pins).
   --production, --prod            Skip dev-scoped JARs
   --offline                       Reserved for a future cached-advisory mode (errors today)
 
+SUBCOMMANDS:
+  signatures                      Re-verify the Layer 1 registry signature of
+                                  every package in the lock file against the
+                                  current keys manifest. Exits non-zero if any
+                                  package is unsigned or fails verification.
+
 EXIT CODES:
-  0  no findings at or above --severity
-  1  one or more findings at or above --severity
+  0  no findings at or above --severity (or all signatures valid)
+  1  one or more findings at or above --severity (or a signature failed)
   2  audit itself failed (missing lockfile, network error, etc.)
 
 NOTES:
@@ -259,6 +272,32 @@ CHANGELOG:
   root and sends the section whose heading names the version being published
   (Keep a Changelog format, e.g. "## [1.2.0]"). If the file exists but has no
   entry for the version, the changelog is sent empty and a warning is printed.
+`,
+	},
+	{
+		Name:       "deprecate",
+		Summary:    "Mark a published version or package deprecated",
+		ListDetail: "\n(npm-style: stays installable, warns consumers;\n --moved-to <pkg> records a successor/rename; --undo lifts it)",
+		Args:       "<pkg>",
+		Usage: "fglpkg deprecate <pkg>[@<version>] [<message>] [--moved-to <newpkg>[@<version>]]\n" +
+			"fglpkg deprecate <pkg>[@<version>] --message <text> [--moved-to <newpkg>]\n" +
+			"fglpkg deprecate <pkg>[@<version>] --undo",
+		Long: `FLAGS:
+  --message <text>         The deprecation message (npm-style). Alternative to
+                           passing the message as a positional argument.
+  --moved-to <newpkg>[@<version>]
+                           Record a successor package (the rename/relocation
+                           case). Auto-fills the message "<pkg> has moved to
+                           <newpkg>" when no message is given.
+  --undo                   Lift the deprecation. Forbids a message / --moved-to.
+  --json                   Emit a machine-readable result instead of text.
+
+Deprecation is advisory (the npm model): a deprecated version stays fully
+installable and listed — consumers just get a non-fatal warning on install,
+'info', and 'outdated', pointing at the successor when --moved-to is set. With
+a bare <pkg> (no @version) the whole package is deprecated/relocated. This is
+an owner-only write and requires login. Deprecation does NOT withdraw or hide a
+package (that is a separate operation).
 `,
 	},
 	{
@@ -349,14 +388,29 @@ login".
 	},
 	{
 		Name:    "registry",
-		Summary: "List configured package repositories",
-		Usage:   "fglpkg registry list",
+		Summary: "Manage configured package repositories",
+		Usage: "fglpkg registry list\n" +
+			"fglpkg registry add <name> <url> [--type genero|artifactory] [--repo-key K]\n" +
+			"                                 [--auth bearer|basic|apikey|anonymous] [--priority N]\n" +
+			"                                 [--packages 'acme-*,foo-*'] [--project]\n" +
+			"fglpkg registry remove <name> [--project]",
 		Long: `SUBCOMMANDS:
   list                     Show configured repositories, priority, auth scheme, and login status
+  add <name> <url>         Add a repository descriptor (defaults to type=artifactory)
+  remove <name>            Remove a configured repository
+
+FLAGS (add):
+  --type <t>               genero | artifactory (default artifactory)
+  --repo-key <k>           Artifactory generic-repo key (required for type=artifactory)
+  --auth <scheme>          bearer | basic | apikey | anonymous (default bearer)
+  --priority <n>           Lower is tried first; unique. Defaults to max+1 when omitted
+  --packages <globs>       Comma-separated name-scope allow-list (e.g. 'acme-*,foo-*')
+  --project                Write to the project fglpkg.json instead of ~/.fglpkg/config.json
 
 Repositories are configured via a "registries" array in fglpkg.json and/or
 ~/.fglpkg/config.json, alongside the built-in Genero Intelligence registry.
-Lower "priority" is tried first; priorities must be unique.
+Lower "priority" is tried first; priorities must be unique. 'add'/'remove' edit
+these files for you; credentials still flow through 'fglpkg login --registry'.
 
 LOGIN column values:
   yes     credentials are stored for this repo (via 'fglpkg login')
@@ -404,6 +458,24 @@ specific doc.
 
 With no arguments, prints the fglpkg tool version. With a bump kind
 (patch|minor|major|prerelease) or an explicit semver, updates fglpkg.json.
+`,
+	},
+	{
+		Name:    "self-update",
+		Aliases: []string{"upgrade"},
+		Summary: "Update fglpkg to the latest release",
+		Usage:   "fglpkg self-update [--check] [--yes] [--force]",
+		Long: `FLAGS:
+  --check                  Report whether an update is available and exit;
+                           never downloads or writes
+  --yes, -y                Skip the confirmation prompt (for scripts)
+  --force                  Re-install even if already on the latest version
+
+Downloads the latest stable release for this OS/arch, verifies its Ed25519
+release signature (chained to fglpkg's pinned root) and its SHA-256 checksum,
+then atomically replaces the running executable. Latest-stable only — no
+version pinning, pre-releases, or downgrade. Refuses on 'dev' builds and on
+installs managed by a package manager such as Homebrew.
 `,
 	},
 	{

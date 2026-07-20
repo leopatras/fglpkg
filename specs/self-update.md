@@ -1,6 +1,6 @@
 # Spec: `fglpkg self-update` — self-updating binary + periodic update notices
 
-**Status:** 📋 Not started — GIS-255 (spec ready)
+**Status:** ✅ Implemented — GIS-255. The client (`self-update` + `upgrade` alias, passive update check, R1 Ed25519 signature verify against the pinned root, R2 GI-served recovery info) merged to `main` via PR #17. The companion GI endpoint `GET /registry/fglpkg/latest` (GIS-256) shipped and is Closed, so self-update is wired end-to-end. Remaining: macOS delivery is gated on Developer-ID-notarized releases (GIS-257).
 **Date:** 2026-07-14
 **Author:** Mike Folcher
 **Motivation:** fglpkg ships as a standalone binary users copy into `PATH` by hand
@@ -21,7 +21,8 @@ registry endpoint this consumes).
 Two related capabilities:
 
 1. **`fglpkg self-update`** — a new command that downloads the latest stable release binary for the
-   current OS/arch, verifies its SHA-256 checksum, and atomically replaces the running executable.
+   current OS/arch, verifies its **Ed25519 release signature and** SHA-256 checksum, and atomically
+   replaces the running executable.
 2. **A passive update check** — piggybacked on ordinary command runs (no daemon). At most once per
    check interval, fglpkg asks the registry for the latest version in the background and, if a newer
    one exists, prints a one-line notice **after** the command's own output. On by default; disabled
@@ -88,6 +89,9 @@ GET /registry/fglpkg/latest
   "version": "3.4.0",
   "notes": "https://github.com/4js-mikefolcher/fglpkg/releases/tag/v3.4.0",
   "checksumsUrl": "https://github.com/4js-mikefolcher/fglpkg/releases/download/v3.4.0/checksums.txt",
+  "checksumsSigUrl": "https://github.com/4js-mikefolcher/fglpkg/releases/download/v3.4.0/checksums.txt.sig",
+  "manualUrl": "https://github.com/4js-mikefolcher/fglpkg/releases/tag/v3.4.0",
+  "instructions": "Download the binary for your platform, verify its SHA-256, and replace your fglpkg executable. See the release page.",
   "assets": [
     { "os": "darwin", "arch": "arm64", "url": "https://github.com/.../v3.4.0/fglpkg-darwin-arm64" },
     { "os": "linux",  "arch": "amd64", "url": "https://github.com/.../v3.4.0/fglpkg-linux-amd64" },
@@ -106,11 +110,52 @@ GET /registry/fglpkg/latest
   file is `sha256sum` output: `<hex>  <filename>` lines). This keeps GI a pure URL provider while
   preserving the integrity gate below. If `checksumsUrl` is absent or the fetch fails, self-update
   **aborts** rather than installing an unverified binary.
+- **`checksumsSigUrl` — a detached Ed25519 signature over `checksums.txt`.** This is the *authenticity*
+  gate; the SHA-256 above is only integrity / anti-corruption. The client verifies this signature back
+  to the **pinned root key** before trusting `checksums.txt` — see
+  [§ Release signing & verification](#release-signing--verification). If `checksumsSigUrl` is absent or
+  the signature fails, self-update **aborts**.
+- **`manualUrl` + `instructions` — the operator-configurable recovery path.** GI returns where to
+  download by hand and human-readable steps; the client prints them verbatim whenever an update is
+  blocked or fails (bad signature, no asset for this platform, permission error, etc.). Nothing about
+  the download location or instructions is hardcoded in the binary, so distribution can move (e.g. off
+  GitHub) without a client release.
 - A registry that predates this endpoint returns `404`; the client treats that as "no update info"
   (silent no-op for the passive check; a clear message for explicit `self-update`).
 
 A new `registry.FetchLatestFGLPkg() (*LatestRelease, error)` wraps this call in
 [internal/registry/registry.go](../internal/registry/registry.go), returning a typed struct.
+
+## Release signing & verification
+
+Self-update is gated on **authenticity, not just integrity** (GIS-255 R1): a SHA-256 check proves a
+download wasn't corrupted in transit, but not that the release itself is genuine — a compromised GitHub
+release or a hijacked version pointer would still checksum-match. So `self-update` **must verify an
+Ed25519 signature over the release before it installs anything**, on every platform. Verification is
+**fully offline** (no Rekor / network dependency) — which is why Ed25519 was chosen over Sigstore here
+(GIS-255, 2026-07-16 design review).
+
+This reuses Layer 1's **two-tier key model** ([`gen-signing-key.mjs`](reference-genero-intelligence)),
+not just its verify code:
+
+- The **offline root key** never touches CI or a repo. It stays offline and *certifies* a dedicated
+  **release-signing working key** via a signed key manifest — exactly as for package signing.
+- The **working key** lives as a CI secret and, in [release.yml](../.github/workflows/release.yml),
+  signs `checksums.txt` → `checksums.txt.sig` (detached Ed25519). Signing therefore happens **inside
+  the build pipeline** without ever exposing the root. (Signing the single `checksums.txt` transitively
+  covers every binary, since each asset's SHA-256 is listed there.)
+- The **client pins the root public key** (it already does for Layer 1). On update it fetches the
+  working-key manifest + `checksums.txt.sig`, verifies the manifest against the pinned root, then
+  verifies `checksums.txt.sig` with the working key — establishing a chain to the offline root. Only
+  then does it trust the SHA-256 values in `checksums.txt`.
+- If the signature or working-key manifest is missing or fails to verify, self-update **aborts** and
+  prints the `manualUrl` / `instructions` recovery path — it never installs an unverified binary.
+
+> **One detail to finalize in implementation:** how the client obtains the release-signing working-key
+> manifest. Preferred: publish it as a release asset (e.g. `keys.json` alongside `checksums.txt.sig`)
+> so verification needs only the release + the pinned root and stays fully offline; the GI endpoint can
+> also surface its URL. (Reusing the package-signing `/.well-known/keys.json` manifest is possible but
+> couples release trust to the registry being reachable, so the release-asset form is preferred.)
 
 ## `fglpkg self-update`
 
@@ -137,19 +182,23 @@ No `--version` / `--pre` / downgrade — latest stable only, per scope.
 2. **Resolve latest** via `registry.FetchLatestFGLPkg()`. Compare to `cli.Version` using
    [`internal/semver`](../internal/semver). If not newer and not `--force`, print
    `fglpkg is up to date (vX.Y.Z)` and exit.
-3. **Select the asset** matching `runtime.GOOS`/`runtime.GOARCH`. If none, error with the manual
-   download URL.
-4. **Fetch expected checksum.** GET `checksumsUrl`, parse the `sha256sum`-format lines
-   (`<hex>  <filename>`), and look up the entry for the selected asset's filename. If `checksumsUrl`
-   is missing or the entry can't be found, **abort** — self-update never installs an unverified
-   binary.
+3. **Select the asset** matching `runtime.GOOS`/`runtime.GOARCH`. If none, print the GI-provided
+   `manualUrl` + `instructions` and exit non-zero.
+4. **Fetch + authenticate `checksums.txt`.** GET `checksumsUrl`, then GET `checksumsSigUrl` and the
+   release-signing working-key manifest, and verify the Ed25519 signature chain back to the **pinned
+   root** (see [§ Release signing & verification](#release-signing--verification)). **Only after the
+   signature verifies**, parse the `sha256sum`-format lines (`<hex>  <filename>`) and look up the
+   selected asset's filename. If `checksumsUrl`/`checksumsSigUrl` is missing, the signature fails, or
+   the entry can't be found, **abort and print `manualUrl` + `instructions`** — self-update never
+   installs an unverified binary.
 5. **Confirm** (unless `--yes`): `Update fglpkg vCUR → vNEW? [Y/n]` via the existing
    [`promptYesNo`](../internal/cli/cli.go#L740).
 6. **Download** the asset to a temp file **in the same directory as the target executable** (so the
    final rename is same-filesystem and atomic — a cross-device `os.Rename` fails). Stream to disk.
-7. **Verify** the computed SHA-256 against the expected value from step 4 using the existing
-   [checksum](../internal/checksum) streaming verifier. Mismatch → delete temp, abort, exit non-zero.
-   This is the integrity gate — never install an unverified binary.
+7. **Verify** the computed SHA-256 against the (now signature-authenticated) expected value from
+   step 4 using the existing [checksum](../internal/checksum) streaming verifier. Mismatch → delete
+   temp, print `manualUrl` + `instructions`, abort, exit non-zero. This is the integrity gate on top of
+   step 4's authenticity gate — never install an unverified binary.
 8. **Swap atomically** (see below), preserving the original file mode; `chmod +x` on Unix.
 9. Print `Updated fglpkg vCUR → vNEW`. Refresh `config.json`'s cached latest so the passive check
    goes quiet immediately.
@@ -233,7 +282,12 @@ env var, and self-update maintains the cache fields. (A future `config` command 
 
 ## Non-goals
 
-- No version pinning, pre-release channel, or downgrade (`--version`/`--pre` explicitly excluded).
+- No **in-tool** version pinning, pre-release channel, or downgrade (`--version`/`--pre` excluded).
+  The only recovery/downgrade path is the GI-served `manualUrl` + `instructions`, printed when an
+  update is blocked or fails (GIS-255 R2).
+- **No OS package-manager distribution** (Homebrew / Scoop / winget) — out of scope. Self-update is the
+  upgrade path for the hand-copied binary; managed installs are only *detected* and deferred to, never
+  produced. (Design review 2026-07-16.)
 - No background daemon / scheduled task — checks only piggyback on invocations.
 - No `fglpkg config` command in this spec (state file is edited by hand / env for now).
 - No auto-apply — the passive check only *notifies*; it never updates without the user running
@@ -247,8 +301,13 @@ env var, and self-update maintains the cache fields. (A future `config` command 
 - **`registry.FetchLatestFGLPkg`**: maps the JSON contract; asset selection by GOOS/GOARCH; missing
   asset → clear error. (Table-driven, mocked HTTP as in
   [registry_test.go](../internal/registry/registry_test.go).)
-- **checksum gate**: a tampered download (wrong sha256) aborts and leaves the original binary
-  untouched — the critical safety test.
+- **signature gate**: a `checksums.txt` whose Ed25519 signature is missing, doesn't verify against the
+  pinned root, or is signed by a working key not certified by the root → self-update aborts *before*
+  downloading the binary and prints `manualUrl`/`instructions`. The critical authenticity test.
+- **checksum gate**: a tampered download (wrong sha256, signature valid) aborts and leaves the original
+  binary untouched — the critical integrity test.
+- **recovery output**: every abort path (no asset for platform, missing/invalid signature, checksum
+  mismatch, permission error) prints the GI-served `manualUrl` + `instructions` verbatim.
 - **atomic swap**: temp written in target dir; original mode preserved; Windows `.old` path
   exercised behind a GOOS guard.
 - **throttle logic**: check skipped when `<interval`, when `CI`/env/`updateCheck:false`, when `dev`,

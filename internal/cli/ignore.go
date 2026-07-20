@@ -15,9 +15,9 @@ const ignoreFilename = ".fglpkgignore"
 // ignoreRule is a single line of a .fglpkgignore file after parsing.
 // `negate` rules re-include a path that an earlier rule excluded.
 type ignoreRule struct {
-	pattern  string
-	negate   bool
-	dirOnly  bool
+	pattern string
+	negate  bool
+	dirOnly bool
 }
 
 // ignoreSet is an ordered list of rules. Rules are evaluated in file

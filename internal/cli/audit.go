@@ -57,6 +57,12 @@ const bdlNotScanned = "BDL packages were not scanned (no advisory database avail
 //	1 = at least one finding at or above the severity floor
 //	2 = command failed (missing lockfile, network error, etc.)
 func cmdAudit(args []string) error {
+	// `fglpkg audit signatures` is a distinct subcommand: it re-verifies Layer
+	// 1 registry signatures rather than scanning Java JARs for CVEs.
+	if len(args) > 0 && args[0] == "signatures" {
+		return cmdAuditSignatures(args[1:])
+	}
+
 	flags, err := parseAuditFlags(args)
 	if err != nil {
 		return &ExitError{Code: 2, Err: err}

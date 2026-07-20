@@ -26,10 +26,11 @@ func TestDownloadAndVerify_AnonymousRepoDoesNotLeakRegistryToken(t *testing.T) {
 	err := downloadAndVerify(
 		srv.URL+"/acme-utils/1.0.0/acme-utils-1.0.0-genero6.zip",
 		"", "acme-utils", &buf,
-		"",                /* githubToken */
-		"gi-secret-bearer", /* registryToken */
-		nil,               /* repoHeaders */
-		true,              /* repoMatched */
+		"",                  /* githubToken */
+		"gi-secret-bearer",  /* registryToken */
+		srv.URL,             /* giOrigin */
+		nil,                 /* repoHeaders */
+		true,                /* repoMatched */
 	)
 	if err != nil {
 		t.Fatalf("download failed: %v", err)
@@ -52,7 +53,7 @@ func TestDownloadAndVerify_SecondaryRepoSendsItsOwnAuth(t *testing.T) {
 	var buf bytes.Buffer
 	err := downloadAndVerify(
 		srv.URL+"/x.zip", "", "x", &buf,
-		"", "gi-secret-bearer",
+		"", "gi-secret-bearer", srv.URL,
 		map[string]string{"Authorization": "Basic dXNlcjp0b2tlbg=="},
 		true,
 	)
@@ -65,7 +66,8 @@ func TestDownloadAndVerify_SecondaryRepoSendsItsOwnAuth(t *testing.T) {
 }
 
 // TestDownloadAndVerify_GIStillGetsRegistryToken confirms the GI path (no
-// configured secondary repo matched) still receives the registry bearer.
+// configured secondary repo matched, URL origin matches giOrigin) still
+// receives the registry bearer.
 func TestDownloadAndVerify_GIStillGetsRegistryToken(t *testing.T) {
 	var gotAuth string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -77,7 +79,7 @@ func TestDownloadAndVerify_GIStillGetsRegistryToken(t *testing.T) {
 	var buf bytes.Buffer
 	err := downloadAndVerify(
 		srv.URL+"/pkg.zip", "", "pkg", &buf,
-		"", "gi-secret-bearer",
+		"", "gi-secret-bearer", srv.URL, /* giOrigin — matches the download URL's origin */
 		nil,   /* repoHeaders */
 		false, /* repoMatched — not a configured secondary repo */
 	)
@@ -86,5 +88,34 @@ func TestDownloadAndVerify_GIStillGetsRegistryToken(t *testing.T) {
 	}
 	if gotAuth != "Bearer gi-secret-bearer" {
 		t.Fatalf("GI download Authorization = %q, want Bearer gi-secret-bearer", gotAuth)
+	}
+}
+
+// TestDownloadAndVerify_ForeignHostDoesNotGetRegistryToken is the regression
+// test for GIS-249 S1: a GI-resolved package whose download URL is an
+// absolute foreign-host URL (e.g. an R2/CDN target) must NOT receive the GI
+// registry bearer, even though it isn't a configured secondary repo
+// (repoMatched=false) and registryToken is set. Only a URL whose origin
+// equals giOrigin may receive it.
+func TestDownloadAndVerify_ForeignHostDoesNotGetRegistryToken(t *testing.T) {
+	var gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		_, _ = w.Write([]byte("zip-bytes"))
+	}))
+	defer srv.Close()
+
+	var buf bytes.Buffer
+	err := downloadAndVerify(
+		srv.URL+"/pkg.zip", "", "pkg", &buf,
+		"", "gi-secret-bearer", "https://service.generointelligence.ai", /* giOrigin — different host than srv.URL */
+		nil,   /* repoHeaders */
+		false, /* repoMatched — not a configured secondary repo */
+	)
+	if err != nil {
+		t.Fatalf("download failed: %v", err)
+	}
+	if gotAuth != "" {
+		t.Fatalf("foreign host received Authorization %q — GI token leaked", gotAuth)
 	}
 }

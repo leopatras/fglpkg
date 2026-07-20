@@ -22,6 +22,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 )
 
 // Registry describes one package repository. It carries no secrets.
@@ -80,6 +81,45 @@ func LoadGlobal(home string) ([]Registry, error) {
 type GlobalFile struct {
 	Registries      []Registry `json:"registries"`
 	DefaultRegistry string     `json:"defaultRegistry"` // logical name of the default publish target
+
+	// Passive update-check user settings (GIS-255). These are READ-ONLY here —
+	// the tool never rewrites config.json. The mutable cache (last check time,
+	// last seen version) lives in the separate tool-managed update-check.json
+	// (see internal/updatecheck), so an advisory feature never reformats the
+	// user's hand-edited registry config.
+	UpdateCheck         *bool  `json:"updateCheck"`         // opt-out; nil => default (enabled)
+	UpdateCheckInterval string `json:"updateCheckInterval"` // Go duration; "" => default 24h
+}
+
+// UpdateSettings are the resolved passive-update-check preferences.
+type UpdateSettings struct {
+	Enabled  bool
+	Interval time.Duration
+}
+
+// DefaultUpdateInterval is the throttle window when config.json sets none.
+const DefaultUpdateInterval = 24 * time.Hour
+
+// LoadUpdateSettings reads the update-check preferences from config.json,
+// applying defaults (enabled, 24h). A missing file or unset fields yield the
+// defaults; an unparseable/zero interval falls back to the default rather than
+// failing a command over an advisory feature. The returned settings are always
+// usable even when err is non-nil (caller may simply skip the check).
+func LoadUpdateSettings(home string) (UpdateSettings, error) {
+	s := UpdateSettings{Enabled: true, Interval: DefaultUpdateInterval}
+	g, err := loadGlobalFile(home)
+	if err != nil {
+		return s, err
+	}
+	if g.UpdateCheck != nil {
+		s.Enabled = *g.UpdateCheck
+	}
+	if g.UpdateCheckInterval != "" {
+		if d, perr := time.ParseDuration(g.UpdateCheckInterval); perr == nil && d > 0 {
+			s.Interval = d
+		}
+	}
+	return s, nil
 }
 
 // loadGlobalFile reads and parses the global config file. A missing or
@@ -107,6 +147,26 @@ func loadGlobalFile(home string) (GlobalFile, error) {
 		return GlobalFile{}, fmt.Errorf("invalid %s: %w", p, err)
 	}
 	return f, nil
+}
+
+// LoadGlobalFile reads and parses ~/.fglpkg/config.json. A missing or blank
+// file yields a zero GlobalFile (not an error). It is the read half of the
+// read-modify-write cycle used by `fglpkg registry add/remove`.
+func LoadGlobalFile(home string) (GlobalFile, error) {
+	return loadGlobalFile(home)
+}
+
+// WriteGlobalFile writes g to ~/.fglpkg/config.json as formatted JSON, creating
+// the home directory if needed. It is the write half of `registry add/remove`.
+func WriteGlobalFile(home string, g GlobalFile) error {
+	if err := os.MkdirAll(home, 0755); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(g, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(home, GlobalFilename), append(data, '\n'), 0644)
 }
 
 // GlobalDefaultRegistry returns the defaultRegistry declared in the global
@@ -194,7 +254,19 @@ func validate(r Registry) error {
 	}
 	switch r.Type {
 	case TypeGenero:
-		// no extra requirements
+		// Only the built-in GI registry may be type=genero: the Genero client
+		// resolves its base from the process-global registryBase()/FGLPKG_REGISTRY,
+		// so a per-instance URL on any other genero entry would be silently
+		// ignored (dead config) and mis-attribute results to it. Point an
+		// internal GI mirror via FGLPKG_REGISTRY, or use type=artifactory.
+		// (GIS-249 C1)
+		if r.Name != GIName {
+			return fmt.Errorf(
+				"registry %q has type %q but only the built-in %q registry may be type=genero; "+
+					"use type=artifactory, or retarget GI via FGLPKG_REGISTRY",
+				r.Name, TypeGenero, GIName,
+			)
+		}
 	case TypeArtifactory:
 		if r.RepoKey == "" {
 			return fmt.Errorf("registry %q (type=artifactory) requires 'repoKey'", r.Name)

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/4js-mikefolcher/fglpkg/internal/genero"
@@ -432,5 +433,32 @@ func TestAddManifestJARs(t *testing.T) {
 	// Idempotent: re-adding the same coordinate is a no-op.
 	if lf.AddManifestJARs(deps) {
 		t.Error("second AddManifestJARs call should report no additions")
+	}
+}
+
+// TestSaveDoesNotHTMLEscape: fglpkg.lock must keep the literal angle brackets
+// in a requiredBy entry like "<root>". Under Go's default HTML escaping the
+// brackets would be written as numeric Unicode escapes, so the literal
+// "<root>" would NOT appear — the positive check alone distinguishes it (GIS-280).
+func TestSaveDoesNotHTMLEscape(t *testing.T) {
+	dir := t.TempDir()
+	lf := &lockfile.LockFile{
+		Version: 1,
+		Packages: []lockfile.LockedPackage{{
+			Name:        "dep",
+			Version:     "1.0.0",
+			DownloadURL: "https://example.test/dep-1.0.0.zip",
+			RequiredBy:  []string{"<root>"},
+		}},
+	}
+	if err := lf.Save(dir); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, lockfile.Filename))
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if got := string(data); !strings.Contains(got, "<root>") {
+		t.Errorf("fglpkg.lock is HTML-escaping requiredBy; want literal <root>:\n%s", got)
 	}
 }

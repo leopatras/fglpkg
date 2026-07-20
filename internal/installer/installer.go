@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 
 	"github.com/4js-mikefolcher/fglpkg/internal/checksum"
 	"github.com/4js-mikefolcher/fglpkg/internal/genero"
@@ -18,6 +20,7 @@ import (
 	"github.com/4js-mikefolcher/fglpkg/internal/manifest"
 	"github.com/4js-mikefolcher/fglpkg/internal/registry"
 	"github.com/4js-mikefolcher/fglpkg/internal/resolver"
+	"github.com/4js-mikefolcher/fglpkg/internal/signing"
 )
 
 // InstalledPackage is a summary of an installed BDL package.
@@ -34,6 +37,7 @@ type Installer struct {
 	webcomponentsDir string // ~/.fglpkg/webcomponents
 	githubToken      string // GitHub PAT for downloading from private GitHub Releases
 	registryToken    string // bearer for the consumer registry when it serves zips directly
+	giOrigin         string // scheme+host of the GI registry; gates where registryToken may be sent
 	repoAuth         []RepoAuth
 	// versionFetcher/infoFetcher, when non-nil, replace the default live GI
 	// registry fetchers with a multi-provider routing layer (RepositorySet).
@@ -43,6 +47,18 @@ type Installer struct {
 	// resolved packages' manifests so transitive deps route to the author's
 	// stated source. Set alongside the multi-provider fetchers.
 	pinDeclarer resolver.PinDeclarer
+	// configuredRegistries lists the logical names of the currently-configured
+	// repositories (including the built-in "gi"). Used to reject a lock file
+	// that references a repository since removed from the config (spec §9).
+	configuredRegistries []string
+
+	// ── Layer 1 signature verification (opt-in via WithSigning) ──
+	signingEnforce  string // "require" | "warn" | "off"; "" == off
+	keysHome        string // where the keys manifest is cached (usually the global ~/.fglpkg)
+	registryBase    string // consumer registry base URL for fetching the keys manifest
+	keysOnce        sync.Once
+	keysManifest    *signing.Manifest
+	keysManifestErr error
 }
 
 // RepoAuth maps a repository URL prefix to the HTTP headers that authenticate
@@ -60,7 +76,12 @@ type RepoAuth struct {
 //   - registryToken: bearer for non-GitHub download URLs (the new
 //     service.generointelligence.ai flow serves zips itself, possibly
 //     behind auth). Pass "" for anonymous fetches.
-func New(home, githubToken, registryToken string) *Installer {
+//   - giOrigin: the GI registry's base URL (e.g. https://service.generointelligence.ai
+//     or FGLPKG_REGISTRY's override). registryToken is only ever sent to a
+//     download URL whose origin matches this — never to an arbitrary
+//     absolute host (e.g. an R2/CDN target) — to avoid leaking the GI
+//     bearer to a third party (GIS-267 / GIS-249 S1).
+func New(home, githubToken, registryToken, giOrigin string) *Installer {
 	return &Installer{
 		home:             home,
 		packagesDir:      filepath.Join(home, "packages"),
@@ -68,6 +89,7 @@ func New(home, githubToken, registryToken string) *Installer {
 		webcomponentsDir: filepath.Join(home, "webcomponents"),
 		githubToken:      githubToken,
 		registryToken:    registryToken,
+		giOrigin:         giOrigin,
 	}
 }
 
@@ -95,6 +117,14 @@ func (i *Installer) WithPinDeclarer(pd resolver.PinDeclarer) *Installer {
 	return i
 }
 
+// WithConfiguredRegistries records the logical names of the currently
+// configured repositories so a lock file referencing a removed repository can
+// be rejected before install (spec §9). Returns the installer for chaining.
+func (i *Installer) WithConfiguredRegistries(names []string) *Installer {
+	i.configuredRegistries = names
+	return i
+}
+
 // newResolver builds the resolver, using injected multi-provider fetchers when
 // configured (still honouring any workspace), else the default live resolver.
 func (i *Installer) newResolver(gv genero.Version) (*resolver.Resolver, error) {
@@ -117,15 +147,139 @@ func (i *Installer) newResolver(gv genero.Version) (*resolver.Resolver, error) {
 // reports matched=true, so the caller knows the host belongs to a configured
 // repository and must NOT be sent the GI registry token (which would leak the
 // GI bearer to a third-party host — see GIS-267).
-func (i *Installer) matchRepoAuth(url string) (headers map[string]string, matched bool) {
+//
+// Matching is by parsed-URL origin (scheme+host) plus a path prefix on a "/"
+// boundary — a raw string prefix would let
+// "https://acme.jfrog.io.attacker.com/…" match a repo configured as
+// "https://acme.jfrog.io" (GIS-249 S1).
+func (i *Installer) matchRepoAuth(downloadURL string) (headers map[string]string, matched bool) {
 	var best RepoAuth
 	for _, ra := range i.repoAuth {
-		if strings.HasPrefix(url, ra.URLPrefix) && len(ra.URLPrefix) > len(best.URLPrefix) {
+		if urlHasOriginPrefix(downloadURL, ra.URLPrefix) && len(ra.URLPrefix) > len(best.URLPrefix) {
 			best = ra
 			matched = true
 		}
 	}
 	return best.Headers, matched
+}
+
+// urlHasOriginPrefix reports whether rawURL is served by the same origin
+// (scheme+host, case-insensitive) as prefix, and its path starts with
+// prefix's path on a "/" boundary (equal, or the next rune is "/"). This is
+// stricter than strings.HasPrefix(rawURL, prefix): it rejects a host that
+// merely has prefix's host as a string prefix, e.g. a repo configured as
+// "https://acme.jfrog.io" must not match "https://acme.jfrog.io.attacker.com/…"
+// (GIS-249 S1), nor "https://acme.jfrog.io/repo" match ".../repo-other/x".
+func urlHasOriginPrefix(rawURL, prefix string) bool {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	p, err := url.Parse(prefix)
+	if err != nil {
+		return false
+	}
+	if !strings.EqualFold(u.Scheme, p.Scheme) || !strings.EqualFold(u.Host, p.Host) {
+		return false
+	}
+	pPath := strings.TrimSuffix(p.Path, "/")
+	if !strings.HasPrefix(u.Path, pPath) {
+		return false
+	}
+	rest := u.Path[len(pPath):]
+	return rest == "" || strings.HasPrefix(rest, "/")
+}
+
+// sameOrigin reports whether rawURL's scheme+host matches originURL's,
+// ignoring path/query/fragment. Used to gate the GI registry bearer: it must
+// only be sent to the GI registry's own origin, never to an arbitrary
+// absolute download URL (e.g. an R2/CDN target) — GIS-249 S1.
+func sameOrigin(rawURL, originURL string) bool {
+	if originURL == "" {
+		return false
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	o, err := url.Parse(originURL)
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(u.Scheme, o.Scheme) && strings.EqualFold(u.Host, o.Host)
+}
+
+// WithSigning enables Layer 1 signature verification on install.
+//
+//   - enforce: "require" aborts on a bad/missing signature, "warn" logs and
+//     continues, "off" (or "") disables verification entirely.
+//   - keysHome: directory the root-verified keys manifest is cached in
+//     (typically the global ~/.fglpkg, even for a local install).
+//   - registryBase: consumer registry base URL the manifest is fetched from.
+func (i *Installer) WithSigning(enforce, keysHome, registryBase string) *Installer {
+	i.signingEnforce = enforce
+	i.keysHome = keysHome
+	i.registryBase = registryBase
+	return i
+}
+
+// keysManifestFor lazily loads (once) the root-verified keys manifest.
+func (i *Installer) keysManifestFor() (*signing.Manifest, error) {
+	i.keysOnce.Do(func() {
+		home := i.keysHome
+		if home == "" {
+			home = i.home
+		}
+		i.keysManifest, i.keysManifestErr = signing.LoadManifest(home, i.registryBase)
+	})
+	return i.keysManifest, i.keysManifestErr
+}
+
+// verifySignature checks info's Layer 1 registry signature, honouring the
+// configured enforce mode. variant is the artifact variant that was signed
+// (e.g. "genero6" / "webcomponent"); it may differ from info.Variant when the
+// record was reconstructed from the lock file.
+func (i *Installer) verifySignature(info *registry.PackageInfo, variant string) error {
+	mode := i.signingEnforce
+	if mode == "" || mode == "off" {
+		return nil
+	}
+	if info.Signature == nil {
+		return i.onSigningIssue(mode, fmt.Errorf("%s@%s: %w", info.Name, info.Version, signing.ErrUnsigned))
+	}
+	m, err := i.keysManifestFor()
+	if err != nil {
+		return i.onSigningIssue(mode, fmt.Errorf("%s@%s: cannot load keys manifest: %w", info.Name, info.Version, err))
+	}
+	p := signing.ArtifactFields{
+		Name: info.Name, Version: info.Version, Variant: variant,
+		SHA256: info.Checksum, Size: info.Size,
+		UploadedAt: info.UploadedAt, Uploader: info.Uploader,
+	}
+	sig := signing.ArtifactSignature{KeyID: info.Signature.KeyID, Alg: info.Signature.Alg, Sig: info.Signature.Sig}
+	if err := m.VerifyArtifact(p, sig); err != nil {
+		return i.onSigningIssue(mode, err)
+	}
+	return nil
+}
+
+// onSigningIssue applies the enforce policy: "require" surfaces the error;
+// "warn" logs it and continues.
+func (i *Installer) onSigningIssue(mode string, err error) error {
+	if mode == "require" {
+		return err
+	}
+	printSync("  warning: signature check failed: %v\n", err)
+	return nil
+}
+
+// lockSignature reconstructs a signature envelope from lock-file fields,
+// returning nil when the locked package carries no signature.
+func lockSignature(keyid, sig string) *registry.Signature {
+	if keyid == "" && sig == "" {
+		return nil
+	}
+	return &registry.Signature{KeyID: keyid, Alg: "ed25519", Sig: sig}
 }
 
 // Options controls optional install behaviour.
@@ -168,6 +322,11 @@ func (i *Installer) InstallAllWithOptions(m *manifest.Manifest, projectDir strin
 		if err != nil {
 			fmt.Printf("warning: cannot read lock file: %v — re-resolving\n", err)
 		} else {
+			// A lock referencing a repository that is no longer configured is a
+			// hard error — never install from a source the user can't see (§9).
+			if err := lf.CheckRegistries(i.configuredRegistries); err != nil {
+				return err
+			}
 			vr := lf.Validate(m, gv.String(), i.packagesDir, i.webcomponentsDir)
 			if vr.NeedsResolve() {
 				fmt.Printf("Lock file is stale (%v) — re-resolving...\n", vr.ManifestMismatch)
@@ -201,6 +360,7 @@ func (i *Installer) InstallAllWithOptions(m *manifest.Manifest, projectDir strin
 		return fmt.Errorf("dependency resolution failed:\n%w", err)
 	}
 	fmt.Printf("Resolved %d package(s), %d JAR(s)\n\n", len(plan.Packages), len(plan.JARs))
+	warnDeprecations(plan, os.Stderr)
 
 	// Write the lock file before installing so it's always present even if
 	// installation is interrupted partway through.
@@ -252,8 +412,21 @@ func (i *Installer) installFromLock(lf *lockfile.LockFile, root *manifest.Manife
 			Version:     pkg.Version,
 			DownloadURL: pkg.DownloadURL,
 			Checksum:    pkg.Checksum,
+			Size:        pkg.Size,
+			UploadedAt:  pkg.UploadedAt,
+			Uploader:    pkg.Uploader,
+			Signature:   lockSignature(pkg.SignatureKeyID, pkg.Signature),
 		}
 		if err := i.Install(info); err != nil {
+			return fmt.Errorf("failed to install %s: %w", pkg.Name, err)
+		}
+		// The signed artifact variant is "genero<major>" (or the record's
+		// own variant when the lock predates that field).
+		variant := pkg.GeneroMajor
+		if variant != "" {
+			variant = "genero" + variant
+		}
+		if err := i.verifySignature(info, variant); err != nil {
 			return fmt.Errorf("failed to install %s: %w", pkg.Name, err)
 		}
 		printSync("  ✓ %s@%s\n", pkg.Name, pkg.Version)
@@ -274,8 +447,15 @@ func (i *Installer) installFromLock(lf *lockfile.LockFile, root *manifest.Manife
 			DownloadURL: wc.DownloadURL,
 			Checksum:    wc.Checksum,
 			Variant:     "webcomponent",
+			Size:        wc.Size,
+			UploadedAt:  wc.UploadedAt,
+			Uploader:    wc.Uploader,
+			Signature:   lockSignature(wc.SignatureKeyID, wc.Signature),
 		}
 		if err := i.Install(info); err != nil {
+			return fmt.Errorf("failed to install webcomponent %s: %w", wc.Name, err)
+		}
+		if err := i.verifySignature(info, "webcomponent"); err != nil {
 			return fmt.Errorf("failed to install webcomponent %s: %w", wc.Name, err)
 		}
 		printSync("  ✓ %s@%s (webcomponent)\n", wc.Name, wc.Version)
@@ -354,6 +534,37 @@ func (i *Installer) installFromLock(lf *lockfile.LockFile, root *manifest.Manife
 	return nil
 }
 
+// warnDeprecations writes a non-fatal stderr warning for each deprecated
+// package in the resolved plan, pointing at the successor when --moved-to was
+// set. npm-style deprecation is advisory: this NEVER blocks the install. Only
+// fires on a fresh resolve — a lock-file install carries no deprecation state
+// (the lockfile is deliberately not extended), matching specs/deprecate-cli.md.
+// Warnings are de-duplicated per (name, version) so a package reached by
+// multiple paths in the transitive graph warns exactly once.
+func warnDeprecations(plan *resolver.Plan, w io.Writer) {
+	seen := make(map[string]bool)
+	for _, p := range plan.Packages {
+		if !p.Deprecated {
+			continue
+		}
+		key := p.Name + "@" + p.Version.String()
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+
+		if p.DeprecationMessage != "" {
+			fmt.Fprintf(w, "warning: %s@%s is deprecated: %s\n", p.Name, p.Version.String(), p.DeprecationMessage)
+		} else {
+			fmt.Fprintf(w, "warning: %s@%s is deprecated\n", p.Name, p.Version.String())
+		}
+		if p.MovedTo != "" {
+			fmt.Fprintf(w, "warning: %s has moved to %s\n", p.Name, p.MovedTo)
+			fmt.Fprintf(w, "         → consider: fglpkg install %s\n", p.MovedTo)
+		}
+	}
+}
+
 // installFromPlan installs every entry in a freshly resolved Plan.
 // Optional-scoped items whose download or extraction fails emit a warning
 // and are skipped; hard-scope failures abort the install.
@@ -367,12 +578,19 @@ func (i *Installer) installFromPlan(plan *resolver.Plan, root *manifest.Manifest
 			DownloadURL: pkg.DownloadURL,
 			Checksum:    pkg.Checksum,
 			Variant:     pkg.Variant,
+			Size:        pkg.Size,
+			UploadedAt:  pkg.UploadedAt,
+			Uploader:    pkg.Uploader,
+			Signature:   pkg.Signature,
 		}
 		if err := i.Install(info); err != nil {
 			if pkg.Scope == manifest.ScopeOptional {
 				printSync("  warning: skipping optional package %s: %v\n", pkg.Name, err)
 				return nil
 			}
+			return fmt.Errorf("failed to install %s: %w", pkg.Name, err)
+		}
+		if err := i.verifySignature(info, pkg.Variant); err != nil {
 			return fmt.Errorf("failed to install %s: %w", pkg.Name, err)
 		}
 		// Required-by hint joins the completion line so it doesn't
@@ -464,7 +682,7 @@ func (i *Installer) installBDL(info *registry.PackageInfo) error {
 
 	// Download and verify in one streaming pass.
 	repoHeaders, repoMatched := i.matchRepoAuth(downloadURL)
-	if err := downloadAndVerify(downloadURL, info.Checksum, info.Name, tmp, i.githubToken, i.registryToken, repoHeaders, repoMatched); err != nil {
+	if err := downloadAndVerify(downloadURL, info.Checksum, info.Name, tmp, i.githubToken, i.registryToken, i.giOrigin, repoHeaders, repoMatched); err != nil {
 		tmp.Close()
 		return err
 	}
@@ -522,7 +740,7 @@ func (i *Installer) installWebcomponent(info *registry.PackageInfo) error {
 
 	downloadURL := registry.AbsoluteDownloadURL(info.DownloadURL)
 	repoHeaders, repoMatched := i.matchRepoAuth(downloadURL)
-	if err := downloadAndVerify(downloadURL, info.Checksum, info.Name, tmp, i.githubToken, i.registryToken, repoHeaders, repoMatched); err != nil {
+	if err := downloadAndVerify(downloadURL, info.Checksum, info.Name, tmp, i.githubToken, i.registryToken, i.giOrigin, repoHeaders, repoMatched); err != nil {
 		tmp.Close()
 		return err
 	}
@@ -555,7 +773,7 @@ func (i *Installer) InstallJar(dep manifest.JavaDependency) error {
 
 	// JavaDependency doesn't carry a checksum field today; pass "" to skip.
 	// JARs come from Maven Central anonymously — no repo auth.
-	if err := downloadAndVerify(url, dep.Checksum, dep.JarFileName(), f, "", "", nil, false); err != nil {
+	if err := downloadAndVerify(url, dep.Checksum, dep.JarFileName(), f, "", "", "", nil, false); err != nil {
 		f.Close()
 		os.Remove(dest)
 		return err
@@ -574,10 +792,10 @@ func (i *Installer) Remove(name string) error {
 
 // ReconcileAfterRemove brings the install state back in line with a manifest
 // that has just had one or more dependencies removed. It re-resolves the
-// remaining graph, rewrites the lock file (so the removed package and its now
-// unreferenced JARs no longer reappear on the next install), and — when prune
-// is true — deletes installed packages and JARs that the resolved graph no
-// longer requires.
+// remaining graph, rewrites the lock file — or deletes it when the last
+// dependency is gone — so the removed package and its now unreferenced JARs no
+// longer reappear on the next install, and — when prune is true — deletes
+// installed packages and JARs that the resolved graph no longer requires.
 //
 // prune MUST be false for a global (~/.fglpkg) home: those package and JAR
 // directories are shared across every project, so pruning against a single
@@ -605,18 +823,52 @@ func (i *Installer) ReconcileAfterRemove(m *manifest.Manifest, projectDir string
 		return nil, fmt.Errorf("dependency resolution failed:\n%w", err)
 	}
 
-	// Rewrite the lock only if the project already had one; a `remove` should
-	// not conjure a lock for a project that was never installed.
-	if lockfile.Exists(projectDir) {
-		if err := lockfile.FromPlan(plan, m).Save(projectDir); err != nil {
-			return nil, fmt.Errorf("cannot write lock file: %w", err)
-		}
+	// Reconcile the lock first, before mutating disk: rewrite it from the
+	// re-resolved graph, or delete it when that graph is now empty. Always
+	// safe regardless of prune — the lock is project-local wherever artifacts
+	// live.
+	lockNote, err := reconcileLock(plan, m, projectDir)
+	if err != nil {
+		return nil, err
 	}
 
-	if !prune {
-		return nil, nil
+	var pruned []string
+	if prune {
+		diskPruned, err := i.pruneToPlan(plan)
+		if err != nil {
+			return pruned, err
+		}
+		pruned = append(pruned, diskPruned...)
 	}
-	return i.pruneToPlan(plan)
+	if lockNote != "" {
+		pruned = append(pruned, lockNote) // reported after the pruned artifacts
+	}
+	return pruned, nil
+}
+
+// reconcileLock brings the project lock file in line with a freshly re-resolved
+// plan after a dependency removal. It is a no-op when the project has no lock
+// (a `remove` must never conjure one for a project that was never installed).
+// When the removal empties the graph — exactly the case where the lock would
+// otherwise be rewritten with empty package and JAR lists — the lock is deleted
+// instead: a project with no dependencies has nothing to pin, and a leftover
+// empty fglpkg.lock is confusing (GIS-273). Otherwise the lock is rewritten
+// from the plan. Returns a human-readable note when the lock was deleted (for
+// the caller's summary), or "" when it was rewritten or absent.
+func reconcileLock(plan *resolver.Plan, m *manifest.Manifest, projectDir string) (string, error) {
+	if !lockfile.Exists(projectDir) {
+		return "", nil
+	}
+	if len(plan.Packages) == 0 && len(plan.JARs) == 0 {
+		if err := lockfile.Remove(projectDir); err != nil {
+			return "", fmt.Errorf("cannot remove empty lock file: %w", err)
+		}
+		return lockfile.Filename + " (no dependencies remain)", nil
+	}
+	if err := lockfile.FromPlan(plan, m).Save(projectDir); err != nil {
+		return "", fmt.Errorf("cannot write lock file: %w", err)
+	}
+	return "", nil
 }
 
 // pruneToPlan deletes installed BDL packages and JARs that are absent from
@@ -716,10 +968,14 @@ func (i *Installer) JarsDir() string { return i.jarsDir }
 //     that repo's auth-scheme headers, or NONE for an "anonymous" repo. The GI
 //     registry token is never sent here: doing so would leak the GI bearer to
 //     a third-party (e.g. Artifactory) host (GIS-267).
-//   - Other non-GitHub URL + registryToken non-empty → send registryToken (the
-//     GI service.generointelligence.ai path where the registry serves zips).
+//   - Other non-GitHub URL whose origin matches giOrigin + registryToken
+//     non-empty → send registryToken (the GI service.generointelligence.ai
+//     path where the registry serves zips). registryToken is NEVER sent to a
+//     URL outside giOrigin — e.g. an absolute R2/CDN download target a GI
+//     package resolves to — since that would leak the GI bearer to a third
+//     party (GIS-249 S1).
 //   - Otherwise → no auth (anonymous public download).
-func downloadAndVerify(url, expectedChecksum, name string, w io.Writer, githubToken, registryToken string, repoHeaders map[string]string, repoMatched bool) error {
+func downloadAndVerify(url, expectedChecksum, name string, w io.Writer, githubToken, registryToken, giOrigin string, repoHeaders map[string]string, repoMatched bool) error {
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
 		return fmt.Errorf("download failed for %s: %w", name, err)
@@ -740,7 +996,7 @@ func downloadAndVerify(url, expectedChecksum, name string, w io.Writer, githubTo
 		for k, v := range repoHeaders {
 			req.Header.Set(k, v)
 		}
-	case !isGH && registryToken != "":
+	case !isGH && registryToken != "" && sameOrigin(url, giOrigin):
 		authToken = registryToken
 		req.Header.Set("Authorization", "Bearer "+authToken)
 	}

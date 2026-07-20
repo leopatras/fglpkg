@@ -19,12 +19,24 @@ import (
 
 	"github.com/4js-mikefolcher/fglpkg/internal/manifest"
 	"github.com/4js-mikefolcher/fglpkg/internal/semver"
+	slugutil "github.com/4js-mikefolcher/fglpkg/internal/slug"
 )
 
 // ErrNotFound is returned (via %w wrapping) when the registry responds 404
 // to a GET. Callers can detect first-publish or missing-package conditions
 // with errors.Is(err, registry.ErrNotFound).
 var ErrNotFound = errors.New("package not found in registry")
+
+// ErrUnauthorized / ErrForbidden / ErrMessageTooLong let publisher-side
+// callers map a write's HTTP status to an actionable message. They are
+// wrapped (%w) so callers detect them with errors.Is. ErrUnauthorized is a
+// 401 (no/expired credentials), ErrForbidden a 403 (authenticated but not the
+// owning partner), ErrMessageTooLong a 400 from the registry's scalar cap.
+var (
+	ErrUnauthorized   = errors.New("not authorized")
+	ErrForbidden      = errors.New("forbidden")
+	ErrMessageTooLong = errors.New("value exceeds the registry length limit")
+)
 
 const (
 	defaultRegistryBase = "https://service.generointelligence.ai"
@@ -51,24 +63,24 @@ var TryRefresh = func() bool { return false }
 // shipped) return empty values for those fields and must be republished to
 // expose them.
 type PackageInfo struct {
-	Name             string                    `json:"name"`
-	Version          string                    `json:"version"`
-	Description      string                    `json:"description"`
-	Author           string                    `json:"author,omitempty"`
-	License          string                    `json:"license,omitempty"`
-	PublishedAt      string                    `json:"publishedAt,omitempty"`
-	DownloadURL      string                    `json:"downloadUrl"`
-	Checksum         string                    `json:"checksum"`
-	GeneroConstraint string                    `json:"genero,omitempty"`
-	FGLDeps          map[string]string         `json:"fglDeps,omitempty"`
+	Name             string            `json:"name"`
+	Version          string            `json:"version"`
+	Description      string            `json:"description"`
+	Author           string            `json:"author,omitempty"`
+	License          string            `json:"license,omitempty"`
+	PublishedAt      string            `json:"publishedAt,omitempty"`
+	DownloadURL      string            `json:"downloadUrl"`
+	Checksum         string            `json:"checksum"`
+	GeneroConstraint string            `json:"genero,omitempty"`
+	FGLDeps          map[string]string `json:"fglDeps,omitempty"`
 	// FGLDepPins carries the per-dependency repository pin this package's own
 	// manifest declared (dep name → registry name), e.g. {"qrcode":"acme"}.
 	// The multi-provider resolver honours these so a package's transitive deps
 	// resolve from the repository the author pinned, even when the name also
 	// exists in another repository. Populated from an Artifactory sidecar's
 	// object-form deps; the GI registry does not carry pins yet (see resolver).
-	FGLDepPins       map[string]string         `json:"fglDepPins,omitempty"`
-	JavaDeps         []manifest.JavaDependency `json:"javaDeps,omitempty"`
+	FGLDepPins map[string]string         `json:"fglDepPins,omitempty"`
+	JavaDeps   []manifest.JavaDependency `json:"javaDeps,omitempty"`
 	// Variant is the artifact variant tag selected by the registry client
 	// when fetching this version — "genero<N>" for BDL packages or
 	// "webcomponent" for webcomponent packages. The installer uses it to
@@ -82,13 +94,44 @@ type PackageInfo struct {
 	// as the dependency-confusion pin. See
 	// specs/artifactory-secondary-repository.md §9.
 	Source string `json:"source,omitempty"`
+
+	// ── Layer 1 signing material for the selected artifact ──
+	// These carry the inputs needed to reconstruct the canonical signed
+	// payload and verify the registry signature. Size/UploadedAt/Uploader
+	// are part of that payload; Signature is nil for unsigned artifacts.
+	Size       int64      `json:"size,omitempty"`
+	UploadedAt string     `json:"uploadedAt,omitempty"`
+	Uploader   string     `json:"uploader,omitempty"`
+	Signature  *Signature `json:"signature,omitempty"`
+
+	// ── npm-style deprecation (advisory; the version stays installable) ──
+	// Deprecated is true when either this version OR the whole package is
+	// deprecated (whole-package relocation applies to every version). The CLI
+	// surfaces these as a non-fatal warning + successor hint; it never filters
+	// or blocks on them. DeprecationMessage/MovedTo carry the version-level
+	// values when present, otherwise the package-level ones. See
+	// specs/deprecate-cli.md.
+	Deprecated         bool   `json:"deprecated,omitempty"`
+	DeprecationMessage string `json:"deprecationMessage,omitempty"`
+	MovedTo            string `json:"movedTo,omitempty"`
+}
+
+// Signature is the Ed25519 signature envelope for a registry-signed artifact.
+type Signature struct {
+	KeyID string `json:"keyid"`
+	Alg   string `json:"alg"`
+	Sig   string `json:"sig"`
 }
 
 // VariantInfo describes a Genero-major-version-specific build.
 type VariantInfo struct {
-	GeneroMajor string `json:"generoMajor"`
-	DownloadURL string `json:"downloadUrl"`
-	Checksum    string `json:"checksum"`
+	GeneroMajor string     `json:"generoMajor"`
+	DownloadURL string     `json:"downloadUrl"`
+	Checksum    string     `json:"checksum"`
+	Size        int64      `json:"size,omitempty"`
+	UploadedAt  string     `json:"uploadedAt,omitempty"`
+	Uploader    string     `json:"uploader,omitempty"`
+	Signature   *Signature `json:"signature,omitempty"`
 }
 
 // VersionEntry pairs a version string with its declared Genero compatibility.
@@ -114,6 +157,11 @@ type SearchResult struct {
 	// Source is the logical repository this result came from, set by the
 	// multi-provider search fan-out. Empty for single-registry results.
 	Source string `json:"source,omitempty"`
+	// Deprecated flags an npm-style deprecated package (package-level / latest
+	// version, per the browse listing). MovedTo carries the successor slug when
+	// the deprecation records a relocation.
+	Deprecated bool   `json:"deprecated,omitempty"`
+	MovedTo    string `json:"movedTo,omitempty"`
 }
 
 // RegistryConfig is returned by the publisher registry's /config endpoint.
@@ -195,12 +243,35 @@ func FetchInfoForGenero(name, version, generoMajor string) (*PackageInfo, error)
 		JavaDeps:         v.Dependencies.Java,
 		Variant:          art.Variant,
 		Readme:           v.Readme,
+		Size:             art.SizeBytes,
+		UploadedAt:       art.UploadedAt,
+		Uploader:         art.Uploader,
+		Signature:        art.Signature.toSignature(),
+	}
+	// npm-style deprecation: a version is deprecated if the version-level flag
+	// OR the package-level flag is set (whole-package relocation applies to
+	// every version). Version-level message/successor win; the package-level
+	// values fill in when the version itself carries none.
+	info.Deprecated = v.Deprecated || d.Deprecated
+	if info.Deprecated {
+		info.DeprecationMessage = v.DeprecationMessage
+		if info.DeprecationMessage == "" {
+			info.DeprecationMessage = d.DeprecationMessage
+		}
+		info.MovedTo = v.MovedTo
+		if info.MovedTo == "" {
+			info.MovedTo = d.MovedTo
+		}
 	}
 	for _, a := range v.Artifacts {
 		info.Variants = append(info.Variants, VariantInfo{
 			GeneroMajor: strings.TrimPrefix(a.Variant, "genero"),
 			DownloadURL: AbsoluteDownloadURL(a.DownloadURL),
 			Checksum:    a.SHA256,
+			Size:        a.SizeBytes,
+			UploadedAt:  a.UploadedAt,
+			Uploader:    a.Uploader,
+			Signature:   a.Signature.toSignature(),
 		})
 	}
 	return info, nil
@@ -268,6 +339,8 @@ func Search(term string) ([]SearchResult, error) {
 			LatestVersion: p.LatestVersion,
 			Description:   p.Description,
 			Author:        p.Owner.Name,
+			Deprecated:    p.Deprecated,
+			MovedTo:       p.MovedTo,
 		})
 	}
 	return results, nil
@@ -296,6 +369,44 @@ func PublishCreatePackage(slug, name, description, visibility string) error {
 		return nil
 	}
 	return fmt.Errorf("create package %q: HTTP %d: %s", slug, status, string(respBody))
+}
+
+// PublishUpdateMetadata pushes the package's current discovery metadata
+// (description and/or keywords) to the registry via the owner-only metadata
+// operation on PATCH /registry/packages/:slug (GIS-268 F/G). The publisher
+// calls this on every publish so a description or keyword edited after the slug
+// was first created still reaches the registry — the GI package description
+// used to be write-once, and manifest keywords were never transmitted at all.
+//
+// Only non-empty fields are sent (so a republish never clears registry metadata
+// the manifest simply omits), and they go in a single request — the server
+// treats description+keywords together as one operation ("one operation at a
+// time"). Keywords are sent verbatim; the registry normalizes them
+// (trim/lowercase/dedupe). When nothing is set, it is a no-op.
+//
+// Returns nil on 200. A non-2xx (e.g. an older registry that does not implement
+// the metadata op) is returned as an error; callers treat a metadata-sync
+// failure as non-fatal to the publish, which has already completed.
+func PublishUpdateMetadata(slug, description string, keywords []string) error {
+	payload := map[string]any{}
+	if description != "" {
+		payload["description"] = description
+	}
+	if len(keywords) > 0 {
+		payload["keywords"] = keywords
+	}
+	if len(payload) == 0 {
+		return nil // nothing declared in the manifest to sync
+	}
+	body, _ := json.Marshal(payload)
+	status, respBody, err := publishJSON(http.MethodPatch, registryBase()+"/registry/packages/"+url.PathEscape(slug), body)
+	if err != nil {
+		return fmt.Errorf("update package metadata for %q: %w", slug, err)
+	}
+	if status == http.StatusOK {
+		return nil
+	}
+	return fmt.Errorf("update package metadata for %q: HTTP %d: %s", slug, status, string(respBody))
 }
 
 // PublishCreateVersion adds version under slug. Returns nil on 201; returns
@@ -402,6 +513,73 @@ func PublishSubmit(slug, version string) error {
 	return fmt.Errorf("submit %s@%s: HTTP %d: %s", slug, version, status, string(respBody))
 }
 
+// deprecationBody builds the JSON PATCH body shared by the two deprecate
+// writers. undo takes precedence: an undo request sends only {deprecated:false}
+// (the registry clears the message + successor). Otherwise it sends
+// {deprecated:true, deprecationMessage, movedTo}, omitting movedTo when empty.
+func deprecationBody(message, movedTo string, undo bool) []byte {
+	if undo {
+		b, _ := json.Marshal(map[string]any{"deprecated": false})
+		return b
+	}
+	payload := map[string]any{
+		"deprecated":         true,
+		"deprecationMessage": message,
+	}
+	if movedTo != "" {
+		payload["movedTo"] = movedTo
+	}
+	b, _ := json.Marshal(payload)
+	return b
+}
+
+// deprecateResultError maps a non-2xx status from a deprecate PATCH to a typed
+// error so the CLI can render the actionable message. 200/204 → nil.
+func deprecateResultError(what string, status int, respBody []byte) error {
+	switch {
+	case status >= 200 && status < 300:
+		return nil
+	case status == http.StatusUnauthorized:
+		return fmt.Errorf("%s: %w", what, ErrUnauthorized)
+	case status == http.StatusForbidden:
+		return fmt.Errorf("%s: %w", what, ErrForbidden)
+	case status == http.StatusNotFound:
+		return fmt.Errorf("%s: %w", what, ErrNotFound)
+	case status == http.StatusBadRequest:
+		return fmt.Errorf("%s: %w: %s", what, ErrMessageTooLong, strings.TrimSpace(string(respBody)))
+	default:
+		return fmt.Errorf("%s: HTTP %d: %s", what, status, string(respBody))
+	}
+}
+
+// PublishDeprecateVersion sets or clears npm-style deprecation on one version
+// via PATCH /registry/packages/{slug}/versions/{version} (owner-only). The
+// version stays fully installable and listed; this only attaches (or clears)
+// the advisory message + optional successor. undo=true lifts the deprecation.
+func PublishDeprecateVersion(slug, version, message, movedTo string, undo bool) error {
+	slug = slugutil.Canonical(slug)
+	u := fmt.Sprintf("%s/registry/packages/%s/versions/%s",
+		registryBase(), url.PathEscape(slug), url.PathEscape(version))
+	status, respBody, err := publishJSON(http.MethodPatch, u, deprecationBody(message, movedTo, undo))
+	if err != nil {
+		return fmt.Errorf("deprecate %s@%s: %w", slug, version, err)
+	}
+	return deprecateResultError(fmt.Sprintf("deprecate %s@%s", slug, version), status, respBody)
+}
+
+// PublishDeprecatePackage sets or clears npm-style deprecation on the whole
+// package via PATCH /registry/packages/{slug} (owner-only) — the whole-package
+// relocation case, applied to every version. undo=true lifts it.
+func PublishDeprecatePackage(slug, message, movedTo string, undo bool) error {
+	slug = slugutil.Canonical(slug)
+	u := fmt.Sprintf("%s/registry/packages/%s", registryBase(), url.PathEscape(slug))
+	status, respBody, err := publishJSON(http.MethodPatch, u, deprecationBody(message, movedTo, undo))
+	if err != nil {
+		return fmt.Errorf("deprecate %s: %w", slug, err)
+	}
+	return deprecateResultError(fmt.Sprintf("deprecate %s", slug), status, respBody)
+}
+
 // VariantsFor reports which variants are already published for (slug, version).
 // Returns ErrNotFound wrapped if the package or version doesn't exist yet,
 // which the publish flow treats as "nothing to clobber". On the new protocol
@@ -434,11 +612,32 @@ func VariantsFor(slug, version string) ([]string, error) {
 // ─── Internal: new-protocol types ────────────────────────────────────────────
 
 type apiArtifact struct {
-	Variant     string `json:"variant"`
-	Filename    string `json:"filename"`
-	SizeBytes   int64  `json:"size_bytes"`
-	SHA256      string `json:"sha256"`
-	DownloadURL string `json:"download_url"`
+	Variant     string        `json:"variant"`
+	Filename    string        `json:"filename"`
+	SizeBytes   int64         `json:"size_bytes"`
+	SHA256      string        `json:"sha256"`
+	DownloadURL string        `json:"download_url"`
+	UploadedAt  string        `json:"uploaded_at"`
+	Uploader    string        `json:"uploader"`
+	Signature   *apiSignature `json:"signature"`
+}
+
+// apiSignature is the Layer 1 registry signature envelope returned per
+// artifact. Nil for unsigned rows (pre-signing history, or when the registry
+// has no working key configured).
+type apiSignature struct {
+	KeyID string `json:"keyid"`
+	Alg   string `json:"alg"`
+	Sig   string `json:"sig"`
+}
+
+// toSignature converts the wire signature envelope to the exported type,
+// returning nil for an absent (unsigned) signature.
+func (s *apiSignature) toSignature() *Signature {
+	if s == nil {
+		return nil
+	}
+	return &Signature{KeyID: s.KeyID, Alg: s.Alg, Sig: s.Sig}
 }
 
 type apiVersionSummary struct {
@@ -457,6 +656,10 @@ type apiVersionSummary struct {
 	Dependencies  apiVersionDeps      `json:"dependencies"`
 	Readme        string              `json:"readme"`
 	Userguide     string              `json:"userguide"`
+	// npm-style deprecation, per-version (advisory; version stays installable).
+	Deprecated         bool   `json:"deprecated"`
+	DeprecationMessage string `json:"deprecation_message"`
+	MovedTo            string `json:"moved_to"`
 }
 
 type apiVersionDeps struct {
@@ -479,6 +682,11 @@ type apiListedPackage struct {
 	LatestVersion string              `json:"latest_version"`
 	Downloads     int64               `json:"downloads"`
 	Tags          map[string][]string `json:"tags"`
+	// Package-level npm-style deprecation (whole-package relocation). Applies
+	// to every version of the package.
+	Deprecated         bool   `json:"deprecated"`
+	DeprecationMessage string `json:"deprecation_message"`
+	MovedTo            string `json:"moved_to"`
 }
 
 type apiPackageDetail struct {
@@ -494,6 +702,9 @@ type apiBrowseResponse struct {
 }
 
 func fetchPackageDetail(slug string) (*apiPackageDetail, error) {
+	// Canonicalize the name to its slug so any spelling (fgl_ai_sdk, Fgl.AI.SDK,
+	// fgl-ai-sdk) resolves to the same /registry/packages/<slug> record (GIS-271).
+	slug = slugutil.Canonical(slug)
 	u := fmt.Sprintf("%s/registry/packages/%s", registryBase(), url.PathEscape(slug))
 	data, err := httpGetAuthed(u)
 	if err != nil {

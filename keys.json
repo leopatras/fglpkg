@@ -1,0 +1,17 @@
+{
+  "issuedAt": "2026-07-16T20:05:18Z",
+  "keys": [
+    {
+      "keyid": "fglpkg-release-2026-07-16",
+      "alg": "ed25519",
+      "pub": "xFsG5GbQSNvzjE9HoAcfnluMCU3m823w4gsmZ68R3FU=",
+      "validFrom": "2026-01-01T00:00:00Z",
+      "validTo": "2028-01-01T00:00:00Z"
+    }
+  ],
+  "sig": {
+    "rootKeyid": "fglpkg-release-root-1",
+    "alg": "ed25519",
+    "sig": "FTcCwE9yr2VYUFZTwwjT9TDZ3SkhXndSzOzRxYY/LUfb2HbnroAgQIQ/Lmp7WRiw4NpbVlHRxeGghmylKRd4Aw=="
+  }
+}

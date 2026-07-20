@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/4js-mikefolcher/fglpkg/internal/manifest"
@@ -188,6 +189,69 @@ func TestValidateBinValid(t *testing.T) {
 	}
 	if err := m.Validate(); err != nil {
 		t.Fatalf("unexpected validation error: %v", err)
+	}
+}
+
+func TestValidateRejectsSelfDependency(t *testing.T) {
+	m := &manifest.Manifest{
+		Name:    "acme-lib",
+		Version: "1.0.0",
+		Dependencies: manifest.Dependencies{
+			FGL: map[string]string{"acme-lib": "^1.0.0"},
+		},
+	}
+	if err := m.Validate(); err == nil {
+		t.Fatal("expected error for a package depending on itself")
+	}
+}
+
+func TestValidateRejectsSelfDependencyCanonical(t *testing.T) {
+	// A separator/case variant of the package's own name must not slip past
+	// (GIS-271 canonicalization): "Acme_Lib" and "acme-lib" are one identity.
+	m := &manifest.Manifest{
+		Name:    "acme-lib",
+		Version: "1.0.0",
+		Dependencies: manifest.Dependencies{
+			FGL: map[string]string{"Acme_Lib": "^1.0.0"},
+		},
+	}
+	if err := m.Validate(); err == nil {
+		t.Fatal("expected error for a self-dependency spelled with a name variant")
+	}
+}
+
+func TestValidateRejectsSelfDependencyInDevAndOptional(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		m    *manifest.Manifest
+	}{
+		{"dev", &manifest.Manifest{
+			Name: "acme-lib", Version: "1.0.0",
+			DevDependencies: manifest.Dependencies{FGL: map[string]string{"acme-lib": "^1.0.0"}},
+		}},
+		{"optional", &manifest.Manifest{
+			Name: "acme-lib", Version: "1.0.0",
+			OptionalDependencies: manifest.Dependencies{FGL: map[string]string{"acme-lib": "^1.0.0"}},
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := tc.m.Validate(); err == nil {
+				t.Fatalf("expected error for self-dependency in %s scope", tc.name)
+			}
+		})
+	}
+}
+
+func TestValidateAllowsDependencyOnOtherPackage(t *testing.T) {
+	m := &manifest.Manifest{
+		Name:    "acme-lib",
+		Version: "1.0.0",
+		Dependencies: manifest.Dependencies{
+			FGL: map[string]string{"other-lib": "^1.0.0"},
+		},
+	}
+	if err := m.Validate(); err != nil {
+		t.Fatalf("unexpected validation error for a normal dependency: %v", err)
 	}
 }
 
@@ -733,6 +797,99 @@ func TestValidateForPublishCollectsAllMissing(t *testing.T) {
 	}
 }
 
+// TestValidateForPublishBadName verifies that a name which does not normalize
+// to a valid slug is rejected, while a name that merely needs canonicalization
+// (case, or '_'/'.' separators) is accepted — matching the publish path, which
+// canonicalizes before uploading. Note Canonical only collapses '-_.' runs and
+// lowercases; it does NOT turn spaces into hyphens, so "My Package" is invalid.
+func TestValidateForPublishBadName(t *testing.T) {
+	cases := []struct {
+		name    string
+		pkgName string
+		wantErr bool
+	}{
+		{"case_normalization_ok", "Fgl.AI.SDK", false},
+		{"underscore_normalization_ok", "fgl_ai_sdk", false},
+		{"already_canonical_ok", "my-package", false},
+		{"space_not_normalized", "My Package", true},
+		{"too_short", "a", true},
+		{"non_alphanumeric_only", "!!!", true},
+		{"empty_after_trim_handled_by_validate", " ", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newPublishableManifest()
+			m.Name = tc.pkgName
+			err := m.ValidateForPublish()
+			if tc.wantErr && err == nil {
+				t.Fatalf("expected error for name %q", tc.pkgName)
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("unexpected error for name %q: %v", tc.pkgName, err)
+			}
+			if tc.wantErr && err != nil && !containsHelper(err.Error(), "not a valid package name") {
+				// " " is caught by Validate() as a missing name, not the format
+				// check — so only assert the format message for genuine format
+				// failures.
+				if strings.TrimSpace(tc.pkgName) != "" {
+					t.Errorf("err = %q, want one mentioning an invalid package name", err.Error())
+				}
+			}
+		})
+	}
+}
+
+// TestValidateForPublishRejectsBadVersion verifies strict semver enforcement
+// at publish: present-but-malformed versions are rejected.
+func TestValidateForPublishBadVersion(t *testing.T) {
+	cases := []struct {
+		name    string
+		version string
+		wantErr bool
+	}{
+		{"plain_ok", "1.2.3", false},
+		{"prerelease_ok", "1.2.3-rc.1", false},
+		{"leading_v", "v1.2.3", true},
+		{"leading_zero", "1.02.3", true},
+		{"two_component", "1.2", true},
+		{"not_a_number", "latest", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newPublishableManifest()
+			m.Version = tc.version
+			err := m.ValidateForPublish()
+			if tc.wantErr && err == nil {
+				t.Fatalf("expected error for version %q", tc.version)
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("unexpected error for version %q: %v", tc.version, err)
+			}
+			if tc.wantErr && err != nil && !containsHelper(err.Error(), "not valid semver") {
+				t.Errorf("err = %q, want one mentioning invalid semver", err.Error())
+			}
+		})
+	}
+}
+
+// TestValidateForPublishCollectsFormatAndMissing verifies a missing field and
+// a malformed version surface together in one error, not one-at-a-time.
+func TestValidateForPublishCollectsFormatAndMissing(t *testing.T) {
+	m := newPublishableManifest()
+	m.License = ""
+	m.Version = "not-semver"
+
+	err := m.ValidateForPublish()
+	if err == nil {
+		t.Fatal("expected error when license missing and version malformed")
+	}
+	for _, want := range []string{"license is required", "not valid semver"} {
+		if !containsHelper(err.Error(), want) {
+			t.Errorf("err = %q, want one containing %q", err.Error(), want)
+		}
+	}
+}
+
 // TestValidateForPublishDelegatesToValidate verifies that structural
 // errors (no version) surface through ValidateForPublish, not just the
 // publish-required ones.
@@ -745,5 +902,68 @@ func TestValidateForPublishDelegatesToValidate(t *testing.T) {
 	}
 	if !containsHelper(err.Error(), "version") {
 		t.Errorf("err = %q, want one mentioning version", err.Error())
+	}
+}
+
+// ─── GIS-280: canonical dependency keys + no HTML escaping ───────────────────
+
+// TestAddFGLDependencyDedupesByCanonicalSlug: installing a package whose name
+// canonicalizes to an already-declared dependency must not leave a duplicate
+// entry ("fgl_ai_sdk_2" + "fgl-ai-sdk-2"); the canonical slug wins (choice A).
+func TestAddFGLDependencyDedupesByCanonicalSlug(t *testing.T) {
+	m := manifest.New("consumer", "1.0.0", "", "")
+	m.Dependencies.FGL = map[string]string{"fgl_ai_sdk_2": "1.0.0"} // the user's spelling
+
+	// install resolves the canonical slug and adds it.
+	m.AddFGLDependencyScoped("fgl-ai-sdk-2", "1.0.0", manifest.ScopeProd)
+
+	fgl := m.Dependencies.FGL
+	if len(fgl) != 1 {
+		t.Fatalf("expected exactly one fgl dependency, got %d: %v", len(fgl), fgl)
+	}
+	if _, ok := fgl["fgl-ai-sdk-2"]; !ok {
+		t.Errorf("expected canonical key \"fgl-ai-sdk-2\", got %v", fgl)
+	}
+	if _, ok := fgl["fgl_ai_sdk_2"]; ok {
+		t.Errorf("non-canonical variant \"fgl_ai_sdk_2\" should have been replaced, got %v", fgl)
+	}
+}
+
+// TestRemoveFGLDependencyMatchesCanonicalSlug: a dependency stored under its
+// canonical slug is still removed when the user types a separator variant.
+func TestRemoveFGLDependencyMatchesCanonicalSlug(t *testing.T) {
+	m := manifest.New("consumer", "1.0.0", "", "")
+	m.Dependencies.FGL = map[string]string{"fgl-ai-sdk-2": "1.0.0"}
+
+	if scope := m.RemoveFGLDependency("fgl_ai_sdk_2"); scope != manifest.ScopeProd {
+		t.Fatalf("RemoveFGLDependency(variant) = %q, want %q", scope, manifest.ScopeProd)
+	}
+	if len(m.Dependencies.FGL) != 0 {
+		t.Errorf("dependency not removed: %v", m.Dependencies.FGL)
+	}
+}
+
+// TestSaveDoesNotHTMLEscape: fglpkg.json must keep the literal '>' in a genero
+// constraint. If Go's default HTML-escaping were in effect the '>' would be
+// written as a numeric Unicode escape, so the literal ">=6.0.0" would NOT
+// appear — the positive check alone distinguishes the two (GIS-280).
+func TestSaveDoesNotHTMLEscape(t *testing.T) {
+	dir := t.TempDir()
+	m := manifest.New("consumer", "1.0.0", "", "")
+	m.GeneroConstraint = ">=6.0.0"
+	m.Dependencies.FGL = map[string]string{"dep": ">=1.0.0"}
+	if err := m.Save(dir); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, manifest.Filename))
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	got := string(data)
+	if !containsHelper(got, ">=6.0.0") {
+		t.Errorf("fglpkg.json is HTML-escaping the genero constraint; want literal >=6.0.0:\n%s", got)
+	}
+	if !containsHelper(got, ">=1.0.0") {
+		t.Errorf("fglpkg.json is HTML-escaping the dependency constraint; want literal >=1.0.0:\n%s", got)
 	}
 }

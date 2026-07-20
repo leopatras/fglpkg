@@ -24,15 +24,18 @@ Add one **public** read endpoint and one **admin** write endpoint to the registr
 ([src/gateway/registry-routes.ts](../../../4js-bitbucket/4js-genero-intelligence/src/gateway/registry-routes.ts)):
 
 - `GET /registry/fglpkg/latest` — returns the latest stable fglpkg version, a per-platform GitHub
-  download URL for each of the six release assets, and the URL of the release's `checksums.txt`.
-  Unauthenticated; cacheable.
-- `PUT /registry/fglpkg/latest` — admin-only setter that records the current latest version in a D1
-  config row. This is how the version is bumped when a release is cut — **no redeploy required**.
+  download URL for each of the six release assets, the URL of the release's `checksums.txt` **and its
+  detached Ed25519 signature** (`checksums.txt.sig`), plus an operator-configurable manual-download URL
+  and instructions for the client's recovery path. Unauthenticated; cacheable.
+- `PUT /registry/fglpkg/latest` — admin-only setter that records the current latest version (and the
+  optional recovery URL / instructions) in a D1 config row. This is how the version is bumped when a
+  release is cut — **no redeploy required**.
 
-The service stores **only the version string** (plus optional release notes). Every download URL is
-**derived** from that version via a fixed template, because GitHub Release assets follow a stable
-naming scheme (`fglpkg-<os>-<arch>[.exe]` under `releases/download/v<version>/`). The repo
-coordinates and URL template are Worker configuration, not data.
+The service stores **only the version string** (plus optional release notes and recovery URL/
+instructions). Every download URL — including the binaries, `checksums.txt`, and `checksums.txt.sig` —
+is **derived** from that version via a fixed template, because GitHub Release assets follow a stable
+naming scheme (`fglpkg-<os>-<arch>[.exe]` under `releases/download/v<version>/`). The repo coordinates
+and URL template are Worker configuration, not data; GI never signs or holds keys.
 
 ## Background — grounding facts
 
@@ -84,11 +87,13 @@ is fully determined by `V`. The service never needs to store URLs — only `V`.
 
 ```sql
 CREATE TABLE IF NOT EXISTS fglpkg_release (
-  id          INTEGER PRIMARY KEY CHECK (id = 1),  -- single-row table
-  version     TEXT NOT NULL,                        -- e.g. "3.4.0" (no leading v)
-  notes_url   TEXT,                                 -- optional; defaults to the GH release tag page
-  updated_by  TEXT,                                 -- user id/email of the admin who set it
-  updated_at  TEXT NOT NULL                         -- ISO-8601
+  id           INTEGER PRIMARY KEY CHECK (id = 1),  -- single-row table
+  version      TEXT NOT NULL,                        -- e.g. "3.4.0" (no leading v)
+  notes_url    TEXT,                                 -- optional; defaults to the GH release tag page
+  manual_url   TEXT,                                 -- optional; manual-download URL for the client recovery path (GIS-255 R2)
+  instructions TEXT,                                 -- optional; human-readable recovery steps the client prints verbatim (R2)
+  updated_by   TEXT,                                 -- user id/email of the admin who set it
+  updated_at   TEXT NOT NULL                         -- ISO-8601
 );
 ```
 
@@ -126,6 +131,9 @@ Public, unauthenticated, cacheable.
   "version": "3.4.0",
   "notes": "https://github.com/4js-mikefolcher/fglpkg/releases/tag/v3.4.0",
   "checksumsUrl": "https://github.com/4js-mikefolcher/fglpkg/releases/download/v3.4.0/checksums.txt",
+  "checksumsSigUrl": "https://github.com/4js-mikefolcher/fglpkg/releases/download/v3.4.0/checksums.txt.sig",
+  "manualUrl": "https://github.com/4js-mikefolcher/fglpkg/releases/tag/v3.4.0",
+  "instructions": "Download the binary for your platform, verify its SHA-256, and replace your fglpkg executable.",
   "assets": [
     { "os": "linux",   "arch": "arm64", "url": ".../v3.4.0/fglpkg-linux-arm64" },
     { "os": "linux",   "arch": "amd64", "url": ".../v3.4.0/fglpkg-linux-amd64" },
@@ -142,6 +150,16 @@ Public, unauthenticated, cacheable.
 - `checksumsUrl` points at GitHub's `checksums.txt` for the release — this is what lets the client's
   self-update perform its SHA-256 integrity check ([self-update.md § self-update flow](self-update.md))
   while GI still only "contains URLs".
+- `checksumsSigUrl` points at the detached **Ed25519 signature** over `checksums.txt`
+  (`checksums.txt.sig`, another release asset; its URL is derived like the others). This is the
+  client's *authenticity* gate — it verifies the signature back to its pinned root before trusting the
+  checksums ([self-update.md § Release signing & verification](self-update.md#release-signing--verification)).
+  GI only provides the URL; it neither signs nor holds any key.
+- `manualUrl` + `instructions` are the **operator-configurable recovery path** (GIS-255 R2): where to
+  download by hand and human-readable steps, which the client prints verbatim when an update is blocked
+  or fails. Both come from the config row (`manual_url` / `instructions`); `manualUrl` defaults to the
+  release tag page when unset and `instructions` to a built-in default. Because they are data, the
+  download location can move (e.g. off GitHub) without a client release.
 - `notes` defaults to the release tag page unless `notes_url` overrides it.
 
 **Optional single-asset form** (client convenience, not required by the client spec): if
@@ -168,14 +186,16 @@ Admin-only setter — `registry.put("/fglpkg/latest", requireRole("super_admin",
 **Request body:**
 
 ```json
-{ "version": "3.4.0", "notesUrl": "https://…" }   // notesUrl optional
+{ "version": "3.4.0", "notesUrl": "https://…", "manualUrl": "https://…", "instructions": "…" }
+// notesUrl, manualUrl, instructions all optional
 ```
 
 **Behavior:**
 1. Validate `version` is a plausible semver (`^\d+\.\d+\.\d+(-[\w.]+)?$`). Reject with `400`
    otherwise. Store **without** a leading `v`.
 2. `INSERT … ON CONFLICT(id) DO UPDATE` the single row, stamping `updated_by` (from `c.get("user")`)
-   and `updated_at`.
+   and `updated_at`. `manualUrl` / `instructions` (GIS-255 R2) persist to `manual_url` / `instructions`;
+   an omitted field leaves the stored value unchanged.
 3. Return `200 { "version": "3.4.0", "updatedAt": "…" }`.
 
 The endpoint does **not** verify the GitHub release actually exists — validation that the assets are
@@ -190,8 +210,11 @@ the writer dumb.
 
 - **GI does not host or proxy binaries.** URLs point at GitHub Releases. If the download origin ever
   moves, only `FGLPKG_RELEASE_BASE`/`FGLPKG_RELEASE_REPO` change — no client change.
-- **No checksum storage/serving.** The client fetches GitHub's `checksums.txt` via `checksumsUrl`; GI
-  never computes or stores SHA-256 for fglpkg binaries.
+- **No checksum or signature storage/serving.** The client fetches GitHub's `checksums.txt` (via
+  `checksumsUrl`) and its detached Ed25519 signature (via `checksumsSigUrl`); GI only *derives* those
+  URLs — it never computes/stores SHA-256, never signs, and never holds a signing key. Release-signing
+  keys are managed entirely on the fglpkg release side
+  ([self-update.md § Release signing & verification](self-update.md#release-signing--verification)).
 - **No auto-sync from GitHub.** The version is set explicitly by an admin (chosen over a live GitHub
   poll to avoid a server-side GitHub dependency + rate-limit handling). Auto-sync is a possible
   future enhancement, not part of this spec.
@@ -203,12 +226,16 @@ the writer dumb.
 ## Testing
 
 - **GET, row present:** builds all six asset URLs from the stored version + configured template;
-  `checksumsUrl` and `notes` correct; `os`/`arch` spellings are Go's.
+  `checksumsUrl`, `checksumsSigUrl`, and `notes` correct; `os`/`arch` spellings are Go's.
+- **GET recovery fields:** `manualUrl` / `instructions` reflect the config row when set, and fall back
+  to the defaults (release tag page / built-in text) when the columns are null.
 - **GET, row absent:** `404` with the documented body (the client's safe no-op state).
 - **GET single-asset:** `?os/&arch` returns one asset; unknown pair → `404`.
 - **GET caching header** present.
 - **PUT auth:** non-admin → `403`; unauthenticated → `401`.
 - **PUT validation:** malformed version → `400`; leading `v` stripped; round-trips through GET.
+- **PUT recovery fields:** `manualUrl` / `instructions` persist and round-trip through GET; omitting a
+  field on a later PUT leaves the stored value unchanged.
 - **PUT idempotency:** second PUT updates the same single row (no duplicate rows), refreshes
   `updated_at`/`updated_by`.
 

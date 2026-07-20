@@ -7,8 +7,10 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/4js-mikefolcher/fglpkg/internal/config"
 	"github.com/4js-mikefolcher/fglpkg/internal/lockfile"
 	"github.com/4js-mikefolcher/fglpkg/internal/manifest"
+	"github.com/4js-mikefolcher/fglpkg/internal/provider"
 	"github.com/4js-mikefolcher/fglpkg/internal/registry"
 	"github.com/4js-mikefolcher/fglpkg/internal/semver"
 )
@@ -21,6 +23,10 @@ type outdatedRow struct {
 	Wanted     string `json:"wanted"`
 	Latest     string `json:"latest"`
 	Status     string `json:"status"`
+	// Deprecated/MovedTo flag an installed version the registry marks
+	// npm-style deprecated (advisory). Surfaced as a Notes column + JSON.
+	Deprecated bool   `json:"deprecated,omitempty"`
+	MovedTo    string `json:"movedTo,omitempty"`
 }
 
 // cmdOutdated compares each FGL dependency declared in fglpkg.json
@@ -58,16 +64,27 @@ func cmdOutdated(args []string) error {
 
 	// Current versions come from the lockfile — the deterministic record
 	// of what was last installed. If the lockfile is missing we still
-	// fetch registry data and mark everything as "not installed".
+	// fetch registry data and mark everything as "not installed". The lock
+	// also records each package's source repository, so an Artifactory-sourced
+	// package is checked against its own repo rather than GI (spec §11).
 	projectDir, _ := os.Getwd()
 	current := map[string]string{}
+	sources := map[string]string{}
 	if lockfile.Exists(projectDir) {
 		lf, err := lockfile.Load(projectDir)
 		if err == nil {
 			for _, p := range lf.Packages {
 				current[p.Name] = p.Version
+				sources[p.Name] = p.Registry
 			}
 		}
+	}
+
+	// Multi-provider set (nil in the single-registry case → GI-only client).
+	home, _ := fglpkgHome()
+	rs, _, _, rsErr := buildRepositorySet(home, m)
+	if rsErr != nil {
+		fmt.Fprintf(os.Stderr, "warning: ignoring registries config: %v\n", rsErr)
 	}
 
 	names := make([]string, 0, len(m.Dependencies.FGL))
@@ -80,7 +97,7 @@ func cmdOutdated(args []string) error {
 	outdatedCount := 0
 
 	for _, name := range names {
-		row := buildOutdatedRow(name, m.Dependencies.FGL[name], current[name])
+		row := buildOutdatedRow(rs, name, m.Dependencies.FGL[name], current[name], sources[name])
 		rows = append(rows, row)
 		if row.Status != "ok" {
 			outdatedCount++
@@ -108,8 +125,10 @@ func cmdOutdated(args []string) error {
 }
 
 // buildOutdatedRow fetches the version list for one package and computes
-// its current/wanted/latest/status fields.
-func buildOutdatedRow(name, constraint, currentVer string) outdatedRow {
+// its current/wanted/latest/status fields. When a multi-provider set is
+// configured (rs != nil) the package is checked against its locked source
+// repository (sourceReg; "" ⇒ the built-in GI registry) rather than always GI.
+func buildOutdatedRow(rs *provider.RepositorySet, name, constraint, currentVer, sourceReg string) outdatedRow {
 	row := outdatedRow{
 		Name:       name,
 		Constraint: constraint,
@@ -119,7 +138,7 @@ func buildOutdatedRow(name, constraint, currentVer string) outdatedRow {
 		row.Current = "missing"
 	}
 
-	vl, err := registry.FetchVersionList(name)
+	vl, err := outdatedVersionList(rs, name, sourceReg)
 	if err != nil {
 		row.Status = "registry error"
 		return row
@@ -159,7 +178,41 @@ func buildOutdatedRow(name, constraint, currentVer string) outdatedRow {
 	default:
 		row.Status = "ok"
 	}
+
+	// Flag an installed version the registry marks deprecated. Best-effort and
+	// GI-only: deprecation is a GI-registry concept (an Artifactory-sourced
+	// package has none), and a fetch failure just leaves the row unflagged so
+	// `outdated` never fails because of an advisory lookup.
+	if currentVer != "" && isGISource(sourceReg) {
+		if info, err := registry.FetchInfo(name, currentVer); err == nil && info.Deprecated {
+			row.Deprecated = true
+			row.MovedTo = info.MovedTo
+		}
+	}
 	return row
+}
+
+// isGISource reports whether a locked source repository name refers to the
+// built-in GI registry ("" is the historical default; config.GIName is "gi").
+func isGISource(sourceReg string) bool {
+	return sourceReg == "" || sourceReg == config.GIName
+}
+
+// outdatedVersionList lists a package's versions from its locked source repo
+// when a multi-provider set is configured, else via the GI-only client.
+func outdatedVersionList(rs *provider.RepositorySet, name, sourceReg string) (*registry.VersionList, error) {
+	if rs == nil {
+		return registry.FetchVersionList(name)
+	}
+	cvs, err := rs.VersionsFrom(sourceReg, name)
+	if err != nil {
+		return nil, err
+	}
+	vs := make([]string, 0, len(cvs))
+	for _, cv := range cvs {
+		vs = append(vs, cv.Version.String())
+	}
+	return &registry.VersionList{Versions: vs}, nil
 }
 
 func parseVersionStrings(vs []string) []semver.Version {
@@ -196,10 +249,26 @@ func newestStable(vs []semver.Version) *semver.Version {
 }
 
 func printOutdatedTable(rows []outdatedRow) {
+	// The Notes column only appears when at least one row carries a note (a
+	// deprecated installed version), so the common case is unchanged.
+	showNotes := false
+	for _, r := range rows {
+		if r.Deprecated {
+			showNotes = true
+			break
+		}
+	}
+
 	headers := []string{"Package", "Current", "Wanted", "Latest", "Status"}
+	if showNotes {
+		headers = append(headers, "Notes")
+	}
 	cells := make([][]string, len(rows))
 	for i, r := range rows {
 		cells[i] = []string{r.Name, r.Current, r.Wanted, r.Latest, r.Status}
+		if showNotes {
+			cells[i] = append(cells[i], deprecationNote(r))
+		}
 	}
 	widths := make([]int, len(headers))
 	for i, h := range headers {
@@ -229,6 +298,19 @@ func printOutdatedTable(rows []outdatedRow) {
 	for _, row := range cells {
 		printRow(row)
 	}
+}
+
+// deprecationNote renders the Notes-column text for a row: "" when not
+// deprecated, "deprecated" alone, or "deprecated → <successor>" with a
+// --moved-to target.
+func deprecationNote(r outdatedRow) string {
+	if !r.Deprecated {
+		return ""
+	}
+	if r.MovedTo != "" {
+		return "deprecated → " + r.MovedTo
+	}
+	return "deprecated"
 }
 
 func pluralY(n int) string {

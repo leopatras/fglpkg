@@ -37,9 +37,11 @@ jobs:
         env:
           MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
           MACOS_NOTARY_API_KEY_JSON: ${{ secrets.MACOS_NOTARY_API_KEY_JSON }}
+          FGLPKG_RELEASE_SIGNING_SEED: ${{ secrets.FGLPKG_RELEASE_SIGNING_SEED }}
         run: |
           if [ -n "$MACOS_CERT_P12" ]; then echo "cert=true" >> "$GITHUB_OUTPUT"; else echo "cert=false" >> "$GITHUB_OUTPUT"; fi
           if [ -n "$MACOS_NOTARY_API_KEY_JSON" ]; then echo "notary=true" >> "$GITHUB_OUTPUT"; else echo "notary=false" >> "$GITHUB_OUTPUT"; fi
+          if [ -n "$FGLPKG_RELEASE_SIGNING_SEED" ]; then echo "release_sign=true" >> "$GITHUB_OUTPUT"; else echo "release_sign=false" >> "$GITHUB_OUTPUT"; fi
 
       - name: Install rcodesign
         if: steps.signing.outputs.cert == 'true'
@@ -98,6 +100,45 @@ jobs:
       # changes its hash.
       - name: Generate checksums
         run: cd bin && sha256sum * > checksums.txt
+
+      # ── Release-artifact signing (GIS-255 R1) ──────────────────────────────────
+      # Sign checksums.txt with the offline-rooted working key so `fglpkg
+      # self-update` verifies release AUTHENTICITY (not just the SHA-256 integrity
+      # gate) before replacing the binary. Signing the single checksums.txt
+      # transitively covers every asset, since each binary's hash is listed there.
+      #
+      # Gated on the working-key secret, so a fork without it still produces an
+      # (unsigned) release. keys.json is the root-signed working-key manifest,
+      # produced OFFLINE by scripts/gen-signing-key (the root private key never
+      # touches CI) and committed to the repo; it is published alongside so the
+      # client's pinned root can verify the whole chain fully offline.
+      - name: Sign checksums.txt (Ed25519 release signature)
+        if: steps.signing.outputs.release_sign == 'true'
+        env:
+          FGLPKG_RELEASE_SIGNING_SEED: ${{ secrets.FGLPKG_RELEASE_SIGNING_SEED }}
+        run: |
+          test -f keys.json || {
+            echo "keys.json (root-signed manifest) is missing — generate it offline with"
+            echo "'go run ./scripts/gen-signing-key sign-manifest' and commit it before releasing."
+            exit 1
+          }
+          go run ./scripts/gen-signing-key sign-file \
+            --in bin/checksums.txt \
+            --seed-env FGLPKG_RELEASE_SIGNING_SEED \
+            --out bin/checksums.txt.sig
+          cp keys.json bin/keys.json
+
+      # Gate: verify the signature we just produced against the SAME root pinned
+      # in the client (internal/signing/root.go). Fails the release rather than
+      # publishing a signature the client would reject (e.g. wrong seed, or a
+      # keys.json not signed by the pinned root).
+      - name: Verify release signature against the pinned root
+        if: steps.signing.outputs.release_sign == 'true'
+        run: |
+          go run ./scripts/gen-signing-key verify-release \
+            --manifest bin/keys.json \
+            --checksums bin/checksums.txt \
+            --sig bin/checksums.txt.sig
 
       - name: Create GitHub Release
         run: |

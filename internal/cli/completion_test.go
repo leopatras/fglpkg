@@ -11,9 +11,9 @@ import (
 // the completion registration).
 func TestCompletionShellContents(t *testing.T) {
 	cases := []struct {
-		shell     string
-		produce   func() string
-		mustHave  []string
+		shell    string
+		produce  func() string
+		mustHave []string
 	}{
 		{
 			shell:   "bash",

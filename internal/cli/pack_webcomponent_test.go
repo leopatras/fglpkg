@@ -157,8 +157,8 @@ func TestBuildMixedZipContents(t *testing.T) {
 	wantIncluded := []string{
 		"fglpkg.json",
 		"README.md",
-		"ChartDemo.42m",      // BDL file at zip root
-		"ChartHelper.42m",    // BDL file at zip root
+		"ChartDemo.42m",        // BDL file at zip root
+		"ChartHelper.42m",      // BDL file at zip root
 		"3DChart/3DChart.html", // webcomponent, prefix stripped
 		"3DChart/3DChart.js",
 	}

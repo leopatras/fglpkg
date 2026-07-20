@@ -295,11 +295,16 @@ files. Defaults to `"."`. The file walk that applies the `files` patterns is
 rooted here. Presence marks the manifest as BDL content.
 
 #### `files` — array of string (globs)
-Glob patterns selecting the files to include in the published zip. Patterns are
-matched against each file's **basename** while walking `root`. When omitted, the
-default is `["*.42m", "*.42f", "*.sch"]` (compiled modules, compiled forms, and
-schema files). Entries must be unique. Files can additionally be excluded with a
-`.fglpkgignore` file.
+Glob patterns selecting the files to include in the published zip, applied while
+walking `root`. A pattern **without** a `/` is matched against each file's
+**basename** at any depth (e.g. `*.42m`). A pattern **containing** a `/` is
+**path-scoped** — matched against the file's path **relative to `root`**, where
+`*` stays within one path segment and `**` spans any number of segments (e.g.
+`tests/*.4gl`, `com/**/*.42m`); a leading `/` is accepted and anchors at `root`.
+When omitted, the default is `["*.42m", "*.42f", "*.sch"]` (compiled modules,
+compiled forms, and schema files). Entries must be unique. Files can additionally
+be excluded with a `.fglpkgignore` file — note its patterns are relative to the
+**project root**, whereas `files` path-patterns are relative to `root`.
 
 #### `importRoot` — string
 The directory whose *contents* become the **archive root**. Files packaged from

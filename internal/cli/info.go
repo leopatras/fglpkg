@@ -7,6 +7,9 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/4js-mikefolcher/fglpkg/internal/genero"
+	"github.com/4js-mikefolcher/fglpkg/internal/manifest"
+	"github.com/4js-mikefolcher/fglpkg/internal/provider"
 	"github.com/4js-mikefolcher/fglpkg/internal/registry"
 	"github.com/4js-mikefolcher/fglpkg/internal/semver"
 )
@@ -46,7 +49,21 @@ func cmdInfo(args []string) error {
 		return err
 	}
 
-	versions, err := registry.FetchVersionList(name)
+	// Route through the multi-provider set when secondary repositories are
+	// configured, so an Artifactory-sourced package is queried against its own
+	// repository instead of GI (which would 404). Falls back to the GI-only
+	// client otherwise (byte-identical legacy behaviour).
+	home, _ := fglpkgHome()
+	var m *manifest.Manifest
+	if mm, mErr := manifest.Load("."); mErr == nil {
+		m = mm
+	}
+	rs, _, _, rsErr := buildRepositorySet(home, m)
+	if rsErr != nil {
+		fmt.Fprintf(os.Stderr, "warning: ignoring registries config: %v\n", rsErr)
+	}
+
+	versions, err := infoVersionList(rs, name)
 	if err != nil {
 		return privateHint(err, name)
 	}
@@ -60,7 +77,7 @@ func cmdInfo(args []string) error {
 		resolvedVersion = latestVersion(versions.Versions)
 	}
 
-	info, err := registry.FetchInfo(name, resolvedVersion)
+	info, err := infoFetch(rs, name, resolvedVersion)
 	if err != nil {
 		return err
 	}
@@ -84,6 +101,36 @@ func cmdInfo(args []string) error {
 
 	printInfo(info, versions, resolvedVersion == latestVersion(versions.Versions))
 	return nil
+}
+
+// infoVersionList lists a package's versions, routing through the
+// multi-provider set when one is configured (rs != nil), else the GI client.
+func infoVersionList(rs *provider.RepositorySet, name string) (*registry.VersionList, error) {
+	if rs == nil {
+		return registry.FetchVersionList(name)
+	}
+	cvs, err := rs.Versions(name)
+	if err != nil {
+		return nil, err
+	}
+	vs := make([]string, 0, len(cvs))
+	for _, cv := range cvs {
+		vs = append(vs, cv.Version.String())
+	}
+	return &registry.VersionList{Versions: vs}, nil
+}
+
+// infoFetch returns full metadata for name@version, routing through the
+// multi-provider set when one is configured (rs != nil), else the GI client.
+func infoFetch(rs *provider.RepositorySet, name, version string) (*registry.PackageInfo, error) {
+	if rs == nil {
+		return registry.FetchInfo(name, version)
+	}
+	generoMajor := ""
+	if gv, err := genero.Detect(); err == nil {
+		generoMajor = gv.MajorString()
+	}
+	return rs.Info(name, version, generoMajor)
 }
 
 // latestVersion picks the newest entry from a version list using the
@@ -120,8 +167,24 @@ func printInfo(info *registry.PackageInfo, versions *registry.VersionList, isLat
 	fmt.Println(strings.Repeat("─", len(header)))
 	fmt.Println()
 
+	// npm-style deprecation block — placed right under the header so it's the
+	// first thing seen. Advisory only; the version is still installable.
+	if info.Deprecated {
+		val := "yes"
+		if info.DeprecationMessage != "" {
+			val = "yes — " + info.DeprecationMessage
+		}
+		printField("Deprecated", val)
+		printField("Moved to", info.MovedTo)
+		fmt.Println()
+	}
+
 	printField("Description", info.Description)
 	printField("Author", info.Author)
+	// Source is the owning repository ("gi", "acme-internal"); populated only
+	// when multi-provider routing is active, so single-registry output is
+	// unchanged.
+	printField("Source", info.Source)
 	printField("License", info.License)
 	printField("Genero", info.GeneroConstraint)
 	printField("Published", info.PublishedAt)

@@ -22,9 +22,13 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
+	"github.com/4js-mikefolcher/fglpkg/internal/config"
+	"github.com/4js-mikefolcher/fglpkg/internal/jsonutil"
 	"github.com/4js-mikefolcher/fglpkg/internal/manifest"
+	"github.com/4js-mikefolcher/fglpkg/internal/registry"
 	"github.com/4js-mikefolcher/fglpkg/internal/resolver"
 )
 
@@ -112,6 +116,17 @@ type LockedPackage struct {
 	// package is re-fetched from this repository and can never be silently
 	// re-routed. See specs/artifactory-secondary-repository.md §9.
 	Registry string `json:"registry,omitempty"`
+
+	// ── Layer 1 signing material ──
+	// Size/UploadedAt/Uploader are the remaining inputs (beyond name,
+	// version, variant, and Checksum) needed to reconstruct the canonical
+	// signed payload for offline re-verification. Signature/SignatureKeyID
+	// are the Ed25519 envelope. All empty for unsigned packages.
+	Size           int64  `json:"size,omitempty"`
+	UploadedAt     string `json:"uploadedAt,omitempty"`
+	Uploader       string `json:"uploader,omitempty"`
+	Signature      string `json:"signature,omitempty"` // base64 raw 64-byte Ed25519 signature
+	SignatureKeyID string `json:"signatureKeyid,omitempty"`
 }
 
 // LockedWebcomponent is the fully-pinned record of one webcomponent package.
@@ -144,6 +159,13 @@ type LockedWebcomponent struct {
 	// Registry is the logical repository this package resolved from. Empty
 	// means the default GI registry. See LockedPackage.Registry.
 	Registry string `json:"registry,omitempty"`
+
+	// ── Layer 1 signing material (see LockedPackage) ──
+	Size           int64  `json:"size,omitempty"`
+	UploadedAt     string `json:"uploadedAt,omitempty"`
+	Uploader       string `json:"uploader,omitempty"`
+	Signature      string `json:"signature,omitempty"`
+	SignatureKeyID string `json:"signatureKeyid,omitempty"`
 }
 
 // LockedJAR is the fully-pinned record of one Java JAR.
@@ -187,28 +209,40 @@ func FromPlan(plan *resolver.Plan, root *manifest.Manifest) *LockFile {
 		copy(requiredBy, p.RequiredBy)
 		sort.Strings(requiredBy)
 
+		keyid, sig := sigFields(p.Signature)
+
 		if p.IsWebcomponent() {
 			wcs = append(wcs, LockedWebcomponent{
-				Name:        p.Name,
-				Version:     p.Version.String(),
-				DownloadURL: p.DownloadURL,
-				Checksum:    p.Checksum,
-				RequiredBy:  requiredBy,
-				Scope:       scopeLockString(p.Scope),
-				Registry:    p.Source,
+				Name:           p.Name,
+				Version:        p.Version.String(),
+				DownloadURL:    p.DownloadURL,
+				Checksum:       p.Checksum,
+				RequiredBy:     requiredBy,
+				Scope:          scopeLockString(p.Scope),
+				Registry:       normalizeSource(p.Source),
+				Size:           p.Size,
+				UploadedAt:     p.UploadedAt,
+				Uploader:       p.Uploader,
+				Signature:      sig,
+				SignatureKeyID: keyid,
 			})
 			continue
 		}
 
 		pkgs = append(pkgs, LockedPackage{
-			Name:        p.Name,
-			Version:     p.Version.String(),
-			DownloadURL: p.DownloadURL,
-			Checksum:    p.Checksum,
-			GeneroMajor: plan.GeneroVersion.MajorString(),
-			RequiredBy:  requiredBy,
-			Scope:       scopeLockString(p.Scope),
-			Registry:    p.Source,
+			Name:           p.Name,
+			Version:        p.Version.String(),
+			DownloadURL:    p.DownloadURL,
+			Checksum:       p.Checksum,
+			GeneroMajor:    plan.GeneroVersion.MajorString(),
+			RequiredBy:     requiredBy,
+			Scope:          scopeLockString(p.Scope),
+			Registry:       normalizeSource(p.Source),
+			Size:           p.Size,
+			UploadedAt:     p.UploadedAt,
+			Uploader:       p.Uploader,
+			Signature:      sig,
+			SignatureKeyID: keyid,
 		})
 	}
 	sort.Slice(pkgs, func(i, j int) bool { return pkgs[i].Name < pkgs[j].Name })
@@ -237,6 +271,19 @@ func FromPlan(plan *resolver.Plan, root *manifest.Manifest) *LockFile {
 		JARs:          jars,
 		Webcomponents: wcs,
 	}
+}
+
+// normalizeSource collapses the explicit GI source name to "" so the lock's
+// "empty registry means GI" convention holds regardless of whether GI packages
+// were resolved via the single-registry path (Source left "") or through
+// GeneroProvider in multi-registry mode (Source stamped "gi"). This keeps
+// fglpkg.lock byte-identical — and diffs clean — when a second registry is
+// added or removed. (GIS-249 C2)
+func normalizeSource(source string) string {
+	if source == config.GIName {
+		return ""
+	}
+	return source
 }
 
 // AddManifestJARs appends Java dependencies recovered by the manifest
@@ -277,7 +324,9 @@ func (lf *LockFile) AddManifestJARs(deps []manifest.JavaDependency) bool {
 
 // Save writes the lock file as formatted JSON to dir/fglpkg.lock.
 func (lf *LockFile) Save(dir string) error {
-	data, err := json.MarshalIndent(lf, "", "  ")
+	// jsonutil (no HTML escaping) so a requiredBy entry like "<root>" keeps its
+	// literal angle brackets instead of Unicode escapes (GIS-280).
+	data, err := jsonutil.MarshalIndent(lf, "  ")
 	if err != nil {
 		return fmt.Errorf("cannot serialise lock file: %w", err)
 	}
@@ -306,6 +355,15 @@ func Load(dir string) (*LockFile, error) {
 func Exists(dir string) bool {
 	_, err := os.Stat(filepath.Join(dir, Filename))
 	return err == nil
+}
+
+// Remove deletes dir/fglpkg.lock. A missing file is not an error, so callers
+// may remove unconditionally without racing Exists.
+func Remove(dir string) error {
+	if err := os.Remove(filepath.Join(dir, Filename)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
 }
 
 // ─── Validation ───────────────────────────────────────────────────────────────
@@ -363,8 +421,8 @@ func (e *GeneroMismatchError) Error() string {
 
 // ManifestMismatchError describes a stale lock file (manifest changed).
 type ManifestMismatchError struct {
-	Field    string
-	InLock   string
+	Field      string
+	InLock     string
 	InManifest string
 }
 
@@ -441,6 +499,45 @@ func (lf *LockFile) Validate(root *manifest.Manifest, currentGenero, packagesDir
 	return result
 }
 
+// CheckRegistries reports the first locked package or webcomponent whose
+// recorded Registry is not among configured (the logical names of the
+// currently-configured repositories, which must include the built-in "gi").
+// An empty Registry means the default GI registry and is always valid, so
+// pre-Artifactory locks pass unchanged. This is the spec §9 guarantee that a
+// lock referencing a repository since removed from the config fails clearly
+// instead of installing silently. configured empty ⇒ the check is skipped
+// (the caller could not determine the configured set).
+func (lf *LockFile) CheckRegistries(configured []string) error {
+	if len(configured) == 0 {
+		return nil
+	}
+	known := make(map[string]bool, len(configured))
+	for _, n := range configured {
+		known[n] = true
+	}
+	check := func(name, reg string) error {
+		if reg == "" || known[reg] {
+			return nil
+		}
+		return fmt.Errorf(
+			"locked package %q came from repository %q, which is not configured.\n"+
+				"  Configured repositories: %s\n"+
+				"  Re-add %q to fglpkg.json / ~/.fglpkg/config.json, or run 'fglpkg update' to re-resolve.",
+			name, reg, strings.Join(configured, ", "), reg)
+	}
+	for _, p := range lf.Packages {
+		if err := check(p.Name, p.Registry); err != nil {
+			return err
+		}
+	}
+	for _, w := range lf.Webcomponents {
+		if err := check(w.Name, w.Registry); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // ─── Plan extraction ──────────────────────────────────────────────────────────
 
 // generoMajor extracts the major version from a version string like "4.01.12".
@@ -451,6 +548,15 @@ func generoMajor(v string) string {
 		}
 	}
 	return v
+}
+
+// sigFields extracts the keyid and base64 signature from a resolved
+// signature envelope, returning empty strings when the package is unsigned.
+func sigFields(s *registry.Signature) (keyid, sig string) {
+	if s == nil {
+		return "", ""
+	}
+	return s.KeyID, s.Sig
 }
 
 // scopeLockString converts a manifest.Scope into the string value stored in

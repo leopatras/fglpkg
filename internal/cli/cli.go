@@ -16,10 +16,11 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/4js-mikefolcher/fglpkg/internal/config"
 	"github.com/4js-mikefolcher/fglpkg/internal/credentials"
@@ -32,7 +33,11 @@ import (
 	"github.com/4js-mikefolcher/fglpkg/internal/oauth"
 	"github.com/4js-mikefolcher/fglpkg/internal/provider"
 	"github.com/4js-mikefolcher/fglpkg/internal/registry"
+	"github.com/4js-mikefolcher/fglpkg/internal/selfupdate"
 	"github.com/4js-mikefolcher/fglpkg/internal/semver"
+	"github.com/4js-mikefolcher/fglpkg/internal/signing"
+	slugutil "github.com/4js-mikefolcher/fglpkg/internal/slug"
+	"github.com/4js-mikefolcher/fglpkg/internal/updatecheck"
 	"github.com/4js-mikefolcher/fglpkg/internal/workspace"
 )
 
@@ -77,14 +82,12 @@ func privateHint(err error, pkg string) error {
 	return fmt.Errorf("%w\n  hint: if %q is a private package, run: fglpkg login", err, pkg)
 }
 
-// validSlugRe is the regular expression that determines whether a package.
-// slug is valid. Currently, a package slug is valid if it is between
-// 2 and 64 characters and only consists of lowercase letters, digits, or hyphens
-var validSlugRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}[a-z0-9]$`)
-
-// isValidPackageSlug returns whether a package slug is valid. it uses validSlugRe to verify
+// isValidPackageSlug reports whether a string is a well-formed canonical
+// package slug (2-64 chars; lowercase letters, digits, hyphens; start/end
+// alphanumeric). It delegates to internal/slug, the single source of truth for
+// the slug rule (GIS-271).
 func isValidPackageSlug(slug string) bool {
-	return validSlugRe.MatchString(slug)
+	return slugutil.IsValid(slug)
 }
 
 // Execute is the main CLI entry point.
@@ -119,59 +122,150 @@ func Execute() error {
 		return nil
 	}
 
-	switch cmd {
-	case "init":
-		return cmdInit(args)
-	case "install":
-		return cmdInstall(args)
-	case "remove":
-		return cmdRemove(args)
-	case "update":
-		return cmdUpdate(args)
-	case "list":
-		return cmdList(args)
-	case "env":
-		return cmdEnv(args)
-	case "search":
-		return cmdSearch(args)
-	case "info", "view":
-		return cmdInfo(args)
-	case "outdated":
-		return cmdOutdated(args)
-	case "audit":
-		return cmdAudit(args)
-	case "sbom":
-		return cmdSbom(args)
-	case "completion":
-		return cmdCompletion(args)
-	case "publish":
-		return cmdPublish(args)
-	case "pack":
-		return cmdPack(args)
-	case "login":
-		return cmdLogin(args)
-	case "logout":
-		return cmdLogout(args)
-	case "whoami":
-		return cmdWhoami(args)
-	case "workspace", "ws":
-		return cmdWorkspace(args)
-	case "registry":
-		return cmdRegistry(args)
-	case "run":
-		return cmdRun(args)
-	case "bdl":
-		return cmdBdl(args)
-	case "docs":
-		return cmdDocs(args)
-	case "version":
-		return cmdVersion(args)
-	case "help", "--help", "-h":
-		printUsage()
+	// Passive update-check (GIS-255): kicked off in the background now; any
+	// notice prints after the command finishes. Never blocks, never changes the
+	// exit code, stays silent on error.
+	pending := startUpdateCheck(cmd)
+	err := func() error {
+		switch cmd {
+		case "init":
+			return cmdInit(args)
+		case "install":
+			return cmdInstall(args)
+		case "remove":
+			return cmdRemove(args)
+		case "update":
+			return cmdUpdate(args)
+		case "list":
+			return cmdList(args)
+		case "env":
+			return cmdEnv(args)
+		case "search":
+			return cmdSearch(args)
+		case "info", "view":
+			return cmdInfo(args)
+		case "outdated":
+			return cmdOutdated(args)
+		case "audit":
+			return cmdAudit(args)
+		case "sbom":
+			return cmdSbom(args)
+		case "completion":
+			return cmdCompletion(args)
+		case "publish":
+			return cmdPublish(args)
+		case "deprecate":
+			return cmdDeprecate(args)
+		case "pack":
+			return cmdPack(args)
+		case "login":
+			return cmdLogin(args)
+		case "logout":
+			return cmdLogout(args)
+		case "whoami":
+			return cmdWhoami(args)
+		case "workspace", "ws":
+			return cmdWorkspace(args)
+		case "registry":
+			return cmdRegistry(args)
+		case "run":
+			return cmdRun(args)
+		case "bdl":
+			return cmdBdl(args)
+		case "docs":
+			return cmdDocs(args)
+		case "version":
+			return cmdVersion(args)
+		case "self-update", "upgrade":
+			return cmdSelfUpdate(args)
+		case "help", "--help", "-h":
+			printUsage()
+			return nil
+		default:
+			return fmt.Errorf("unknown command: %q\nRun 'fglpkg help' for usage", cmd)
+		}
+	}()
+	pending.Finish(os.Stderr, semverNewer)
+	return err
+}
+
+// startUpdateCheck starts the passive "a new version is available" check for
+// this invocation (GIS-255). It returns nil when the check should not run; a
+// nil *Pending is safe to Finish.
+func startUpdateCheck(cmd string) *updatecheck.Pending {
+	home, err := fglpkgHome()
+	if err != nil {
 		return nil
-	default:
-		return fmt.Errorf("unknown command: %q\nRun 'fglpkg help' for usage", cmd)
 	}
+	settings, _ := config.LoadUpdateSettings(home) // usable defaults even on error
+	state := updatecheck.LoadState(home)
+	env := updatecheck.Env{
+		Version:     Version,
+		Command:     cmd,
+		CI:          os.Getenv("CI") != "",
+		NoCheckEnv:  os.Getenv("FGLPKG_NO_UPDATE_CHECK") != "",
+		StdoutIsTTY: isTerminal(os.Stdout),
+		Enabled:     settings.Enabled,
+		Interval:    settings.Interval,
+		Now:         time.Now(),
+		LastCheck:   state.LastCheck,
+	}
+	return updatecheck.Start(home, env, state.LatestKnown, fetchLatestVersion)
+}
+
+// fetchLatestVersion returns the latest published fglpkg version from the
+// registry — the network call behind the passive check.
+func fetchLatestVersion() (string, error) {
+	lr, err := registry.FetchLatestFGLPkg()
+	if err != nil {
+		return "", err
+	}
+	return lr.Version, nil
+}
+
+// semverNewer reports whether latest is a newer release than current.
+// Unparseable versions (e.g. a "dev" build) are treated as not newer.
+func semverNewer(current, latest string) bool {
+	c, err1 := semver.Parse(current)
+	l, err2 := semver.Parse(latest)
+	if err1 != nil || err2 != nil {
+		return false
+	}
+	return l.GreaterThan(c)
+}
+
+// isTerminal reports whether f is a character device (an interactive terminal),
+// used to keep the update notice out of piped or scripted output.
+func isTerminal(f *os.File) bool {
+	fi, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	return fi.Mode()&os.ModeCharDevice != 0
+}
+
+// cmdSelfUpdate downloads and installs the latest release (GIS-255), verifying
+// the Ed25519 release signature and SHA-256 before atomically replacing the
+// running binary. See internal/selfupdate.
+func cmdSelfUpdate(args []string) error {
+	opts := selfupdate.Options{Current: Version, Stdout: os.Stdout}
+	for _, a := range args {
+		switch a {
+		case "--check":
+			opts.Check = true
+		case "--yes", "-y":
+			opts.Yes = true
+		case "--force":
+			opts.Force = true
+		default:
+			return fmt.Errorf("unknown flag %q\nUsage: fglpkg self-update [--check] [--yes] [--force]", a)
+		}
+	}
+	opts.Confirm = func(prompt string) bool { return promptYesNo(prompt, true) }
+	if home, err := fglpkgHome(); err == nil {
+		opts.HomeForCache = home
+	}
+	return selfupdate.Run(opts)
 }
 
 // ─── init ─────────────────────────────────────────────────────────────────────
@@ -240,6 +334,12 @@ func cmdInstall(args []string) error {
 	if err != nil {
 		return err
 	}
+	// On `install`, --registry pins the named package's source repository, so a
+	// package argument is required. (`update --registry` restricts re-resolution
+	// to one repo and needs no package — see cmdUpdate.)
+	if flags.registry != "" && len(flags.pkgs) == 0 {
+		return fmt.Errorf("--registry requires a package to install (it pins that package's source repository)")
+	}
 
 	// `fglpkg install <pkg>` in a directory that isn't yet a project (no
 	// .fglpkg/, no fglpkg.json) is treated as local: the add-package branch
@@ -258,6 +358,10 @@ func cmdInstall(args []string) error {
 	// The authoritative load happens later per install path.
 	regManifest, _ := manifest.Load(".")
 	inst := newInstaller(home, regManifest)
+	if flags.noVerifySignature {
+		globalHome, _ := fglpkgHome()
+		inst.WithSigning(signing.EnforceOff, globalHome, defaultRegistry())
+	}
 	projectDir, _ := os.Getwd()
 
 	if isLocal {
@@ -317,7 +421,7 @@ func cmdInstall(args []string) error {
 	if err != nil {
 		globalHome = home
 	}
-	rs, _, rsErr := buildRepositorySet(globalHome, m)
+	rs, _, _, rsErr := buildRepositorySet(globalHome, m)
 	if rsErr != nil {
 		fmt.Fprintf(os.Stderr, "warning: ignoring registries config: %v\n", rsErr)
 	}
@@ -358,6 +462,13 @@ func cmdInstall(args []string) error {
 		// empty key into fglpkg.json.
 		if info.Name == "" {
 			info.Name = name
+		}
+		// A package can never depend on itself — the resolver dedups to one
+		// version per name, so this would only pull a registry snapshot of this
+		// project into its own tree. Reject early with a clear message; the
+		// manifest validator enforces the same rule at load/publish time.
+		if m.Name != "" && slugutil.Canonical(info.Name) == slugutil.Canonical(m.Name) {
+			return fmt.Errorf("cannot add %q: a package cannot depend on itself", info.Name)
 		}
 		m.AddFGLDependencyPinned(info.Name, info.Version, flags.registry, flags.scope)
 		fmt.Printf("✓ Added %s@%s to %s [%s]\n", info.Name, info.Version, manifest.Filename, scopeLabel)
@@ -498,6 +609,7 @@ type installFlags struct {
 	force              bool
 	production         bool
 	noManifestFallback bool
+	noVerifySignature  bool
 	scope              manifest.Scope
 	registry           string // --registry <name>: restrict resolution to one repo and pin it
 	pkgs               []string
@@ -525,6 +637,8 @@ func parseInstallFlags(args []string) (installFlags, error) {
 			f.production = true
 		case "--no-manifest-fallback":
 			f.noManifestFallback = true
+		case "--no-verify-signature":
+			f.noVerifySignature = true
 		case "--save-dev", "-D":
 			devSeen = true
 			f.scope = manifest.ScopeDev
@@ -548,9 +662,6 @@ func parseInstallFlags(args []string) (installFlags, error) {
 	}
 	if f.production && (devSeen || optSeen) {
 		return f, fmt.Errorf("--production cannot be combined with --save-dev or --save-optional")
-	}
-	if f.registry != "" && len(f.pkgs) == 0 {
-		return f, fmt.Errorf("--registry requires a package to install (it pins that package's source repository)")
 	}
 	return f, nil
 }
@@ -632,7 +743,20 @@ func cmdUpdate(args []string) error {
 	projectDir, _ := os.Getwd()
 	fmt.Println("Ignoring lock file and re-resolving all dependencies...")
 	instOpts := installer.Options{Production: flags.production, NoManifestFallback: flags.noManifestFallback}
-	return newInstaller(home, m).InstallAllWithOptions(m, projectDir, true, instOpts)
+	inst, rs := buildInstaller(home, m)
+
+	// --registry <name> restricts this re-resolution to a single repository
+	// (spec §11). It needs no package argument (unlike `install --registry`).
+	if flags.registry != "" {
+		if rs == nil {
+			if flags.registry != config.GIName {
+				return fmt.Errorf("--registry %q: no repository named %q is configured (add it to fglpkg.json or ~/.fglpkg/config.json)", flags.registry, flags.registry)
+			}
+		} else {
+			rs.Restrict(flags.registry)
+		}
+	}
+	return inst.InstallAllWithOptions(m, projectDir, true, instOpts)
 }
 
 // ─── list ─────────────────────────────────────────────────────────────────────
@@ -720,6 +844,22 @@ func cmdEnv(args []string) error {
 
 // ─── search ───────────────────────────────────────────────────────────────────
 
+// searchDeprecatedStatus returns the value for a search row's STATUS column: ""
+// for a live package (leaving the column blank), "deprecated" when there is no
+// successor, or "deprecated -> <slug>" when the deprecation records a
+// relocation. The status rides in its own column next to the package identity
+// rather than being appended to the publisher-authored description, so it stays
+// scannable and can't be mistaken for the description text.
+func searchDeprecatedStatus(deprecated bool, movedTo string) string {
+	if !deprecated {
+		return ""
+	}
+	if movedTo != "" {
+		return "deprecated -> " + movedTo
+	}
+	return "deprecated"
+}
+
 func cmdSearch(args []string) error {
 	term, all, err := parseSearchArgs(args)
 	if err != nil {
@@ -732,7 +872,7 @@ func cmdSearch(args []string) error {
 	if mm, mErr := manifest.Load("."); mErr == nil {
 		m = mm
 	}
-	if rs, _, rErr := buildRepositorySet(home, m); rErr == nil && rs != nil {
+	if rs, _, _, rErr := buildRepositorySet(home, m); rErr == nil && rs != nil {
 		return searchAcrossProviders(rs, term, all)
 	}
 
@@ -760,10 +900,29 @@ func cmdSearch(args []string) error {
 	} else {
 		fmt.Printf("Results for %q:\n", term)
 	}
-	fmt.Printf("  %-30s %-12s %s\n", "NAME", "VERSION", "DESCRIPTION")
-	fmt.Printf("  %-30s %-12s %s\n", "----", "-------", "-----------")
+	// Only show the STATUS column when at least one match is deprecated;
+	// otherwise the common all-live listing keeps its original layout with no
+	// blank column wasting width.
+	showStatus := false
 	for _, r := range results {
-		fmt.Printf("  %-30s %-12s %s\n", r.Name, r.LatestVersion, r.Description)
+		if r.Deprecated {
+			showStatus = true
+			break
+		}
+	}
+	if showStatus {
+		fmt.Printf("  %-30s %-12s %-24s %s\n", "NAME", "VERSION", "STATUS", "DESCRIPTION")
+		fmt.Printf("  %-30s %-12s %-24s %s\n", "----", "-------", "------", "-----------")
+		for _, r := range results {
+			fmt.Printf("  %-30s %-12s %-24s %s\n", r.Name, r.LatestVersion,
+				searchDeprecatedStatus(r.Deprecated, r.MovedTo), r.Description)
+		}
+	} else {
+		fmt.Printf("  %-30s %-12s %s\n", "NAME", "VERSION", "DESCRIPTION")
+		fmt.Printf("  %-30s %-12s %s\n", "----", "-------", "-----------")
+		for _, r := range results {
+			fmt.Printf("  %-30s %-12s %s\n", r.Name, r.LatestVersion, r.Description)
+		}
 	}
 	return nil
 }
@@ -771,19 +930,43 @@ func cmdSearch(args []string) error {
 // searchAcrossProviders fans out a search to every configured provider, tags
 // each result with its source repository, and prints a source-tagged table.
 func searchAcrossProviders(rs *provider.RepositorySet, term string, all bool) error {
-	var results []registry.SearchResult
+	// Gather in provider priority order so the first-seen version/description
+	// for a colliding name comes from the highest-priority repository.
+	type merged struct {
+		name        string
+		version     string
+		description string
+		deprecated  bool     // package-level deprecation, from the highest-priority source
+		movedTo     string   // successor slug when the deprecation is a relocation
+		sources     []string // every repo the name appears in, priority order
+	}
+	var order []string
+	byName := map[string]*merged{}
 	for _, p := range rs.Providers() {
 		rr, err := p.Search(term)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "warning: search in %q failed: %v\n", p.Name(), err)
 			continue
 		}
-		for i := range rr {
-			rr[i].Source = p.Name()
+		for _, r := range rr {
+			if m, ok := byName[r.Name]; ok {
+				// A name in more than one repo: record the extra source but keep
+				// the higher-priority repo's version/description.
+				m.sources = append(m.sources, p.Name())
+				continue
+			}
+			byName[r.Name] = &merged{
+				name:        r.Name,
+				version:     r.LatestVersion,
+				description: r.Description,
+				deprecated:  r.Deprecated,
+				movedTo:     r.MovedTo,
+				sources:     []string{p.Name()},
+			}
+			order = append(order, r.Name)
 		}
-		results = append(results, rr...)
 	}
-	if len(results) == 0 {
+	if len(order) == 0 {
 		if all {
 			fmt.Println("No packages in any configured repository.")
 		} else {
@@ -792,14 +975,43 @@ func searchAcrossProviders(rs *provider.RepositorySet, term string, all bool) er
 		return nil
 	}
 	if all {
-		fmt.Printf("All packages (%d):\n", len(results))
+		fmt.Printf("All packages (%d):\n", len(order))
 	} else {
 		fmt.Printf("Results for %q:\n", term)
 	}
-	fmt.Printf("  %-28s %-12s %-14s %s\n", "NAME", "VERSION", "SOURCE", "DESCRIPTION")
-	fmt.Printf("  %-28s %-12s %-14s %s\n", "----", "-------", "------", "-----------")
-	for _, r := range results {
-		fmt.Printf("  %-28s %-12s %-14s %s\n", r.Name, r.LatestVersion, r.Source, r.Description)
+	// Only show the STATUS column when at least one match is deprecated;
+	// otherwise keep the original source-tagged layout with no blank column.
+	showStatus := false
+	for _, name := range order {
+		if byName[name].deprecated {
+			showStatus = true
+			break
+		}
+	}
+	if showStatus {
+		fmt.Printf("  %-28s %-12s %-24s %-24s %s\n", "NAME", "VERSION", "STATUS", "SOURCE", "DESCRIPTION")
+		fmt.Printf("  %-28s %-12s %-24s %-24s %s\n", "----", "-------", "------", "------", "-----------")
+	} else {
+		fmt.Printf("  %-28s %-12s %-24s %s\n", "NAME", "VERSION", "SOURCE", "DESCRIPTION")
+		fmt.Printf("  %-28s %-12s %-24s %s\n", "----", "-------", "------", "-----------")
+	}
+	collisions := 0
+	for _, name := range order {
+		m := byName[name]
+		source := strings.Join(m.sources, ", ")
+		if len(m.sources) > 1 {
+			collisions++
+		}
+		if showStatus {
+			fmt.Printf("  %-28s %-12s %-24s %-24s %s\n", m.name, m.version,
+				searchDeprecatedStatus(m.deprecated, m.movedTo), source, m.description)
+		} else {
+			fmt.Printf("  %-28s %-12s %-24s %s\n", m.name, m.version, source, m.description)
+		}
+	}
+	if collisions > 0 {
+		fmt.Printf("\nnote: %d package name(s) are available from more than one repository (shown with all sources).\n"+
+			"  Pin the source in fglpkg.json to install a colliding name.\n", collisions)
 	}
 	return nil
 }
@@ -1336,8 +1548,17 @@ func publishPackage(m *manifest.Manifest, registryURL, generoMajor string, dryRu
 	fmt.Printf("  Package zip: %d bytes (SHA256: %s)\n", len(zipData), checksum)
 
 	variant := artifactVariant(m, generoMajor)
-	filename := artifactFilename(m.Name, m.Version, variant)
-	slug := m.Name
+	// The slug is the canonical (PyPI/PEP 503) form of the name — lowercased,
+	// with runs of '-'/'_'/'.' collapsed to '-' — and is the package's identity
+	// in every /registry/... path. The manifest name is kept as the display
+	// name. Validity is already enforced upstream by ValidateForPublish (which
+	// runs for every publish path, GI and Artifactory alike), so here we only
+	// need the canonical form for the URL (GIS-271).
+	slug := slugutil.Canonical(m.Name)
+	if slug != m.Name {
+		fmt.Printf("  Normalized name %q → slug %q\n", m.Name, slug)
+	}
+	filename := artifactFilename(slug, m.Version, variant)
 	visibility := visibilityOverride
 	if visibility == "" {
 		visibility = m.Visibility
@@ -1414,6 +1635,11 @@ func publishPackage(m *manifest.Manifest, registryURL, generoMajor string, dryRu
 		fmt.Printf("            body: <%d bytes zip>\n", len(zipData))
 		fmt.Printf("  [dry-run] would POST   %s/registry/packages/%s/versions/%s/submit\n",
 			registryURL, slug, m.Version)
+		if m.Description != "" || len(m.Keywords) > 0 {
+			fmt.Printf("  [dry-run] would PATCH  %s/registry/packages/%s   (sync search metadata)\n",
+				registryURL, slug)
+			fmt.Printf("            body: {description:%q, keywords:%v}\n", m.Description, m.Keywords)
+		}
 		return nil
 	}
 
@@ -1442,7 +1668,22 @@ func publishPackage(m *manifest.Manifest, registryURL, generoMajor string, dryRu
 
 	// 5. Submit for review.
 	fmt.Println("  → POST   /registry/packages/" + slug + "/versions/" + m.Version + "/submit")
-	return registry.PublishSubmit(slug, m.Version)
+	if err := registry.PublishSubmit(slug, m.Version); err != nil {
+		return err
+	}
+
+	// 6. Sync package discovery metadata (description + keywords) so edits made
+	//    after the slug was first created still reach the registry and feed
+	//    `fglpkg search` (GIS-268 F/G). Best-effort: the version is already
+	//    published, so an older registry without the metadata op — or any
+	//    transient failure — warns rather than failing the publish.
+	if m.Description != "" || len(m.Keywords) > 0 {
+		fmt.Println("  → PATCH  /registry/packages/" + slug + "   (description, keywords)")
+		if err := registry.PublishUpdateMetadata(slug, m.Description, m.Keywords); err != nil {
+			fmt.Printf("    ⚠ could not sync search metadata (description/keywords): %v\n", err)
+		}
+	}
+	return nil
 }
 
 // dryRunScalar renders an optional scalar metadata field for the dry-run
@@ -1577,6 +1818,35 @@ func stagePackage(stageDir string, m *manifest.Manifest) error {
 	return nil
 }
 
+// filesPatternMatch reports whether a manifest `files` pattern matches a source
+// file during the pack staging walk.
+//
+//   - A pattern WITHOUT "/" (e.g. "*.42m") matches the file's BASENAME at any
+//     depth under root — the historical behaviour, preserved byte-for-byte.
+//   - A pattern CONTAINING "/" (e.g. "tests/*.4gl", "com/**/*.42m") is
+//     path-scoped: it matches the file's path RELATIVE TO root, with "**"
+//     spanning directory levels and "*" confined to a single path segment. A
+//     leading "/" is accepted and anchors at root (same as no leading slash).
+//
+// A basename never contains "/", so every "/"-pattern matched nothing under the
+// old basename-only rule; giving them path semantics therefore assigns
+// behaviour only to previously dead patterns and cannot change any manifest
+// that works today (GIS-275). Note the reference point: `files` path-patterns
+// are relative to root (the BDL source base), whereas .fglpkgignore patterns
+// are relative to the project root — see docs/user-guide.md.
+func filesPatternMatch(pattern, base, relToRoot string, relToRootErr error) bool {
+	slashPattern := filepath.ToSlash(pattern)
+	if !strings.Contains(slashPattern, "/") {
+		matched, _ := filepath.Match(pattern, base)
+		return matched
+	}
+	if relToRootErr != nil {
+		return false
+	}
+	anchored := strings.TrimPrefix(slashPattern, "/")
+	return matchGlob(anchored, filepath.ToSlash(relToRoot))
+}
+
 // stageBDLFiles walks the BDL source tree (m.Root, default "."), applying the
 // manifest's `files` patterns (defaulting to *.42m/*.42f/*.sch) and declared
 // `bin` scripts, and stages each match at its path rebased under importRoot.
@@ -1602,9 +1872,11 @@ func stageBDLFiles(stageDir string, m *manifest.Manifest, ignore *ignoreSet, sta
 			return nil
 		}
 		base := filepath.Base(path)
+		// relToRoot drives path-scoped `files` patterns (those containing "/");
+		// bare patterns still match on the basename alone (GIS-275).
+		relToRoot, relToRootErr := filepath.Rel(root, path)
 		for _, pattern := range patterns {
-			matched, _ := filepath.Match(pattern, base)
-			if !matched {
+			if !filesPatternMatch(pattern, base, relToRoot, relToRootErr) {
 				continue
 			}
 			relPath, relErr := filepath.Rel(".", path)
@@ -2367,10 +2639,289 @@ func parseOwnerRepo(s string) (owner, repo string, err error) {
 // ─── registry ───────────────────────────────────────────────────────────────
 
 func cmdRegistry(args []string) error {
-	if len(args) == 0 || args[0] == "list" {
+	if len(args) == 0 {
 		return cmdRegistryList()
 	}
-	return fmt.Errorf("unknown registry subcommand %q\nusage: fglpkg registry list", args[0])
+	switch args[0] {
+	case "list":
+		return cmdRegistryList()
+	case "add":
+		return cmdRegistryAdd(args[1:])
+	case "remove", "rm":
+		return cmdRegistryRemove(args[1:])
+	default:
+		return fmt.Errorf("unknown registry subcommand %q\nusage: fglpkg registry <list|add|remove>", args[0])
+	}
+}
+
+// registryEditFlags carries the parsed flags for `registry add`.
+type registryEditFlags struct {
+	name     string
+	url      string
+	typ      string
+	repoKey  string
+	auth     string
+	priority *int // nil = unset (auto-assign); an explicit value (incl. 0) is validated
+	packages []string
+	project  bool // write to the project fglpkg.json instead of the global config
+}
+
+const registryAddUsage = "usage: fglpkg registry add <name> <url> " +
+	"[--type genero|artifactory] [--repo-key K] [--auth bearer|basic|apikey|anonymous] " +
+	"[--priority N] [--packages 'acme-*,foo-*'] [--project]"
+
+func parseRegistryAddFlags(args []string) (registryEditFlags, error) {
+	f := registryEditFlags{typ: config.TypeArtifactory}
+	var positional []string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "--project":
+			f.project = true
+		case a == "--type" || strings.HasPrefix(a, "--type="):
+			v, err := flagValue(a, &i, args)
+			if err != nil {
+				return f, err
+			}
+			f.typ = v
+		case a == "--repo-key" || strings.HasPrefix(a, "--repo-key="):
+			v, err := flagValue(a, &i, args)
+			if err != nil {
+				return f, err
+			}
+			f.repoKey = v
+		case a == "--auth" || strings.HasPrefix(a, "--auth="):
+			v, err := flagValue(a, &i, args)
+			if err != nil {
+				return f, err
+			}
+			f.auth = v
+		case a == "--priority" || strings.HasPrefix(a, "--priority="):
+			v, err := flagValue(a, &i, args)
+			if err != nil {
+				return f, err
+			}
+			n, err := strconv.Atoi(v)
+			if err != nil {
+				return f, fmt.Errorf("--priority must be an integer, got %q", v)
+			}
+			f.priority = &n
+		case a == "--packages" || strings.HasPrefix(a, "--packages="):
+			v, err := flagValue(a, &i, args)
+			if err != nil {
+				return f, err
+			}
+			for _, p := range strings.Split(v, ",") {
+				if p = strings.TrimSpace(p); p != "" {
+					f.packages = append(f.packages, p)
+				}
+			}
+		case strings.HasPrefix(a, "-"):
+			return f, fmt.Errorf("unknown flag %q\n%s", a, registryAddUsage)
+		default:
+			positional = append(positional, a)
+		}
+	}
+	if len(positional) != 2 {
+		return f, fmt.Errorf("registry add needs exactly <name> and <url>\n%s", registryAddUsage)
+	}
+	f.name, f.url = positional[0], positional[1]
+	return f, nil
+}
+
+// flagValue resolves either "--flag value" (advancing i) or "--flag=value".
+func flagValue(a string, i *int, args []string) (string, error) {
+	if v, ok := strings.CutPrefix(a, "--"); ok {
+		if eq := strings.IndexByte(v, '='); eq >= 0 {
+			return v[eq+1:], nil
+		}
+	}
+	*i++
+	if *i >= len(args) {
+		return "", fmt.Errorf("%s requires a value", a)
+	}
+	return args[*i], nil
+}
+
+func cmdRegistryAdd(args []string) error {
+	f, err := parseRegistryAddFlags(args)
+	if err != nil {
+		return err
+	}
+	if f.name == config.GIName {
+		return fmt.Errorf("%q is the built-in registry and cannot be redefined", config.GIName)
+	}
+
+	home, err := fglpkgHome()
+	if err != nil {
+		return err
+	}
+	env := os.Getenv("FGLPKG_REGISTRY")
+
+	// Current effective set: reject a duplicate name and auto-assign a priority
+	// when none was given (max existing + 1) so the common case needs no --priority.
+	current, err := config.Load(home, env, projectRegistries())
+	if err != nil {
+		return err
+	}
+	if _, dup := config.Find(current, f.name); dup {
+		return fmt.Errorf("a registry named %q already exists; run 'fglpkg registry remove %s' first", f.name, f.name)
+	}
+	// A nil priority means the flag was omitted → auto-assign max+1 so the common
+	// case needs no --priority. An explicit value (including 0) is left as-is and
+	// validated by config.Resolve, which rejects any priority < 1. (GIS-249)
+	if f.priority == nil {
+		max := 0
+		for _, r := range current {
+			if r.Priority > max {
+				max = r.Priority
+			}
+		}
+		p := max + 1
+		f.priority = &p
+	}
+
+	r := config.Registry{
+		Name:     f.name,
+		Type:     f.typ,
+		URL:      f.url,
+		RepoKey:  f.repoKey,
+		Priority: *f.priority,
+		Auth:     f.auth,
+		Packages: f.packages,
+	}
+
+	// Validate against the prospective effective set (type/auth/repoKey and
+	// priority-uniqueness) before writing anything.
+	if f.project {
+		m, err := manifest.Load(".")
+		if err != nil {
+			return fmt.Errorf("registry add --project requires an fglpkg.json in the current directory: %w", err)
+		}
+		proj := append(append([]config.Registry(nil), m.Registries...), r)
+		global, err := config.LoadGlobal(home)
+		if err != nil {
+			return err
+		}
+		if _, err := config.Resolve(config.BuiltinGI(env), global, proj); err != nil {
+			return err
+		}
+		m.Registries = proj
+		if err := m.Save("."); err != nil {
+			return err
+		}
+		fmt.Printf("✓ Added registry %q to %s\n", f.name, manifest.Filename)
+		return nil
+	}
+
+	g, err := config.LoadGlobalFile(home)
+	if err != nil {
+		return err
+	}
+	global := append(append([]config.Registry(nil), g.Registries...), r)
+	if _, err := config.Resolve(config.BuiltinGI(env), global, projectRegistries()); err != nil {
+		return err
+	}
+	g.Registries = global
+	if err := config.WriteGlobalFile(home, g); err != nil {
+		return err
+	}
+	fmt.Printf("✓ Added registry %q to %s\n", f.name, filepath.Join(home, config.GlobalFilename))
+	if r.Auth != config.AuthAnonymous {
+		fmt.Printf("  Run 'fglpkg login --registry %s' to store credentials.\n", f.name)
+	}
+	return nil
+}
+
+func cmdRegistryRemove(args []string) error {
+	var name string
+	project := false
+	for _, a := range args {
+		switch {
+		case a == "--project":
+			project = true
+		case strings.HasPrefix(a, "-"):
+			return fmt.Errorf("unknown flag %q\nusage: fglpkg registry remove <name> [--project]", a)
+		case name == "":
+			name = a
+		default:
+			return fmt.Errorf("registry remove takes a single <name>")
+		}
+	}
+	if name == "" {
+		return fmt.Errorf("usage: fglpkg registry remove <name> [--project]")
+	}
+	if name == config.GIName {
+		return fmt.Errorf("the built-in %q registry cannot be removed", config.GIName)
+	}
+
+	if project {
+		m, err := manifest.Load(".")
+		if err != nil {
+			return fmt.Errorf("registry remove --project requires an fglpkg.json in the current directory: %w", err)
+		}
+		kept, removed := dropRegistry(m.Registries, name)
+		if !removed {
+			return fmt.Errorf("no registry named %q in %s", name, manifest.Filename)
+		}
+		m.Registries = kept
+		// Clear a now-dangling default, mirroring the global branch below: a bare
+		// `publish` resolving the removed name would otherwise fail. (GIS-249 C3)
+		if m.DefaultRegistry == name {
+			m.DefaultRegistry = ""
+		}
+		if err := m.Save("."); err != nil {
+			return err
+		}
+		fmt.Printf("✓ Removed registry %q from %s\n", name, manifest.Filename)
+		return nil
+	}
+
+	home, err := fglpkgHome()
+	if err != nil {
+		return err
+	}
+	g, err := config.LoadGlobalFile(home)
+	if err != nil {
+		return err
+	}
+	kept, removed := dropRegistry(g.Registries, name)
+	if !removed {
+		return fmt.Errorf("no registry named %q in %s (use --project to remove one declared in fglpkg.json)",
+			name, config.GlobalFilename)
+	}
+	g.Registries = kept
+	if g.DefaultRegistry == name {
+		g.DefaultRegistry = ""
+	}
+	if err := config.WriteGlobalFile(home, g); err != nil {
+		return err
+	}
+	fmt.Printf("✓ Removed registry %q from %s\n", name, filepath.Join(home, config.GlobalFilename))
+	return nil
+}
+
+// dropRegistry returns regs without the named entry and whether it was present.
+func dropRegistry(regs []config.Registry, name string) ([]config.Registry, bool) {
+	kept := make([]config.Registry, 0, len(regs))
+	removed := false
+	for _, r := range regs {
+		if r.Name == name {
+			removed = true
+			continue
+		}
+		kept = append(kept, r)
+	}
+	return kept, removed
+}
+
+// projectRegistries returns the current project's declared registries, or nil
+// when there is no manifest in the working directory.
+func projectRegistries() []config.Registry {
+	if m, err := manifest.Load("."); err == nil {
+		return m.Registries
+	}
+	return nil
 }
 
 func cmdRegistryList() error {
@@ -2783,16 +3334,20 @@ func cmdDocs(args []string) error {
 // findInstalledPackage looks for a package by name, checking local then global.
 // Returns the package directory, its manifest, and an error.
 func findInstalledPackage(name string) (string, *manifest.Manifest, error) {
+	// Packages are installed under their canonical slug (GIS-271), so accept any
+	// spelling the user types — under_score_test, Under-Score-Test — and look up
+	// the canonical directory the resolver/installer actually wrote.
+	slug := slugutil.Canonical(name)
 	if isProjectDir() {
 		wd, _ := os.Getwd()
-		localDir := filepath.Join(wd, ".fglpkg", "packages", name)
+		localDir := filepath.Join(wd, ".fglpkg", "packages", slug)
 		if m, err := manifest.Load(localDir); err == nil {
 			return localDir, m, nil
 		}
 	}
 	globalHome, err := fglpkgHome()
 	if err == nil {
-		globalDir := filepath.Join(globalHome, "packages", name)
+		globalDir := filepath.Join(globalHome, "packages", slug)
 		if m, err := manifest.Load(globalDir); err == nil {
 			return globalDir, m, nil
 		}
@@ -3000,6 +3555,15 @@ func fglpkgHome() (string, error) {
 }
 
 func newInstaller(home string, m *manifest.Manifest) *installer.Installer {
+	inst, _ := buildInstaller(home, m)
+	return inst
+}
+
+// buildInstaller is newInstaller's core, additionally returning the
+// RepositorySet backing the installer's fetchers (nil in the single-registry
+// case). Callers that need to constrain resolution — e.g. `update --registry`
+// — use the returned set to call Restrict before installing.
+func buildInstaller(home string, m *manifest.Manifest) (*installer.Installer, *provider.RepositorySet) {
 	// Always look up credentials from the global home directory, even when
 	// installing to a local project directory (--local).
 	globalHome, err := fglpkgHome()
@@ -3009,23 +3573,35 @@ func newInstaller(home string, m *manifest.Manifest) *installer.Installer {
 	registryURL := defaultRegistry()
 	githubToken := credentials.GitHubTokenFor(globalHome, registryURL)
 	registryToken, _ := credentials.ActiveBearer(context.Background(), globalHome, registryURL, oauth.Refresh)
-	inst := installer.New(home, githubToken, registryToken)
+	inst := installer.New(home, githubToken, registryToken, registryURL)
 
 	// Engage multi-provider routing only when repositories beyond the built-in
 	// GI registry are configured — otherwise the single-registry path stays
 	// byte-identical (no Source stamped in the lockfile).
-	if rs, repoAuth, err := buildRepositorySet(globalHome, m); err != nil {
+	var set *provider.RepositorySet
+	if rs, repoAuth, regNames, err := buildRepositorySet(globalHome, m); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: ignoring registries config: %v\n", err)
-	} else if rs != nil {
-		inst = inst.WithFetchers(rs.Versions, rs.Info).WithRepoAuth(repoAuth).WithPinDeclarer(rs)
+	} else {
+		// Record the configured names in every case (even single-registry) so a
+		// lock referencing a since-removed repository is rejected (§9).
+		inst = inst.WithConfiguredRegistries(regNames)
+		if rs != nil {
+			set = rs
+			inst = inst.WithFetchers(rs.Versions, rs.Info).WithRepoAuth(repoAuth).WithPinDeclarer(rs)
+		}
 	}
-	return inst
+
+	// Layer 1 signature verification. The keys manifest is cached in the
+	// global home even for a local install. Mode comes from FGLPKG_SIGNING /
+	// config.json / the built-in default (warn).
+	inst.WithSigning(signing.EnforceMode(globalHome), globalHome, registryURL)
+	return inst, set
 }
 
 // buildRepositorySet resolves the configured registries and, when more than the
 // built-in GI registry is present, builds a RepositorySet plus the per-repo
 // download auth. Returns (nil, nil, nil) for the single-registry case.
-func buildRepositorySet(globalHome string, m *manifest.Manifest) (*provider.RepositorySet, []installer.RepoAuth, error) {
+func buildRepositorySet(globalHome string, m *manifest.Manifest) (*provider.RepositorySet, []installer.RepoAuth, []string, error) {
 	var projRegs []config.Registry
 	var pins map[string]string
 	if m != nil {
@@ -3034,10 +3610,14 @@ func buildRepositorySet(globalHome string, m *manifest.Manifest) (*provider.Repo
 	}
 	regs, err := config.Load(globalHome, os.Getenv("FGLPKG_REGISTRY"), projRegs)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
+	}
+	regNames := make([]string, 0, len(regs))
+	for _, r := range regs {
+		regNames = append(regNames, r.Name)
 	}
 	if len(regs) <= 1 {
-		return nil, nil, nil // only the built-in gi — keep legacy behaviour
+		return nil, nil, regNames, nil // only the built-in gi — keep legacy behaviour
 	}
 
 	creds, _ := credentials.Load(globalHome)
@@ -3060,7 +3640,7 @@ func buildRepositorySet(globalHome string, m *manifest.Manifest) (*provider.Repo
 			provs = append(provs, provider.NewGeneroProvider(r.Name))
 		}
 	}
-	return provider.NewRepositorySet(provs, regs, pins), repoAuth, nil
+	return provider.NewRepositorySet(provs, regs, pins), repoAuth, regNames, nil
 }
 
 // headersApplier turns a fixed header map into a provider.AuthApplier (nil when
@@ -3081,7 +3661,7 @@ func collectFGLPins(m *manifest.Manifest) map[string]string {
 	pins := map[string]string{}
 	for _, d := range []manifest.Dependencies{m.Dependencies, m.DevDependencies, m.OptionalDependencies} {
 		for name, reg := range d.FGLPins {
-			pins[name] = reg
+			pins[slugutil.Canonical(name)] = reg
 		}
 	}
 	return pins
@@ -3206,25 +3786,28 @@ func promptWithDefault(label, def string) string {
 	return val
 }
 
-// promptPackageSlug prompts for the package name and re-prompts until the
-// entry is a valid registry slug (2-64 chars: lowercase letters, digits,
-// hyphens), catching invalid names at init instead of at publish time where
-// the registry would reject the slug. The current directory name is offered
-// as the default, but only when it is itself a valid slug — otherwise the
-// default is cleared so the user must type a valid name rather than accept an
-// invalid suggestion by pressing enter.
+// promptPackageSlug prompts for the package name and re-prompts until the entry
+// normalizes to a valid registry slug — after lowercasing and collapsing runs
+// of '.'/'_'/'-' (PEP 503; see internal/slug) it must be 2-64 chars of letters,
+// digits, and hyphens. Catching this at init avoids a late rejection at publish.
+// The current directory name is offered as the default, but only when it
+// normalizes to a valid slug. The name is kept verbatim as the display name;
+// its canonical slug is echoed when the two differ.
 func promptPackageSlug() string {
 	const slugPrompt = "Package name"
 
-	defaultSlug := filepathBase()
-	if !isValidPackageSlug(defaultSlug) {
-		defaultSlug = ""
+	defaultName := filepathBase()
+	if !isValidPackageSlug(slugutil.Canonical(defaultName)) {
+		defaultName = ""
 	}
 
-	name := promptWithDefault(slugPrompt, defaultSlug)
-	for !isValidPackageSlug(name) {
-		fmt.Printf("error: Invalid package name \"%s\" - must be 2-64 chars: lowercase letters, digits, hyphens\n", name)
-		name = promptWithDefault(slugPrompt, defaultSlug)
+	name := promptWithDefault(slugPrompt, defaultName)
+	for !isValidPackageSlug(slugutil.Canonical(name)) {
+		fmt.Printf("error: %q does not normalize to a valid package slug — after lowercasing and collapsing '.'/'_'/'-' it must be 2-64 chars of letters, digits, and hyphens\n", name)
+		name = promptWithDefault(slugPrompt, defaultName)
+	}
+	if s := slugutil.Canonical(name); s != name {
+		fmt.Printf("  → will publish under slug %q\n", s)
 	}
 	return name
 }

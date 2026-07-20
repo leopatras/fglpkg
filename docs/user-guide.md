@@ -6,6 +6,7 @@ This guide covers the day-to-day usage of fglpkg, the package manager for Genero
 
 - [Getting Started](#getting-started)
 - [Installing fglpkg](#installing-fglpkg)
+- [Keeping fglpkg Up to Date](#keeping-fglpkg-up-to-date)
 - [Setting Up Your Environment](#setting-up-your-environment)
 - [Creating a New Project](#creating-a-new-project)
 - [Managing Dependencies](#managing-dependencies)
@@ -76,6 +77,63 @@ cd fglpkg
 go build -o fglpkg ./cmd/fglpkg
 sudo cp fglpkg /usr/local/bin/
 ```
+
+## Keeping fglpkg Up to Date
+
+fglpkg can update itself, so you don't have to re-download and re-copy the binary by hand.
+
+```bash
+fglpkg self-update            # download, verify, and install the latest release
+fglpkg self-update --check    # report whether a newer version exists, then exit
+fglpkg self-update --yes      # skip the confirmation prompt (for scripts)
+fglpkg self-update --force    # reinstall even if already on the latest version
+```
+
+**What it does.** `self-update` asks the registry for the latest stable release, downloads the
+build for your OS and architecture, and — before installing anything — verifies:
+
+1. an **Ed25519 release signature** chained to a root key pinned inside your fglpkg binary
+   (authenticity — the release really came from the fglpkg maintainers), and
+2. the **SHA-256 checksum** of the download (integrity — it arrived intact).
+
+Only then does it atomically replace the running executable. If either check fails it aborts
+without touching your installed binary and prints a manual-download link with instructions.
+
+Scope is deliberately narrow — **latest stable only**: no version pinning, no pre-release
+channel, and no downgrade. The only manual recovery path is the download link shown on failure.
+
+**When it won't run.** Self-update refuses on a `dev` build (one you built from source) and on an
+install that looks managed by a package manager such as Homebrew — update those the way you
+installed them.
+
+### Update notices
+
+fglpkg also tells you, passively, when a newer version is out. At most once every 24 hours,
+after a command finishes, it prints a short notice to standard error:
+
+```
+─────────────────────────────────────────────
+ A new fglpkg is available: 3.8.0 → 3.9.0
+ Run 'fglpkg self-update' to upgrade.
+─────────────────────────────────────────────
+```
+
+The check runs in the background and never blocks your command, changes its exit code, or
+reports network errors. It is automatically silent for `dev` builds, in CI, and when output is
+piped or redirected (not an interactive terminal).
+
+To turn it off, set `FGLPKG_NO_UPDATE_CHECK=1`, or configure it in `~/.fglpkg/config.json`:
+
+```json
+{
+  "updateCheck": false,
+  "updateCheckInterval": "24h"
+}
+```
+
+`updateCheckInterval` is a Go duration string (e.g. `"12h"`, `"48h"`); the default is `24h`.
+fglpkg records the last check time and last seen version in `~/.fglpkg/update-check.json`, a
+file it manages automatically — separate from your hand-edited `config.json` settings.
 
 ## Setting Up Your Environment
 
@@ -389,6 +447,15 @@ By default, fglpkg collects files matching `*.42m`, `*.42f`, and `*.sch`. To cus
   "files": ["*.42m", "*.42f", "*.sch", "*.str"]
 }
 ```
+
+Patterns come in two forms:
+
+- **No slash** (e.g. `*.42m`) — matched against each file's **basename**, at any depth under `root`. This is the common case.
+- **Contains a slash** (e.g. `tests/*.4gl`, `com/**/*.42m`) — **path-scoped**, matched against the file's path **relative to `root`**. `*` matches within a single directory segment; `**` spans any number of segments. A leading `/` is allowed and means the same thing (anchored at `root`).
+
+So with `"root": "com/fourjs/ai/fgl_ai_sdk"`, a `"files": ["*.42m", "tests/*.4gl"]` ships every compiled module plus only the `.4gl` sources under `tests/` — the library `.4gl` at the package root is left out, with no `.fglpkgignore` needed.
+
+> **Note:** `files` path-patterns are relative to `root` (your BDL source base). This differs from [`.fglpkgignore`](#excluding-files-with-fglpkgignore), whose patterns are relative to the **project root**. Keep that in mind when the same file needs to line up across both.
 
 ### Excluding Files with `.fglpkgignore`
 
@@ -1054,6 +1121,21 @@ Descriptor fields:
 | `priority` | Yes | Lower is tried first; must be unique. Ordering only — not a precedence tiebreak |
 | `auth` | No | `bearer` (default) \| `basic` \| `apikey` \| `anonymous` |
 | `packages` | No | Glob allow-list (e.g. `["acme-*"]`); names outside it are never queried against this repo |
+
+Instead of hand-editing JSON, let `fglpkg` manage these entries — it validates
+the result before writing and auto-assigns the priority after `gi` when you omit
+`--priority`:
+
+```bash
+fglpkg registry add acme https://artifactory.acme.example/artifactory \
+    --repo-key fgl-internal-generic --packages "acme-*"   # writes ~/.fglpkg/config.json
+fglpkg registry add acme https://… --repo-key K --project # writes the project fglpkg.json
+fglpkg registry remove acme
+```
+
+`add` defaults `--type` to `artifactory`; pass `--type genero`, `--auth`, or
+`--priority` as needed. It refuses to redefine the built-in `gi` or collide on
+name or priority.
 
 Check the effective configuration and login status any time:
 

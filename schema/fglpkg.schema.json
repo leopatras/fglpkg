@@ -17,8 +17,8 @@
     },
     "name": {
       "type": "string",
-      "description": "Package name. Must be unique within a registry; conventionally lowercase with no spaces.",
-      "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_-]*$",
+      "description": "Package name. Its canonical slug — lowercase, with runs of '.', '_' and '-' collapsed to a single '-' (PyPI/PEP 503) — is the registry identity; this name is kept as the display name. Must canonicalize to a slug unique within the registry.",
+      "pattern": "^[a-zA-Z0-9]([a-zA-Z0-9._-]*[a-zA-Z0-9])?$",
       "minLength": 1,
       "maxLength": 128
     },

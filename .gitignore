@@ -28,6 +28,11 @@ go.work.sum
 .env
 .mcp.json
 
+# Signing private keys — offline root / working keys emitted by
+# scripts/gen-signing-key. NEVER commit these. (keys.json, the root-signed
+# public manifest, is a safe release asset and is intentionally not ignored.)
+*.key.json
+
 # Editor/IDE
 # .idea/
 # .vscode/

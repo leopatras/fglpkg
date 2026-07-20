@@ -21,12 +21,14 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 
 	"github.com/4js-mikefolcher/fglpkg/internal/genero"
 	"github.com/4js-mikefolcher/fglpkg/internal/manifest"
 	"github.com/4js-mikefolcher/fglpkg/internal/registry"
 	"github.com/4js-mikefolcher/fglpkg/internal/semver"
+	"github.com/4js-mikefolcher/fglpkg/internal/slug"
 	"github.com/4js-mikefolcher/fglpkg/internal/workspace"
 )
 
@@ -55,6 +57,22 @@ type ResolvedPackage struct {
 	// PackageInfo.Source; empty means the default GI registry. Recorded in
 	// the lockfile as the anti-dependency-confusion pin.
 	Source string
+
+	// ── Layer 1 signing material (parallel to Checksum) ──
+	// Carried from the registry record so the installer can reconstruct the
+	// canonical signed payload and verify the registry signature.
+	Size       int64
+	UploadedAt string
+	Uploader   string
+	Signature  *registry.Signature
+
+	// ── npm-style deprecation (advisory) ──
+	// Carried from the registry record so the install path can warn the
+	// consumer that a resolved dependency is deprecated (and point at its
+	// successor) without ever blocking the install. See specs/deprecate-cli.md.
+	Deprecated         bool
+	DeprecationMessage string
+	MovedTo            string
 }
 
 // IsWebcomponent reports whether this resolved entry is a webcomponent
@@ -557,7 +575,13 @@ func (s *state) skipOptional(name, reason string) {
 	fmt.Fprintf(os.Stderr, "warning: skipping optional dependency %s: %s\n", name, reason)
 }
 
-func (s *state) enqueue(item workItem)         { s.queue = append(s.queue, item) }
+func (s *state) enqueue(item workItem) {
+	// Canonicalize the dependency name (GIS-271) so every spelling of a package
+	// collapses to one identity for fetch, dedup, conflict detection, and the
+	// resulting plan / lockfile.
+	item.name = slug.Canonical(item.name)
+	s.queue = append(s.queue, item)
+}
 func (s *state) dequeue() workItem             { item := s.queue[0]; s.queue = s.queue[1:]; return item }
 func (s *state) hasWork() bool                 { return len(s.queue) > 0 }
 func (s *state) isResolved(n string) bool      { _, ok := s.resolved[n]; return ok }
@@ -666,23 +690,42 @@ func (s *state) buildPlan() *Plan {
 			RequiredBy:  requiredBy,
 			Scope:       entry.scope,
 			Source:      entry.info.Source,
+			Size:        entry.info.Size,
+			UploadedAt:  entry.info.UploadedAt,
+			Uploader:    entry.info.Uploader,
+			Signature:   entry.info.Signature,
+
+			Deprecated:         entry.info.Deprecated,
+			DeprecationMessage: entry.info.DeprecationMessage,
+			MovedTo:            entry.info.MovedTo,
 		})
 	}
-	for i := 1; i < len(pkgs); i++ {
-		for j := i; j > 0 && s.resolved[pkgs[j].Name].order < s.resolved[pkgs[j-1].Name].order; j-- {
-			pkgs[j], pkgs[j-1] = pkgs[j-1], pkgs[j]
-		}
-	}
+	// Restore discovery order. Each resolved entry carries a unique,
+	// monotonically increasing order stamp (see markResolved), so this defines a
+	// total order and a non-stable sort is sufficient and fully deterministic —
+	// the output plan is identical regardless of the map's randomized iteration
+	// order. This is O(N log N); the former hand-written insertion sort was
+	// O(N²) on that randomized input and dominated resolution on large graphs
+	// (GIS-258).
+	sort.Slice(pkgs, func(i, j int) bool {
+		return s.resolved[pkgs[i].Name].order < s.resolved[pkgs[j].Name].order
+	})
 
 	jars := make([]manifest.JavaDependency, 0, len(s.jars))
 	for _, dep := range s.jars {
 		jars = append(jars, dep)
 	}
+	// s.jars / s.localMembers are maps, so their iteration order is randomized.
+	// Sort both into a stable order (JARs by Maven key, local members by name)
+	// so the plan — and the lockfile written from it — does not churn run to
+	// run (GIS-258 secondary finding).
+	sort.Slice(jars, func(i, j int) bool { return jars[i].Key() < jars[j].Key() })
 
 	locals := make([]LocalMember, 0, len(s.localMembers))
 	for _, lm := range s.localMembers {
 		locals = append(locals, lm)
 	}
+	sort.Slice(locals, func(i, j int) bool { return locals[i].Name < locals[j].Name })
 
 	scopes := make(map[string]manifest.Scope, len(s.jarScopes))
 	for k, v := range s.jarScopes {

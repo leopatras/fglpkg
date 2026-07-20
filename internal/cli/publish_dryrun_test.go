@@ -135,8 +135,8 @@ func TestPublishPackageDryRunListsMetadata(t *testing.T) {
 		"genero:       ^6.0.0",
 		"dependencies: 1 fgl, 1 java",
 		"readme:       11 B", // "# Meta Test" is 11 bytes, shown in bytes not KB
-		"userguide:",           // size line present
-		"(truncated)",          // oversized USERGUIDE flagged
+		"userguide:",         // size line present
+		"(truncated)",        // oversized USERGUIDE flagged
 	}
 	for _, want := range wantSubstrings {
 		if !strings.Contains(out, want) {
@@ -233,6 +233,55 @@ func TestPublishPackageDryRunChangelogMissingSection(t *testing.T) {
 	}
 	if !strings.Contains(out, "no entry for 2.0.0") {
 		t.Errorf("expected missing-section warning\n---output---\n%s", out)
+	}
+}
+
+// TestPublishPackageDryRunSyncsMetadata verifies the dry-run preview shows the
+// GIS-268 F/G metadata-sync PATCH with the manifest's description and keywords.
+func TestPublishPackageDryRunSyncsMetadata(t *testing.T) {
+	dir := t.TempDir()
+	write := func(rel, content string) {
+		if err := os.WriteFile(filepath.Join(dir, rel), []byte(content), 0644); err != nil {
+			t.Fatalf("write %s: %v", rel, err)
+		}
+	}
+	write("fglpkg.json", `{
+  "name": "meta-sync",
+  "version": "1.0.0",
+  "description": "a searchable blurb",
+  "author": "me",
+  "license": "MIT",
+  "keywords": ["alpha", "beta"],
+  "dependencies": { "fgl": {} }
+}`)
+	write("Main.42m", "MAIN\nEND MAIN\n")
+
+	origDir, _ := os.Getwd()
+	t.Cleanup(func() { _ = os.Chdir(origDir) })
+	if err := os.Chdir(dir); err != nil {
+		t.Fatalf("chdir: %v", err)
+	}
+	m, err := manifest.Load(".")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	out, runErr := captureDryRun(t, func() error {
+		return publishPackage(m, "http://127.0.0.1:1", "6", true, "", "")
+	})
+	if runErr != nil {
+		t.Fatalf("dry-run publishPackage returned error: %v", runErr)
+	}
+	for _, want := range []string{
+		"would PATCH",
+		"/registry/packages/meta-sync",
+		"a searchable blurb",
+		"alpha",
+		"beta",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("dry-run output missing %q\n---output---\n%s", want, out)
+		}
 	}
 }
 

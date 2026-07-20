@@ -213,7 +213,7 @@ func (ws *Workspace) ExternalDeps() *manifest.Manifest {
 			// If the same external dep appears in multiple members, keep the
 			// most restrictive (first-seen) constraint. A conflict will surface
 			// during resolution, which is the correct behaviour.
-			if _, exists := merged.Dependencies.FGL[name]; !exists {
+			if _, sc := merged.FindFGLDependency(name); sc == "" {
 				merged.AddFGLDependency(name, constraint)
 			}
 		}

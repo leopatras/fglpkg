@@ -148,7 +148,7 @@ func writePkgManifest(t *testing.T, packagesDir, name, body string) {
 
 func TestCollectDeclared(t *testing.T) {
 	home := t.TempDir()
-	inst := New(home, "", "")
+	inst := New(home, "", "", "")
 	if err := inst.ensureDirs(); err != nil {
 		t.Fatal(err)
 	}
@@ -312,7 +312,7 @@ func poiapiRegressionFixture(t *testing.T) (*Installer, string, *lockfile.LockFi
 	})
 
 	home := t.TempDir()
-	inst := New(home, "", "")
+	inst := New(home, "", "", "")
 
 	projectDir := t.TempDir()
 	lf := &lockfile.LockFile{

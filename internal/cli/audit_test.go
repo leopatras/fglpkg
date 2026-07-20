@@ -40,12 +40,12 @@ type osvStubResponse struct {
 }
 
 type osvStubVuln struct {
-	ID               string                   `json:"id"`
-	Summary          string                   `json:"summary"`
-	Details          string                   `json:"details,omitempty"`
-	Aliases          []string                 `json:"aliases,omitempty"`
-	References       []map[string]string      `json:"references,omitempty"`
-	DatabaseSpecific osvStubDatabaseSpecific  `json:"database_specific,omitempty"`
+	ID               string                  `json:"id"`
+	Summary          string                  `json:"summary"`
+	Details          string                  `json:"details,omitempty"`
+	Aliases          []string                `json:"aliases,omitempty"`
+	References       []map[string]string     `json:"references,omitempty"`
+	DatabaseSpecific osvStubDatabaseSpecific `json:"database_specific,omitempty"`
 }
 
 type osvStubDatabaseSpecific struct {

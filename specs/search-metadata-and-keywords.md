@@ -1,6 +1,10 @@
 # Spec: Complete `fglpkg search` metadata — descriptions in every result + keyword search
 
-**Status:** 📋 Not started — GIS-268 (spec ready)
+**Status:** ✅ Done — GIS-268 (closed 2026-07-17). All three fixes shipped: **(E)** Artifactory
+`Search` sidecar enrichment (PR #12/#13); **(F)/(G)** the GI service side — updatable package
+description + keyword storage and `q` matching — on `package-management`, plus the fglpkg client
+push of the manifest's current `description` + `keywords` on every publish
+(`registry.PublishUpdateMetadata`, PR #22, merged to `main`).
 **Date:** 2026-07-15
 **Author:** Mike Folcher
 **Motivation:** Two defects surfaced while testing `fglpkg search` after the Artifactory merge
