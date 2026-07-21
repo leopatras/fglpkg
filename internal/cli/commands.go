@@ -79,7 +79,7 @@ Without --local/--global, the target is auto-detected: local when a
 	},
 	{
 		Name:    "remove",
-		Summary: "Remove a package",
+		Summary: "Remove an installed package (from fglpkg install)",
 		Args:    "<pkg>",
 		Usage:   "fglpkg remove <package>... [--local|--global]",
 		Long: `FLAGS:
