@@ -1,17 +1,23 @@
 @echo off
 REM fglpkg-genero.bat: self-compiling launcher for the published "fglpkg"
 REM source package (the Genero 4GL reimplementation of the fglpkg tool).
-REM See fglpkg-genero (the Unix sh launcher) for the full rationale:
-REM compiling in place on every invocation would let .42m files from one
-REM Genero version linger and clash with another, so instead this syncs
-REM sources into a per-Genero-version cache dir under %TEMP% and lets
-REM `fglcomp --make` (only recompiles a source whose .42m is missing or
-REM older than it) skip the real work once that version's cache is warm.
+REM See fglpkg-genero (the Unix sh launcher) for the full rationale and the
+REM -o/--make no-copy design: compiles straight from the installed package's
+REM own source directory (%FGLPKGDIR%) into a per-Genero-version cache dir
+REM under %TEMP%, via fglcomp's --output-dir (-o) combined with --make --
+REM no copy step needed at all. fglcomp reads sources from %FGLPKGDIR%
+REM directly and only writes/checks .42m under the cache dir, so
+REM --make's staleness check always sees the real, live install directory,
+REM including after the installed package itself gets updated.
+REM
+REM fglcomp treats PACKAGE fglpkg modules specially: given -o <dir>, it
+REM creates <dir>\fglpkg\ itself (mirroring the package name) and writes
+REM .42m there -- so this must run from the cache dir's PARENT (CACHEBASE,
+REM which must NOT itself be named "fglpkg"), not from a "fglpkg" dir
+REM itself, or you get a doubly-nested fglpkg\fglpkg\.
 setlocal enabledelayedexpansion
 
 set FGLPKGDIR=%~dp0
-set THISDRIVE=%~dd0
-FOR %%i IN ("%CD%") DO set MYDRIVE=%%~di
 
 REM FGL_LENGTH_SEMANTICS=CHAR is required: fglpkgutils.cmpBytes (and any
 REM other per-character loop) relies on ORD() resolving full Unicode code
@@ -31,28 +37,24 @@ if "%FGLVER%"=="" (
 for /f "tokens=1,2 delims=." %%a in ("%FGLVER%") do set "MAJMIN=%%a.%%b"
 
 set CACHEBASE=%TEMP%\fglpkg-%MAJMIN%
-set CACHEDIR=%CACHEBASE%\fglpkg
-if not exist "%CACHEDIR%" mkdir "%CACHEDIR%"
-
-REM /D copies only if the source is newer than an existing destination
-REM file (or it doesn't exist yet) -- the same "cheap to redo, lets
-REM fglcomp --make see accurate mtimes" idea as `cp -p` on Unix.
-xcopy "%FGLPKGDIR%*.4gl" "%CACHEDIR%\" /D /Y /Q >NUL
-xcopy "%FGLPKGDIR%*.inc" "%CACHEDIR%\" /D /Y /Q >NUL
+if not exist "%CACHEBASE%" mkdir "%CACHEBASE%"
 
 set FGLLDPATH=%CACHEBASE%;%FGLLDPATH%
 
-pushd %CD%
-%THISDRIVE%
-cd "%CACHEDIR%"
-fglcomp --make *.4gl
-if %errorlevel% neq 0 goto fglpkg_genero_err
+REM pushd (unlike plain cd) switches drives too, so this works even when
+REM %TEMP% is on a different drive than the script or the caller's cwd --
+REM simpler and more robust than the THISDRIVE/MYDRIVE dance the old
+REM xcopy-based version of this script needed.
+pushd "%CACHEBASE%"
+if errorlevel 1 (
+  echo fglpkg-genero: could not enter cache directory "%CACHEBASE%" 1>&2
+  exit /b 1
+)
+fglcomp --make -o . "%FGLPKGDIR%*.4gl" 1>&2
+if errorlevel 1 (
+  popd
+  exit /b 1
+)
 popd
-%MYDRIVE%
-fglrun "%CACHEDIR%\main.42m" %*
-goto :eof
 
-:fglpkg_genero_err
-popd
-%MYDRIVE%
-exit /b 1
+fglrun "%CACHEBASE%\fglpkg\main.42m" %*
