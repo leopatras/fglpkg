@@ -11,6 +11,21 @@ import (
 	"github.com/4js-mikefolcher/fglpkg/internal/manifest"
 )
 
+// mustBuildPackage stages + zips the project once, matching the built package
+// that enforceLint hands to publishPackage in production.
+func mustBuildPackage(t *testing.T, m *manifest.Manifest) *builtPackage {
+	t.Helper()
+	zipData, checksum, err := buildPackageZip(m)
+	if err != nil {
+		t.Fatalf("buildPackageZip: %v", err)
+	}
+	entries, err := listZipEntries(zipData)
+	if err != nil {
+		t.Fatalf("listZipEntries: %v", err)
+	}
+	return &builtPackage{zip: zipData, checksum: checksum, entries: entries}
+}
+
 // TestPublishPackageDryRunNoNetwork verifies that publishPackage with
 // dryRun=true returns successfully without performing any network I/O.
 // The tokens passed in are deliberately bogus; if the function tried to
@@ -55,6 +70,7 @@ func TestPublishPackageDryRunNoNetwork(t *testing.T) {
 		true,                 // dryRun
 		"",                   // visibilityOverride — use manifest default
 		"",                   // changelogText
+		mustBuildPackage(t, m),
 	)
 	if err != nil {
 		t.Fatalf("dry-run publishPackage returned error: %v", err)
@@ -116,7 +132,7 @@ func TestPublishPackageDryRunListsMetadata(t *testing.T) {
 	old := os.Stdout
 	r, w, _ := os.Pipe()
 	os.Stdout = w
-	runErr := publishPackage(m, "http://127.0.0.1:1", "6", true, "", "")
+	runErr := publishPackage(m, "http://127.0.0.1:1", "6", true, "", "", mustBuildPackage(t, m))
 	_ = w.Close()
 	os.Stdout = old
 	var buf bytes.Buffer
@@ -178,7 +194,7 @@ func TestPublishPackageDryRunChangelog(t *testing.T) {
 	}
 
 	out, runErr := captureDryRun(t, func() error {
-		return publishPackage(m, "http://127.0.0.1:1", "6", true, "", "")
+		return publishPackage(m, "http://127.0.0.1:1", "6", true, "", "", mustBuildPackage(t, m))
 	})
 	if runErr != nil {
 		t.Fatalf("dry-run publishPackage returned error: %v", runErr)
@@ -226,7 +242,7 @@ func TestPublishPackageDryRunChangelogMissingSection(t *testing.T) {
 	}
 
 	out, runErr := captureDryRun(t, func() error {
-		return publishPackage(m, "http://127.0.0.1:1", "6", true, "", "")
+		return publishPackage(m, "http://127.0.0.1:1", "6", true, "", "", mustBuildPackage(t, m))
 	})
 	if runErr != nil {
 		t.Fatalf("dry-run publishPackage returned error: %v", runErr)
@@ -267,7 +283,7 @@ func TestPublishPackageDryRunSyncsMetadata(t *testing.T) {
 	}
 
 	out, runErr := captureDryRun(t, func() error {
-		return publishPackage(m, "http://127.0.0.1:1", "6", true, "", "")
+		return publishPackage(m, "http://127.0.0.1:1", "6", true, "", "", mustBuildPackage(t, m))
 	})
 	if runErr != nil {
 		t.Fatalf("dry-run publishPackage returned error: %v", runErr)
