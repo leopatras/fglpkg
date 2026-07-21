@@ -67,6 +67,27 @@ func loadIgnore(root string) (*ignoreSet, error) {
 	return &set, nil
 }
 
+// dirShouldBeSkipped reports whether a directory encountered during a
+// filepath.Walk should be pruned entirely (return filepath.SkipDir at the
+// call site), by checking it against .fglpkgignore with isDir=true. This
+// is the only way a dirOnly (trailing-slash) ignore rule ever applies —
+// shouldExclude skips dirOnly rules whenever isDir is false, so a walk
+// that only ever calls shouldExclude on individual files (isDir=false)
+// can never honour a trailing-slash pattern like "test/", regardless of
+// what it names. path is the directory path as seen by filepath.Walk
+// (relative to the walk's root); root is "." for a walk rooted at the
+// current directory, or a different WalkDir root for e.g. a
+// webcomponent's own subtree — path is always converted to be relative
+// to "." before matching, since .fglpkgignore patterns are project-root
+// relative regardless of which subtree is being walked.
+func dirShouldBeSkipped(ignore *ignoreSet, path string) bool {
+	rel, err := filepath.Rel(".", path)
+	if err != nil || rel == "." {
+		return false
+	}
+	return ignore.shouldExclude(filepath.ToSlash(rel), true)
+}
+
 // shouldExclude reports whether a relative path should be omitted from
 // the zip. relPath is normalised to forward slashes before matching so
 // patterns work the same on Windows. Empty rule sets always return false.

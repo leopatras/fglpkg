@@ -68,6 +68,23 @@ func TestIgnoreDirOnlyRule(t *testing.T) {
 	}
 }
 
+// TestDirShouldBeSkipped covers dirShouldBeSkipped in isolation (GIS-297):
+// this is the helper that lets a dirOnly (trailing-slash) .fglpkgignore
+// rule actually take effect during a filepath.Walk, since shouldExclude
+// only honours dirOnly rules when isDir is true.
+func TestDirShouldBeSkipped(t *testing.T) {
+	s := &ignoreSet{rules: []ignoreRule{{pattern: "sub", dirOnly: true}}}
+	if !dirShouldBeSkipped(s, "sub") {
+		t.Error("expected sub/ directory to be skipped by the dir-only rule")
+	}
+	if dirShouldBeSkipped(s, "other") {
+		t.Error("unrelated directory should not be skipped")
+	}
+	if dirShouldBeSkipped(s, ".") {
+		t.Error("the walk root itself must never be skipped")
+	}
+}
+
 func TestIgnoreEmptySetIsNoop(t *testing.T) {
 	var s *ignoreSet
 	if s.shouldExclude("anything", false) {
@@ -191,6 +208,63 @@ func TestBuildPackageZipRespectsFglpkgIgnore(t *testing.T) {
 	}
 	if !got["fglpkg.json"] {
 		t.Error("fglpkg.json must always be included")
+	}
+}
+
+// TestBuildPackageZipRespectsDirOnlyIgnorePattern reproduces GIS-297: a
+// dirOnly ("trailing slash") .fglpkgignore pattern like "sub/" previously
+// had no effect at all in buildPackageZip, because none of the staging
+// walks ever called shouldExclude with isDir=true (the only way a
+// dirOnly rule can match) — they only ever checked individual files.
+func TestBuildPackageZipRespectsDirOnlyIgnorePattern(t *testing.T) {
+	dir := t.TempDir()
+	write := func(rel, content string) {
+		full := filepath.Join(dir, rel)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", rel, err)
+		}
+		if err := os.WriteFile(full, []byte(content), 0o644); err != nil {
+			t.Fatalf("write %s: %v", rel, err)
+		}
+	}
+	write("fglpkg.json", `{
+  "name": "dirignoretest",
+  "version": "1.0.0",
+  "dependencies": { "fgl": {} },
+  "files": ["*.4gl"]
+}`)
+	write("hello.4gl", "FUNCTION main()\nEND FUNCTION\n")
+	write("sub/secret.4gl", "FUNCTION shouldNotBePublished()\nEND FUNCTION\n")
+	write(".fglpkgignore", "sub/\n")
+
+	origDir, _ := os.Getwd()
+	t.Cleanup(func() { _ = os.Chdir(origDir) })
+	if err := os.Chdir(dir); err != nil {
+		t.Fatalf("chdir: %v", err)
+	}
+
+	m, err := manifest.Load(".")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	data, _, err := buildPackageZip(m)
+	if err != nil {
+		t.Fatalf("buildPackageZip: %v", err)
+	}
+	r, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatalf("zip.NewReader: %v", err)
+	}
+	got := map[string]bool{}
+	for _, f := range r.File {
+		got[f.Name] = true
+	}
+
+	if !got["hello.4gl"] {
+		t.Errorf("hello.4gl should be in zip; got %v", got)
+	}
+	if got["sub/secret.4gl"] {
+		t.Error("sub/secret.4gl should be excluded by the dir-only 'sub/' rule in .fglpkgignore")
 	}
 }
 
