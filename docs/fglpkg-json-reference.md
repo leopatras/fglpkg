@@ -161,10 +161,25 @@ The three practical shapes:
 `fglpkg.json` is parsed **strictly**. Understanding the rules avoids a class of
 confusing errors:
 
+- **Load errors are friendly and named in manifest terms.** When a manifest
+  fails to decode, fglpkg translates the raw `encoding/json` error into a message
+  phrased in terms of the JSON key (never a Go struct field) — see
+  `friendlyLoadError` in
+  [internal/manifest/loaderror.go](../internal/manifest/loaderror.go). Because the
+  translation happens at the single load point, `publish`, `pack`, `info`, and
+  every other command that reads the manifest benefit from it uniformly.
 - **Unknown fields are rejected**, not silently ignored. The decoder uses
   `DisallowUnknownFields()`, so a typo anywhere in the tree (e.g. `licence`
   instead of `license`, or a package name placed directly under `dependencies`
-  instead of `dependencies.fgl`) fails the load with a pointed error.
+  instead of `dependencies.fgl`) fails the load with a message that **names the
+  offending field and points at
+  [schema/fglpkg.schema.json](../schema/fglpkg.schema.json)**.
+- **Type mismatches name the key and the expected shape.** Giving a field the
+  wrong JSON type — e.g. a string where `docs` expects an array — yields
+  `"<key>: expected <hint>, got <type>"` (for instance *`docs: expected an array
+  of strings, got string`*) rather than a raw decoder error mentioning a Go
+  struct field. A per-field hint table covers `docs`, `files`, `programs`,
+  `keywords`, `include`, `webcomponents`, and `bin`.
 - **`dependencies` accepts only the keys `fgl` and `java`.** Anything else
   produces a hint: *`Did you mean "dependencies.fgl.<name>"?`* — because the
   most common mistake is nesting package names one level too shallow.
@@ -260,6 +275,13 @@ using standard semver constraint syntax:
 The constraint is parsed and validated at load (`semver.ParseConstraint`); an
 unparseable constraint fails validation. Note the JSON key is `genero`, not
 `geneoConstraint` (the Go field is `GeneroConstraint`).
+
+`fglpkg search` reads this constraint (the latest published version's) to
+annotate each result as compatible (`✓`), incompatible (`✗`), or unknown (`?`)
+against your running Genero version — override the compared version with
+`fglpkg search <term> --genero <version>`. The annotation is advisory: nothing
+is hidden or reordered, and a package with no `genero` constraint simply grades
+`?`.
 
 ### 6.3 Entry points & runnable content
 
