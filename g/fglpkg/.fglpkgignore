@@ -1,0 +1,9 @@
+# exclude the dev test suite from the published "fglpkg" source package
+# (not needed to run the tool; keeps the artifact to just the 27 modules
+# + launcher + manifest)
+# NOTE: no trailing slash -- a dirOnly (trailing-slash) pattern never
+# actually excludes anything here, since stageBDLFiles always calls
+# shouldExclude(relPath, false) with isDir hardcoded false (see
+# internal/cli/cli.go's stageBDLFiles + internal/cli/ignore.go's
+# shouldExclude); a bare "test" segment-match pattern works instead.
+test

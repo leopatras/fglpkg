@@ -1,0 +1,20 @@
+{
+  "name": "fglpkg",
+  "version": "1.0.0",
+  "description": "fglpkg -- Genero 4GL (BDL) reimplementation of the fglpkg package manager. Source-only, self-compiling at every invocation (like fglwebrun); works with any Genero version since v4 (verified against real Genero 4.01.10 and 6.00.02).",
+  "author": "Four Js Genero",
+  "license": "MIT",
+  "repository": "https://github.com/leopatras/fglpkg",
+  "keywords": ["cli", "package-manager", "genero", "bdl", "4gl", "self-hosting"],
+  "root": ".",
+  "files": [
+    "*.4gl",
+    "*.inc",
+    "Makefile",
+    "fglpkg-genero",
+    "fglpkg-genero.bat"
+  ],
+  "bin": {
+    "fglpkg-genero": "fglpkg-genero"
+  }
+}

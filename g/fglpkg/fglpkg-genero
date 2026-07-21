@@ -1,0 +1,52 @@
+#!/bin/sh
+#fglpkg-genero: self-compiling launcher for the published "fglpkg" source
+#package (the Genero 4GL reimplementation of the fglpkg tool). One
+#published artifact works across Genero majors without shipping .42m
+#bytecode (which is not compatible across majors) -- separate from the
+#real g/fglpkg/fglpkg development launcher in the source repo, which
+#execs a precompiled main.42m directly.
+#
+#Compiling in place on every invocation (the original approach, like
+#fglwebrun) has two costs: it always pays the recompile check, and
+#worse, if the machine has multiple Genero versions installed, .42m
+#files compiled by one major would silently sit there for the next
+#invocation under a different major to (wrongly) reuse or clash with.
+#So instead: sync the sources (cp -p, so mtimes carry over) into a
+#per-Genero-version cache dir under $TMPDIR, and let `fglcomp --make`
+#(which only recompiles a source whose .42m is missing or older than
+#it -- see the Genero docs' "Compiling in make mode") do the real
+#staleness check every time. First run per Genero version compiles
+#everything; every run after that is a fast no-op unless the installed
+#package (or the cache) actually changed.
+#FGL_LENGTH_SEMANTICS=CHAR is required: fglpkgutils.cmpBytes (and any
+#other per-character loop) relies on ORD() resolving full Unicode code
+#points, not just the first byte of a multi-byte UTF-8 character.
+dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+FGL_LENGTH_SEMANTICS=CHAR
+export FGL_LENGTH_SEMANTICS
+
+#"fglcomp 6.00.02 rev-5054478" -> "6.00" (major.minor only -- .42m
+#compatibility is a major.minor concern, not a patch-level one)
+ver=$(fglcomp -V 2>&1 | head -n 1 | awk '{print $2}')
+majmin=$(echo "$ver" | cut -d. -f1,2)
+if [ -z "$majmin" ]; then
+  echo "fglpkg-genero: could not determine the Genero version (fglcomp -V failed)" >&2
+  exit 1
+fi
+
+tmpbase=${TMPDIR:-/tmp}
+cachebase="$tmpbase/fglpkg-$majmin"
+cachedir="$cachebase/fglpkg"
+mkdir -p "$cachedir" || exit 1
+
+#cp -p preserves the source's mtime, so fglcomp --make's own staleness
+#check (source newer than .42m?) still works correctly even after the
+#installed package itself gets updated -- this is cheap to redo on
+#every invocation, unlike the actual compile it lets --make skip.
+cp -p "$dir"/*.4gl "$dir"/*.inc "$cachedir/" 2>/dev/null
+
+FGLLDPATH="$cachebase${FGLLDPATH:+:$FGLLDPATH}"
+export FGLLDPATH
+
+( cd "$cachedir" && fglcomp --make ./*.4gl ) >&2 || exit 1
+exec fglrun "$cachedir/main.42m" "$@"
