@@ -1,0 +1,14 @@
+{
+  "name": "sample-v5-42m",
+  "version": "1.0.0",
+  "description": "fglpkg sample package requiring Genero 5 (base.Channel.getExitStatus), shipped as compiled .42m only (no source)",
+  "author": "fglpkg samples",
+  "license": "MIT",
+  "repository": "https://github.com/leopatras/fglpkg",
+  "genero": ">=5.00.03",
+  "dependencies": {},
+  "root": ".",
+  "files": [
+    "*.42m"
+  ]
+}

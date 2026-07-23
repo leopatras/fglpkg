@@ -1,0 +1,13 @@
+{
+  "name": "sample-v6-42m-consumer",
+  "version": "1.0.0",
+  "description": "fglpkg sample consumer project using sample-v6-42m (Genero >=6.00, .42m-only package)",
+  "author": "fglpkg samples",
+  "license": "MIT",
+  "genero": "*",
+  "dependencies": {
+    "fgl": {
+      "sample-v6-42m": "^1.0.0"
+    }
+  }
+}

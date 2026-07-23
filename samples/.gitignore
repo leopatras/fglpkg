@@ -12,3 +12,7 @@ consumers/v5-consumer/.fglpkg/
 consumers/v5-consumer/fglpkg.lock
 consumers/v6-consumer/.fglpkg/
 consumers/v6-consumer/fglpkg.lock
+consumers/v5-42m-consumer/.fglpkg/
+consumers/v5-42m-consumer/fglpkg.lock
+consumers/v6-42m-consumer/.fglpkg/
+consumers/v6-42m-consumer/fglpkg.lock
