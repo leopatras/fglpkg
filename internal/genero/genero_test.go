@@ -48,6 +48,47 @@ func TestParseErrors(t *testing.T) {
 	}
 }
 
+func TestParseLoose(t *testing.T) {
+	cases := []struct {
+		input        string
+		wantOriginal string
+		wantMajor    uint64
+		wantMinor    uint64
+		wantPatch    uint64
+	}{
+		{"4.01.12", "4.01.12", 4, 1, 12},
+		{"4.01", "4.01", 4, 1, 0},   // patch padded
+		{"3.20", "3.20", 3, 20, 0},  // patch padded
+		{"4", "4", 4, 0, 0},         // minor + patch padded
+		{" 4.01 ", "4.01", 4, 1, 0}, // trimmed
+	}
+	for _, tc := range cases {
+		v, err := genero.ParseLoose(tc.input)
+		if err != nil {
+			t.Errorf("ParseLoose(%q) error: %v", tc.input, err)
+			continue
+		}
+		if v.String() != tc.wantOriginal {
+			t.Errorf("ParseLoose(%q).String() = %q, want %q", tc.input, v.String(), tc.wantOriginal)
+		}
+		sv := v.Semver()
+		if sv.Major != tc.wantMajor || sv.Minor != tc.wantMinor || sv.Patch != tc.wantPatch {
+			t.Errorf("ParseLoose(%q) semver = %d.%d.%d, want %d.%d.%d",
+				tc.input, sv.Major, sv.Minor, sv.Patch,
+				tc.wantMajor, tc.wantMinor, tc.wantPatch)
+		}
+	}
+}
+
+func TestParseLooseErrors(t *testing.T) {
+	bad := []string{"abc", "", "4.01.x", "4.1.2.3"}
+	for _, s := range bad {
+		if _, err := genero.ParseLoose(s); err == nil {
+			t.Errorf("ParseLoose(%q) expected error, got nil", s)
+		}
+	}
+}
+
 func TestSatisfies(t *testing.T) {
 	cases := []struct {
 		version    string

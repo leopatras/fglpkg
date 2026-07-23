@@ -90,6 +90,40 @@ func MustParse(s string) Version {
 	return v
 }
 
+// ParseLoose parses a user-supplied Genero version that may omit the minor
+// and/or patch component (e.g. "4", "4.01", "4.01.12"), padding the missing
+// trailing components with zeros. Unlike Parse it does not require a full
+// MAJOR.MINOR.PATCH: for user-facing overrides such as `fglpkg search --genero`
+// that grade compatibility, demanding a patch level is needless friction — the
+// verdict turns on the leading components. The returned version's String()
+// preserves exactly what the user typed (e.g. "4.01"), while its semver value
+// is the zero-padded form used for matching.
+func ParseLoose(s string) (Version, error) {
+	trimmed := strings.TrimSpace(s)
+	if trimmed == "" {
+		return Version{}, fmt.Errorf("invalid Genero version %q: empty", s)
+	}
+	parts := strings.Split(trimmed, ".")
+	if len(parts) > 3 {
+		return Version{}, fmt.Errorf("invalid Genero version %q: expected at most MAJOR.MINOR.PATCH", s)
+	}
+	for _, p := range parts {
+		if p == "" {
+			return Version{}, fmt.Errorf("invalid Genero version %q: empty component", s)
+		}
+	}
+	for len(parts) < 3 {
+		parts = append(parts, "0")
+	}
+	v, err := parse(strings.Join(parts, "."))
+	if err != nil {
+		return Version{}, err
+	}
+	// Keep the user's original text as the display form.
+	v.original = trimmed
+	return v, nil
+}
+
 // Satisfies reports whether this Genero version satisfies the given constraint
 // string (uses the same semver constraint syntax as package versions).
 // An empty constraint is treated as "any version".

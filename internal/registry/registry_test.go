@@ -139,9 +139,19 @@ func TestSearchMapsBrowseResponse(t *testing.T) {
 				"description":    "A friendly starter",
 				"latest_version": "1.2.3",
 				"owner":          map[string]any{"name": "ACME"},
+				"genero":         "^4.0.0",
+			},
+			{
+				// No "genero" key: an older registry that doesn't report the
+				// constraint must map to an empty GeneroConstraint (unknown).
+				"slug":           "legacy-pkg",
+				"name":           "legacy-pkg",
+				"description":    "No constraint reported",
+				"latest_version": "0.9.0",
+				"owner":          map[string]any{"name": "ACME"},
 			},
 		},
-		"total": 1,
+		"total": 2,
 	})
 	defer ts.Close()
 	t.Setenv("FGLPKG_REGISTRY", ts.URL)
@@ -150,12 +160,18 @@ func TestSearchMapsBrowseResponse(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Search: %v", err)
 	}
-	if len(results) != 1 {
-		t.Fatalf("got %d results, want 1", len(results))
+	if len(results) != 2 {
+		t.Fatalf("got %d results, want 2", len(results))
 	}
 	r := results[0]
 	if r.Name != "hello-genero" || r.LatestVersion != "1.2.3" || r.Author != "ACME" {
 		t.Errorf("result = %+v, fields wrong", r)
+	}
+	if r.GeneroConstraint != "^4.0.0" {
+		t.Errorf("GeneroConstraint = %q, want %q", r.GeneroConstraint, "^4.0.0")
+	}
+	if got := results[1].GeneroConstraint; got != "" {
+		t.Errorf("absent genero field: GeneroConstraint = %q, want empty", got)
 	}
 }
 
