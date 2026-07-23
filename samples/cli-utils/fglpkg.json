@@ -1,0 +1,14 @@
+{
+  "name": "com-fourjs-utils-cli",
+  "version": "1.0.0",
+  "description": "fglpkg sample package demonstrating a multi-segment PACKAGE path (PACKAGE com.fourjs.utils.cli) with a myErr() error-reporting helper, similar to fglpkgutils.myErr",
+  "author": "fglpkg samples",
+  "license": "MIT",
+  "repository": "https://github.com/leopatras/fglpkg",
+  "genero": "*",
+  "dependencies": {},
+  "root": ".",
+  "files": [
+    "com/fourjs/utils/cli/*.4gl"
+  ]
+}

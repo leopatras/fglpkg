@@ -1,0 +1,13 @@
+{
+  "name": "sample-com-fourjs-utils-cli",
+  "version": "1.0.0",
+  "description": "fglpkg sample consumer project using com-fourjs-utils-cli (PACKAGE com.fourjs.utils.cli) -- the fglpkg registry name deliberately mismatches the Genero PACKAGE name, exercising GIS-346",
+  "author": "fglpkg samples",
+  "license": "MIT",
+  "genero": "*",
+  "dependencies": {
+    "fgl": {
+      "com-fourjs-utils-cli": "^1.0.0"
+    }
+  }
+}

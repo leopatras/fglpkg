@@ -116,6 +116,31 @@ session. Packaging source lives in `~/tmp/tool_fglwebrun` (the user's
 real upstream checkout, with its own `fglpkg.json` + `make
 fglpkg-publish`/`fglpkg-pack-list` targets added) — NOT in this repo.
 
+## Registry-side name validation is stricter than the client's own schema
+
+The fglpkg CLI's own manifest schema and `internal/slug` package (PEP 503 /
+GIS-271) are explicitly designed to accept dotted, Maven-`groupId`-style
+names (e.g. `com.fourjs.utils.cli`) and derive a canonical hyphenated slug
+client-side (`Canonical`: lowercase, collapse runs of `.`/`_`/`-` to one
+`-`). But the live test registry's `POST /registry/packages` rejects a
+dotted raw name outright: `HTTP 400 {"error":"slug must be 2-64 chars:
+lowercase letters, digits, hyphens"}` — it does not canonicalize
+server-side the way the client expects. Confirmed publishing
+`samples/cli-utils` (PACKAGE `com.fourjs.utils.cli`): had to rename the
+manifest's `name` to `com-fourjs-utils-cli` to get past the registry,
+even though the client-side schema/slug logic already fully supports the
+dotted form. This is a registry-side gap, not a client-side one — the
+registry backend's own source isn't in this repo (it's Mike's separate
+Cloudflare Worker deployment). Leo's take (2026-07-23): dots should be
+allowed — no problem with permitting them; worth raising with the
+registry maintainer.
+
+The BDL/Java `PACKAGE`/import path is unaffected either way — it's driven
+entirely by the archive's internal directory layout (`com/fourjs/utils/cli/`),
+never by the registry's own package name/slug (same as Maven `groupId` vs.
+the Java package a `.class` file actually declares — see the conversation
+that prompted this, no ticket filed).
+
 ## Reference
 
 4js internal Confluence "FGLPKG: Product Card":
