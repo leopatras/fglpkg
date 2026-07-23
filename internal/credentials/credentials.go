@@ -247,6 +247,18 @@ func (f *File) SetBasic(registryURL, username, secret string) {
 	f.Registries[key] = e
 }
 
+// ClearOAuth removes any stored OAuth tokens for registryURL, leaving other
+// credential fields (PAT, GitHub token) intact. Used when the user explicitly
+// re-logs in with a PAT (`fglpkg login --token`) so a stale OAuth token does
+// not keep shadowing the new PAT at resolution time (see ActiveBearer).
+func (f *File) ClearOAuth(registryURL string) {
+	key := normalise(registryURL)
+	if e, ok := f.Registries[key]; ok {
+		e.OAuth = nil
+		f.Registries[key] = e
+	}
+}
+
 // Get retrieves the credential entry for registryURL.
 func (f *File) Get(registryURL string) (Entry, bool) {
 	e, ok := f.Registries[normalise(registryURL)]

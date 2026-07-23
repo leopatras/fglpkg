@@ -1101,6 +1101,8 @@ Credentials are stored in `~/.fglpkg/credentials.json` and refreshed automatical
 fglpkg login --token <PAT>
 ```
 
+Running `fglpkg login --token` switches the GI registry to PAT auth: it replaces any OAuth session from a previous browser login, so the token takes effect immediately (no `fglpkg logout` first). Logging in again with `fglpkg login` (no arguments) switches back to OAuth.
+
 ### Checking Your Identity
 
 ```bash

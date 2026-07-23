@@ -42,7 +42,7 @@ func (v Version) MajorString() string { return fmt.Sprintf("%d", v.sv.Major) }
 func Detect() (Version, error) {
 	// 1. Explicit override.
 	if s := os.Getenv("FGLPKG_GENERO_VERSION"); s != "" {
-		return parse(s)
+		return ParseLoose(s)
 	}
 
 	// 2. fglcomp on PATH.
@@ -171,9 +171,10 @@ func FglrunPath() (string, error) {
 
 // versionPattern matches Genero version strings embedded in command output.
 // Handles formats like:
-//   "Genero BDL Version 4.01.12 ..."
-//   "fglcomp: Genero BDL 3.20.05-..."
-//   "4.01.12"
+//
+//	"Genero BDL Version 4.01.12 ..."
+//	"fglcomp: Genero BDL 3.20.05-..."
+//	"4.01.12"
 var versionPattern = regexp.MustCompile(`\b(\d+)\.(\d+)\.(\d+)\b`)
 
 func fromCommand(name string, args ...string) (Version, error) {

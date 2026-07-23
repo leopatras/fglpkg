@@ -153,6 +153,32 @@ func TestDetectFromEnvOverride(t *testing.T) {
 	}
 }
 
+// TestDetectFromEnvLoose proves FGLPKG_GENERO_VERSION is parsed leniently
+// (matching the --genero flag): a bare MAJOR.MINOR with no patch is accepted,
+// shown verbatim, and pads to a semver that satisfies a real constraint.
+func TestDetectFromEnvLoose(t *testing.T) {
+	t.Setenv("FGLPKG_GENERO_VERSION", "4.01")
+	v, err := genero.Detect()
+	if err != nil {
+		t.Fatalf("Detect(%q) error: %v", "4.01", err)
+	}
+	if v.String() != "4.01" {
+		t.Errorf("Detect() = %q, want %q", v.String(), "4.01")
+	}
+	if ok, err := v.Satisfies("^4.0.0"); err != nil || !ok {
+		t.Errorf("Satisfies(^4.0.0) = %v, %v; want true, nil", ok, err)
+	}
+}
+
+// TestDetectFromEnvMalformed guards against silent fallthrough: a bad
+// FGLPKG_GENERO_VERSION must surface an error rather than being ignored.
+func TestDetectFromEnvMalformed(t *testing.T) {
+	t.Setenv("FGLPKG_GENERO_VERSION", "not-a-version")
+	if _, err := genero.Detect(); err == nil {
+		t.Error("Detect() with malformed FGLPKG_GENERO_VERSION: want error, got nil")
+	}
+}
+
 func TestDetectFailsGracefully(t *testing.T) {
 	// Clear all detection sources so we get a clean error.
 	os.Unsetenv("FGLPKG_GENERO_VERSION")

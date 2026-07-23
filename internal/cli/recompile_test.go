@@ -242,13 +242,26 @@ func TestCheckForRecompileWarnsOnStale(t *testing.T) {
 		t.Fatalf("manifest.Load: %v", err)
 	}
 
+	// Stage the package once (as enforceLint does in pack/publish) and hand the
+	// built result to checkForRecompile, which now inspects the staged entries
+	// rather than rebuilding the zip itself.
+	zipData, checksum, err := buildPackageZip(m)
+	if err != nil {
+		t.Fatalf("buildPackageZip: %v", err)
+	}
+	entries, err := listZipEntries(zipData)
+	if err != nil {
+		t.Fatalf("listZipEntries: %v", err)
+	}
+	built := &builtPackage{zip: zipData, checksum: checksum, entries: entries}
+
 	// Feed "y" so the guard's "Continue?" prompt does not os.Exit(1).
 	origReader := reader
 	reader = bufio.NewReader(strings.NewReader("y\n"))
 	t.Cleanup(func() { reader = origReader })
 
 	out, _ := captureDryRun(t, func() error {
-		checkForRecompile(m)
+		checkForRecompile(built)
 		return nil
 	})
 	if !strings.Contains(out, "may not have been recompiled") {
