@@ -236,10 +236,11 @@ func FetchVersionList(name string) (*VersionList, error) {
 			variants = append(variants, a.Variant)
 		}
 		out.VersionEntries = append(out.VersionEntries, VersionEntry{
-			Version:    v.Version,
-			Variants:   variants,
-			Deprecated: v.Deprecated,
-			MovedTo:    v.MovedTo,
+			Version:          v.Version,
+			Variants:         variants,
+			GeneroConstraint: v.Genero,
+			Deprecated:       v.Deprecated,
+			MovedTo:          v.MovedTo,
 		})
 	}
 	return out, nil
