@@ -2584,6 +2584,10 @@ func cmdLogin(args []string) error {
 		if !strings.HasPrefix(pat, "gpr_") {
 			fmt.Fprintln(os.Stderr, "  Warning: PAT does not start with 'gpr_' — storing anyway.")
 		}
+		// An explicit --token login switches this registry to PAT auth. Drop any
+		// existing OAuth token so it doesn't keep winning over the new PAT at
+		// resolution time (ActiveBearer prefers OAuth ahead of the PAT).
+		creds.ClearOAuth(registryURL)
 		creds.Set(registryURL, pat, "")
 		if err := creds.Save(home); err != nil {
 			return err

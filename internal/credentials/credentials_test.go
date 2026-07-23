@@ -102,6 +102,55 @@ func TestDelete(t *testing.T) {
 	}
 }
 
+// TestClearOAuthLetsPatWin reproduces the `fglpkg login` then
+// `fglpkg login --token` scenario: an explicit PAT login must clear the stored
+// OAuth token so ActiveBearer resolves to the new PAT rather than the stale
+// (unexpired) OAuth token that would otherwise win.
+func TestClearOAuthLetsPatWin(t *testing.T) {
+	os.Unsetenv("FGLPKG_TOKEN")
+
+	home := t.TempDir()
+	f, _ := credentials.Load(home)
+	f.SetOAuth(registryURL, oauth.Tokens{
+		AccessToken: "stored-oauth",
+		ExpiresAt:   time.Now().Add(time.Hour),
+		ClientID:    "c",
+	}, "alice")
+
+	// Simulate `login --token`: drop OAuth, then store the PAT.
+	f.ClearOAuth(registryURL)
+	f.Set(registryURL, testToken, "")
+	f.Save(home) //nolint:errcheck
+
+	e, ok := f.Get(registryURL)
+	if !ok {
+		t.Fatal("entry missing after ClearOAuth + Set")
+	}
+	if e.OAuth != nil {
+		t.Errorf("OAuth should be nil after ClearOAuth, got %+v", e.OAuth)
+	}
+	if e.Pat != testToken {
+		t.Errorf("Pat = %q, want %q", e.Pat, testToken)
+	}
+
+	tok, err := credentials.ActiveBearer(context.Background(), home, registryURL, nil)
+	if err != nil {
+		t.Fatalf("ActiveBearer: %v", err)
+	}
+	if tok != testToken {
+		t.Errorf("ActiveBearer = %q, want %q (PAT should win once OAuth is cleared)", tok, testToken)
+	}
+}
+
+func TestClearOAuthNoEntryIsNoop(t *testing.T) {
+	home := t.TempDir()
+	f, _ := credentials.Load(home)
+	f.ClearOAuth(registryURL) // must not panic or create an entry
+	if _, ok := f.Get(registryURL); ok {
+		t.Error("ClearOAuth created an entry for an unknown registry")
+	}
+}
+
 func TestURLNormalisation(t *testing.T) {
 	home := t.TempDir()
 	f, _ := credentials.Load(home)
