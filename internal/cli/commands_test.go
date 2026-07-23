@@ -1,9 +1,81 @@
 package cli
 
 import (
+	"os"
+	"regexp"
 	"strings"
 	"testing"
 )
+
+// dispatchCaseRE pulls the quoted labels out of a `case "a", "b":` line.
+var dispatchCaseRE = regexp.MustCompile(`"([^"]+)"`)
+
+// dispatchedCommands scans the Execute dispatch switch in cli.go and returns
+// the set of command labels it routes. It isolates the switch that follows
+// startUpdateCheck(cmd) so flag-parsing switches elsewhere in the file are not
+// picked up.
+func dispatchedCommands(t *testing.T) map[string]bool {
+	t.Helper()
+	src, err := os.ReadFile("cli.go")
+	if err != nil {
+		t.Fatalf("read cli.go: %v", err)
+	}
+	text := string(src)
+	anchor := strings.Index(text, "startUpdateCheck(cmd)")
+	if anchor < 0 {
+		t.Fatal("could not locate the dispatch anchor startUpdateCheck(cmd)")
+	}
+	swi := strings.Index(text[anchor:], "switch cmd {")
+	if swi < 0 {
+		t.Fatal("could not locate the dispatch switch")
+	}
+	region := text[anchor+swi:]
+	if end := strings.Index(region, "default:"); end >= 0 {
+		region = region[:end]
+	}
+	out := map[string]bool{}
+	for _, line := range strings.Split(region, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(trimmed, "case ") {
+			continue
+		}
+		for _, m := range dispatchCaseRE.FindAllStringSubmatch(trimmed, -1) {
+			out[m[1]] = true
+		}
+	}
+	return out
+}
+
+// TestRegistryMatchesDispatch guards the invariant the commands.go doc comment
+// promises: every dispatched command has a registry entry (so it appears in
+// help/completion) and every registry entry is dispatched (so invoking it does
+// not fall through to "unknown command"). The top-level help pseudo-commands
+// are dispatched but intentionally not registered.
+func TestRegistryMatchesDispatch(t *testing.T) {
+	helpPseudo := map[string]bool{"help": true, "--help": true, "-h": true}
+
+	dispatched := dispatchedCommands(t)
+	registered := map[string]bool{}
+	for _, c := range commands {
+		for _, key := range append([]string{c.Name}, c.Aliases...) {
+			registered[key] = true
+		}
+	}
+
+	for name := range dispatched {
+		if helpPseudo[name] {
+			continue
+		}
+		if !registered[name] {
+			t.Errorf("command %q is dispatched in cli.go but missing from the commands registry", name)
+		}
+	}
+	for name := range registered {
+		if !dispatched[name] {
+			t.Errorf("command %q is in the commands registry but not dispatched in cli.go", name)
+		}
+	}
+}
 
 // TestRegistryEntriesWellFormed verifies every command carries the metadata
 // the help renderer and top-level listing depend on.

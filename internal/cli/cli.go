@@ -176,6 +176,8 @@ func Execute() error {
 			return cmdDeprecate(args)
 		case "pack":
 			return cmdPack(args)
+		case "lint", "check":
+			return cmdLint(args)
 		case "login":
 			return cmdLogin(args)
 		case "logout":
@@ -1292,15 +1294,9 @@ var binaryToSourceExt = map[string]string{
 // mistake. Binaries come from the package zip (so nested paths are covered);
 // their sources are located anywhere in the project via a one-pass index, so
 // split src/ vs build/ layouts are handled, not just compile-in-place.
-func checkForRecompile(m *manifest.Manifest) {
-	zipData, _, err := buildPackageZip(m)
-	if err != nil {
-		return
-	}
-	entries, err := listZipEntries(zipData)
-	if err != nil {
-		return
-	}
+func checkForRecompile(built *builtPackage) {
+	// Reuse the package staged during enforceLint rather than rebuilding.
+	entries := built.entries
 
 	ignore, err := loadIgnore(".")
 	if err != nil {
@@ -1568,6 +1564,10 @@ func cmdPublish(args []string) error {
 	if err := m.ValidateForPublish(); err != nil {
 		return err
 	}
+	built, err := enforceLint(m, ".")
+	if err != nil {
+		return err
+	}
 	// Detect Genero before the publish check so the latter can reject only
 	// when the SAME variant (not just the same version string) is already
 	// published. Allows adding new Genero major variants to an existing
@@ -1591,9 +1591,11 @@ func cmdPublish(args []string) error {
 	// direct-PUT path — no GI variant pre-check, no submit/approval step.
 	if pf.registry != "" && pf.registry != config.GIName {
 		// Same recompile staleness guard as the GI path below — it is about the
-		// local build, not the target, so it applies identically here.
+		// local build, not the target, so it applies identically here. Reuse the
+		// package already staged by enforceLint above (checkForRecompile now
+		// inspects the built entries rather than rebuilding the zip).
 		if !ci {
-			checkForRecompile(m)
+			checkForRecompile(built)
 		}
 		// Note: the GI path's `--ci` → FGLPKG_TOKEN requirement intentionally does
 		// NOT apply here. Artifactory auth is per-registry (apikey/bearer/basic,
@@ -1604,7 +1606,7 @@ func cmdPublish(args []string) error {
 		if err := runHook(m, manifest.HookPrePublish, projectDir); err != nil {
 			return err
 		}
-		if err := publishToArtifactory(home, m, generoMajor, pf); err != nil {
+		if err := publishToArtifactory(home, m, generoMajor, pf, built); err != nil {
 			return fmt.Errorf("publish failed: %w", err)
 		}
 		return runHook(m, manifest.HookPostPublish, projectDir)
@@ -1638,7 +1640,7 @@ func cmdPublish(args []string) error {
 		fmt.Printf("DRY RUN — no network calls will be made\n\n")
 	}
 	if !ci {
-		checkForRecompile(m)
+		checkForRecompile(built)
 	}
 	variant := artifactVariant(m, generoMajor)
 	fmt.Printf("Publishing %s@%s (%s) to %s...\n", m.Name, m.Version, variantDescription(variant), registryURL)
@@ -1646,7 +1648,7 @@ func cmdPublish(args []string) error {
 	if err := runHook(m, manifest.HookPrePublish, projectDir); err != nil {
 		return err
 	}
-	if err := publishPackage(m, registryURL, generoMajor, dryRun, visibilityOverride, changelogText); err != nil {
+	if err := publishPackage(m, registryURL, generoMajor, dryRun, visibilityOverride, changelogText, built); err != nil {
 		return fmt.Errorf("publish failed: %w", err)
 	}
 	if dryRun {
@@ -1664,7 +1666,7 @@ func cmdPublish(args []string) error {
 
 // publishToArtifactory deploys the built package + sidecar manifest to a
 // configured Artifactory generic repository via direct PUTs (spec §10).
-func publishToArtifactory(home string, m *manifest.Manifest, generoMajor string, pf publishFlags) error {
+func publishToArtifactory(home string, m *manifest.Manifest, generoMajor string, pf publishFlags, built *builtPackage) error {
 	reg, err := resolveRegistry(home, pf.registry)
 	if err != nil {
 		return err
@@ -1686,10 +1688,8 @@ func publishToArtifactory(home string, m *manifest.Manifest, generoMajor string,
 	}
 	p := provider.NewArtifactoryProvider(reg, nil, headersApplier(headers))
 
-	zipData, checksum, err := buildPackageZip(m)
-	if err != nil {
-		return fmt.Errorf("cannot build package zip: %w", err)
-	}
+	// Reuse the package staged during enforceLint rather than rebuilding.
+	zipData, checksum := built.zip, built.checksum
 	sidecar, err := json.MarshalIndent(m.PublishCopy(), "", "  ")
 	if err != nil {
 		return fmt.Errorf("cannot serialize sidecar manifest: %w", err)
@@ -1740,12 +1740,9 @@ func publishToArtifactory(home string, m *manifest.Manifest, generoMajor string,
 //     streams the zip body. Server computes size + sha256 and stores in R2.
 //  5. POST /registry/packages/:slug/versions/:version/submit — marks the
 //     version pending so an admin reviews and approves.
-func publishPackage(m *manifest.Manifest, registryURL, generoMajor string, dryRun bool, visibilityOverride, changelogText string) error {
-	// 1. Build the zip.
-	zipData, checksum, err := buildPackageZip(m)
-	if err != nil {
-		return fmt.Errorf("cannot build package zip: %w", err)
-	}
+func publishPackage(m *manifest.Manifest, registryURL, generoMajor string, dryRun bool, visibilityOverride, changelogText string, built *builtPackage) error {
+	// 1. Reuse the package staged during enforceLint rather than rebuilding.
+	zipData, checksum := built.zip, built.checksum
 	fmt.Printf("  Package zip: %d bytes (SHA256: %s)\n", len(zipData), checksum)
 
 	variant := artifactVariant(m, generoMajor)

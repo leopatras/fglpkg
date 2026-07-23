@@ -49,6 +49,10 @@ func cmdPack(args []string) error {
 	if err := m.Validate(); err != nil {
 		return fmt.Errorf("manifest is invalid: %w", err)
 	}
+	built, err := enforceLint(m, ".")
+	if err != nil {
+		return err
+	}
 
 	// Pure-WC packages are genero-version-agnostic, so skip the
 	// (potentially expensive) runtime detection in that case. Any BDL
@@ -64,15 +68,9 @@ func cmdPack(args []string) error {
 	}
 	variant := artifactVariant(m, generoMajor)
 
-	zipData, checksum, err := buildPackageZip(m)
-	if err != nil {
-		return fmt.Errorf("cannot build package zip: %w", err)
-	}
-
-	entries, err := listZipEntries(zipData)
-	if err != nil {
-		return fmt.Errorf("cannot read built zip: %w", err)
-	}
+	// Reuse the package built during enforceLint above rather than staging +
+	// zipping a second time.
+	zipData, checksum, entries := built.zip, built.checksum, built.entries
 
 	fmt.Printf("Package:  %s@%s (%s)\n", m.Name, m.Version, variantDescription(variant))
 	fmt.Printf("Size:     %d bytes\n", len(zipData))

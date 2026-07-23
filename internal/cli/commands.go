@@ -323,6 +323,27 @@ Builds the same zip 'fglpkg publish' would upload, for local inspection.
 `,
 	},
 	{
+		Name:    "lint",
+		Aliases: []string{"check"},
+		Summary: "Validate fglpkg.json before packing or publishing",
+		Usage:   "fglpkg lint",
+		Long: `Checks fglpkg.json and the package it would produce, printing an
+errors + warnings report. Exits non-zero when any error is found, so it can
+gate CI.
+
+Reports (among others):
+  - malformed or mistyped manifest fields, named in plain language
+  - a 'files' or 'docs' pattern that matches no files
+  - a declared 'program' with no matching staged .42m module
+  - a package that would contain no BDL modules at all (error)
+  - missing publish metadata: description, license, repository, author (warning)
+
+The same validation runs automatically inside 'fglpkg pack' and
+'fglpkg publish', so these problems cannot be skipped. Errors block; warnings
+are advisory and do not stop pack/publish on their own.
+`,
+	},
+	{
 		Name:       "login",
 		Summary:    "Sign in to the registry",
 		ListDetail: " (OAuth browser flow, or --token <PAT>)",
