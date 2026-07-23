@@ -40,7 +40,7 @@ func TestSearchAcrossProviders_DedupAndCollision(t *testing.T) {
 	}
 	rs := provider.NewRepositorySet([]provider.Provider{gi, acme}, descs, nil)
 
-	out, err := captureStdout(t, func() error { return searchAcrossProviders(rs, "u", false) })
+	out, err := captureStdout(t, func() error { return searchAcrossProviders(rs, "u", false, nil) })
 	if err != nil {
 		t.Fatalf("searchAcrossProviders: %v", err)
 	}

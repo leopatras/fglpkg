@@ -11,6 +11,7 @@ This guide covers the day-to-day usage of fglpkg, the package manager for Genero
 - [Creating a New Project](#creating-a-new-project)
 - [Managing Dependencies](#managing-dependencies)
 - [Publishing a Package](#publishing-a-package)
+- [Deprecating & Relocating Packages](#deprecating--relocating-packages)
 - [Working with Java JARs](#working-with-java-jars)
 - [Webcomponent Packages](#webcomponent-packages)
 - [Distributable Scripts](#distributable-scripts)
@@ -20,6 +21,7 @@ This guide covers the day-to-day usage of fglpkg, the package manager for Genero
 - [Secondary Repositories (JFrog Artifactory)](#secondary-repositories-jfrog-artifactory)
 - [Workspaces (Monorepos)](#workspaces-monorepos)
 - [Lock Files](#lock-files)
+- [Package Signature Verification](#package-signature-verification)
 - [Package Ownership](#package-ownership)
 - [Troubleshooting](#troubleshooting)
 
@@ -315,7 +317,16 @@ Peer dependencies are intentionally not supported — they solve a JS/TS singlet
 fglpkg remove myutils
 ```
 
-This deletes the package from `~/.fglpkg/packages/` and removes it from whichever scope (`dependencies`, `devDependencies`, or `optionalDependencies`) it lives in. The command tells you which scope was touched.
+`remove` drops the package from whichever scope it lives in (`dependencies`, `devDependencies`, or `optionalDependencies`) — telling you which one — then re-resolves the remaining graph and rewrites `fglpkg.lock`, so the removed package and any now-orphaned transitive dependencies do not reappear on the next install.
+
+What happens on disk depends on the install context (see [Local vs Global](#local-vs-global-context-aware)):
+
+- **Local project (`.fglpkg/`)** — the removed package, plus any transitive dependencies the graph no longer needs, are pruned from `.fglpkg/`.
+- **Global (`~/.fglpkg/`)** — packages and JARs there are shared across projects, so they are left on disk; only `fglpkg.json` and `fglpkg.lock` are updated.
+
+Removing the **last** dependency empties the graph, so `fglpkg.lock` is deleted rather than left behind as an empty file.
+
+If the registry can't be reached to re-resolve, `remove` still updates the manifest, prints a warning, and leaves the lock untouched — run `fglpkg install` once you're back online to reconcile.
 
 ### Updating Dependencies
 
@@ -340,13 +351,34 @@ Installed packages:
 
 ### Searching the Registry
 
+`fglpkg search` annotates every result with its compatibility against the Genero version
+you are running. The version is detected automatically (honoring `FGLPKG_GENERO_VERSION`)
+and can be overridden with `--genero <version>`. The marker is advisory — nothing is hidden
+or reordered:
+
+- `✓` — the package's latest version is compatible with your Genero version
+- `✗` — the latest version requires a different Genero version
+- `?` — unknown: the registry reports no constraint, or no Genero version could be resolved
+
 ```bash
 $ fglpkg search json
-Results for "json":
-  NAME                           VERSION      DESCRIPTION
-  ----                           -------      -----------
-  jsonutils                      2.0.1        JSON utility functions for BDL
+Results for "json" (Genero 4.01):
+  NAME                           VERSION      GENERO       ?  DESCRIPTION
+  ----                           -------      ------       -  -----------
+  jsonutils                      2.0.1        ^4.0.0       ✓  JSON utility functions for BDL
+  legacyjson                     1.4.0        ^3.0.0       ✗  JSON helpers for Genero 3
+  mystery                        0.9.0        -            ?  registry reports no constraint
 ```
+
+Grade against a specific version instead of the detected one:
+
+```bash
+$ fglpkg search json --genero 3.20
+```
+
+If no Genero version can be detected (no `fglcomp`, no `$FGLDIR`, no override), search still
+runs — every result shows `?` and the header explains how to set the version. Results from
+secondary (non-GI) repositories are not graded and always show `?`.
 
 ## Publishing a Package
 
@@ -606,6 +638,37 @@ Supported constraint syntax:
 - `>=3.20.0 <5.0.0` — explicit range
 - `^3.20.0 || ^4.0.0` — multiple ranges
 - `*` or omit — compatible with any version
+
+## Deprecating & Relocating Packages
+
+`fglpkg deprecate` marks a published version — or a whole package — as deprecated, following the **npm model**: the deprecated version stays **fully installable and listed**; consumers just get a non-fatal warning, optionally pointing at a successor. This is also how a **rename or relocation** is expressed — there is no separate `rename`/`migrate` command.
+
+Deprecation is an **owner-only** action and requires login.
+
+```bash
+# Deprecate one version with a message
+fglpkg deprecate chart-3d@1.2.3 "security fix in 1.2.4; please upgrade"
+
+# Rename / relocate — message auto-fills to "chart-3d has moved to chart-3d-ng"
+fglpkg deprecate chart-3d@1.2.3 --moved-to chart-3d-ng
+
+# Relocate the whole package (all versions), pinning a successor version
+fglpkg deprecate chart-3d --moved-to chart-3d-ng@2.0.0
+
+# Lift a deprecation
+fglpkg deprecate chart-3d@1.2.3 --undo
+```
+
+- A bare `<pkg>` (no `@version`) targets the whole package; `<pkg>@<version>` targets one version.
+- A message is required unless `--moved-to` is given (which auto-fills one).
+- `--message <text>` is an alternative to the positional message; `--json` prints a machine-readable result.
+- Re-running `deprecate` edits the existing message/successor (it is idempotent).
+
+Deprecation is **advisory, not withdrawal**: it never hides or un-lists the package and never renames the slug in place — it records a pointer to a separately-published successor. What consumers see:
+
+- **`install` / `update`** — a `warning:` line for each deprecated resolved dependency (including transitive ones), with a `→ consider: fglpkg install <successor>` hint when a successor is set. The install still succeeds; deprecation never blocks it. (Warnings fire on a fresh resolve, not on a lock-file-only reinstall.)
+- **`info`** — a `Deprecated:` / `Moved to:` block under the header.
+- **`outdated`** — a `deprecated → <successor>` note for any installed dependency that is deprecated.
 
 ## Running BDL Programs
 
@@ -1270,6 +1333,38 @@ To bypass the lock and re-resolve everything:
 ```bash
 fglpkg update
 ```
+
+## Package Signature Verification
+
+Every artifact the GI registry serves is signed with **Ed25519** over a canonical (RFC 8785 / JCS) payload of the package's identity and `sha256`. On install, `fglpkg` reconstructs that payload and verifies the signature — proving the bytes you received are exactly what the registry stored. This sits a layer above the plain SHA-256 integrity check, defending against transport, mirror, and cache tampering.
+
+Trust is anchored in a **root public key pinned inside the fglpkg binary**: the registry's working keys are published in a signed manifest (`GET /registry/.well-known/keys.json`), itself signed by that pinned root — so a rogue registry can't substitute its own keys. The verified manifest is cached at `~/.fglpkg/keys.json`, so reinstalls and `--production` deploys work offline.
+
+This gives integrity **and** authenticity for the registry artifact. It does *not* prove *who built* the package (that is a separate, opt-in provenance layer, not in this release), and Java JARs pulled from Maven Central keep their existing checksum-only trust.
+
+### Enforcement modes
+
+Set `signing.enforce` in `~/.fglpkg/config.json` (or the `FGLPKG_SIGNING` environment variable, which wins):
+
+```json
+{ "signing": { "enforce": "warn" } }
+```
+
+| Mode | Behaviour |
+|---|---|
+| `warn` *(default)* | A bad or missing signature warns but the install continues. |
+| `require` | A bad or missing signature aborts the install. |
+| `off` | Signature verification is skipped entirely. |
+
+`fglpkg install --no-verify-signature` skips verification for a single run (discouraged; for emergencies).
+
+### Auditing signatures
+
+```bash
+fglpkg audit signatures
+```
+
+Re-verifies every package in `fglpkg.lock` against the current keys manifest, printing one line per package and exiting non-zero if any package is unsigned or fails to verify — suitable as a CI gate.
 
 ## Package Ownership
 

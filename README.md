@@ -43,19 +43,6 @@ sudo chmod +x /usr/local/bin/fglpkg
 copy fglpkg-windows-amd64.exe C:\tools\fglpkg.exe
 ```
 
-### macOS Gatekeeper warning
-
-If you download the macOS binary through a **browser**, macOS tags it with a quarantine
-attribute and Gatekeeper blocks it on first run — *"fglpkg cannot be opened because the developer
-cannot be verified."* Clear the quarantine flag after copying it into place:
-
-```bash
-sudo xattr -d com.apple.quarantine /usr/local/bin/fglpkg
-```
-
-Alternatively, right-click the file in Finder → **Open** once to add a one-time exception, or
-download the asset with `curl -L -O <asset-url>` (curl does not set the quarantine attribute).
-
 Add environment setup:
 
 **macOS / Linux** — add to `~/.bashrc` or `~/.zshrc`:
@@ -238,7 +225,9 @@ eval "$(fglpkg env --global)"
 | `main` | No | Primary `.42m` entry point |
 | `genero` | No | Genero BDL version constraint (e.g., `^4.0.0`) |
 | `root` | No | Base directory for package files when publishing (default `.`) |
-| `files` | No | Glob patterns for files to include in the zip (default `["*.42m", "*.42f", "*.sch"]`) |
+| `importRoot` | No | Directory whose *contents* become the archive root (its prefix is stripped) — e.g. ship compiled output from under `lib/` without the `lib/` prefix. Must lie on the same path as `root`. |
+| `files` | No | Glob patterns for files to include in the zip (default `["*.42m", "*.42f", "*.sch"]`). A pattern with no `/` matches basenames at any depth under `root`; a pattern containing `/` is path-scoped relative to `root`. |
+| `include` | No | Extra loose files folded into the archive **root** by basename (e.g. `["dist/app.4st"]` ships as `app.4st`) — for files that live outside `importRoot`. |
 | `bin` | No | Command name to script path mappings (e.g., `{"migrate": "scripts/migrate.sh"}`) |
 | `docs` | No | Glob patterns for documentation files to include (e.g., `["README.md", "docs/**/*.md"]`) |
 | `dependencies.fgl` | No | BDL production package dependencies. Each value is either a version-constraint string (`"^1.0.0"`) or an object pinning the source repository: `{ "version": "^1.0.0", "registry": "acme" }` (see [Secondary Package Repositories](#secondary-package-repositories-jfrog-artifactory)) |
@@ -248,8 +237,9 @@ eval "$(fglpkg env --global)"
 | `devDependencies` | No | Test / tooling deps (fgl + java), skipped with `--production` |
 | `optionalDependencies` | No | Attempted like prod, failures emit a warning instead of aborting |
 | `programs` | No | List of module names with MAIN blocks (e.g., `["PoiConvert"]`) |
+| `webcomponents` | No | COMPONENTTYPE names this package provides, each backed by a `webcomponents/<NAME>/` source directory. Presence marks the package as a webcomponent package. See [Webcomponent Packages](docs/user-guide.md#webcomponent-packages). |
 | `visibility` | No | Who can see this package on the registry: `"public"` (default) or `"private"`. Defaults to `"public"` if omitted — set `"private"` explicitly to restrict access. Applied on first publish only; ignored on subsequent publishes. |
-| `scripts` | No | Custom script definitions |
+| `hooks` | No | Lifecycle steps run on well-known events (e.g. `postinstall`) as declarative operations from a fixed vocabulary — not arbitrary shell. Replaces the removed `scripts` field. See [Lifecycle Hooks](docs/user-guide.md#lifecycle-hooks). |
 
 ## Environment Variables
 
@@ -345,10 +335,11 @@ fglpkg list                              # List installed packages
 fglpkg env                               # Print export statements (auto-detects scope)
 fglpkg env --global                      # Print exports for all global packages
 fglpkg env --gst                         # Print in Genero Studio format
-fglpkg search json                       # Search the registry (matches name/description)
+fglpkg search json                       # Search (annotates ✓/✗/? vs your Genero version)
 fglpkg search --all                      # List every package in the registry
                                          #   a STATUS column appears only when a match is
                                          #   deprecated, e.g. "chart-3d  1.2.3  deprecated -> chart-3d-ng  3D charts"
+fglpkg search json --genero 4.01         # Grade results against a specific Genero version
 fglpkg audit signatures                  # Verify registry signatures of locked packages
 fglpkg bdl <pkg> <module> [args...]      # Run a BDL program from a package
 fglpkg bdl --list                        # List available BDL programs

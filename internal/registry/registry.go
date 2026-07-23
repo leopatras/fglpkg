@@ -154,6 +154,10 @@ type SearchResult struct {
 	LatestVersion string `json:"latestVersion"`
 	Description   string `json:"description"`
 	Author        string `json:"author"`
+	// GeneroConstraint is the latest version's declared Genero version
+	// constraint (e.g. "^4.0.0"). Empty when the registry does not report one,
+	// in which case compatibility is treated as unknown.
+	GeneroConstraint string `json:"genero,omitempty"`
 	// Source is the logical repository this result came from, set by the
 	// multi-provider search fan-out. Empty for single-registry results.
 	Source string `json:"source,omitempty"`
@@ -335,12 +339,13 @@ func Search(term string) ([]SearchResult, error) {
 	results := make([]SearchResult, 0, len(br.Packages))
 	for _, p := range br.Packages {
 		results = append(results, SearchResult{
-			Name:          p.Slug,
-			LatestVersion: p.LatestVersion,
-			Description:   p.Description,
-			Author:        p.Owner.Name,
-			Deprecated:    p.Deprecated,
-			MovedTo:       p.MovedTo,
+			Name:             p.Slug,
+			LatestVersion:    p.LatestVersion,
+			Description:      p.Description,
+			Author:           p.Owner.Name,
+			GeneroConstraint: p.Genero,
+			Deprecated:       p.Deprecated,
+			MovedTo:          p.MovedTo,
 		})
 	}
 	return results, nil
@@ -687,6 +692,10 @@ type apiListedPackage struct {
 	Deprecated         bool   `json:"deprecated"`
 	DeprecationMessage string `json:"deprecation_message"`
 	MovedTo            string `json:"moved_to"`
+	// Genero is the latest version's declared Genero version constraint,
+	// surfaced on the browse listing for compatibility annotation. Empty when
+	// the registry does not report one.
+	Genero string `json:"genero,omitempty"`
 }
 
 type apiPackageDetail struct {

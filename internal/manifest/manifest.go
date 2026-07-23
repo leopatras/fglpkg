@@ -461,13 +461,7 @@ func Load(dir string) (*Manifest, error) {
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&m); err != nil {
-		if strings.Contains(err.Error(), `"scripts"`) {
-			return nil, fmt.Errorf(
-				`invalid %s: the "scripts" field has been replaced by "hooks" with declarative operations — see docs/user-guide.md`,
-				Filename,
-			)
-		}
-		return nil, fmt.Errorf("invalid %s: %w", Filename, err)
+		return nil, friendlyLoadError(err)
 	}
 	if m.Dependencies.FGL == nil {
 		m.Dependencies.FGL = map[string]string{}
