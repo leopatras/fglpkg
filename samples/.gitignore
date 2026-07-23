@@ -4,5 +4,11 @@
 .fglpkg-home/
 consumers/D/.fglpkg/
 consumers/D/fglpkg.lock
+consumers/E/.fglpkg/
+consumers/E/fglpkg.lock
 consumers/com.fourjs.utils.cli/.fglpkg/
 consumers/com.fourjs.utils.cli/fglpkg.lock
+consumers/v5-consumer/.fglpkg/
+consumers/v5-consumer/fglpkg.lock
+consumers/v6-consumer/.fglpkg/
+consumers/v6-consumer/fglpkg.lock
