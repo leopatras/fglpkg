@@ -1,12 +1,16 @@
 package cli
 
 import (
+	"bufio"
 	"os"
 	"path/filepath"
 	"reflect"
 	"sort"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/4js-mikefolcher/fglpkg/internal/manifest"
 )
 
 // TestResolveSourceMatching drives the tiered source resolver directly with a
@@ -199,6 +203,56 @@ func TestCheckForRecompileDetectsStaleAcrossDirs(t *testing.T) {
 	if !srcInfo.ModTime().After(binInfo.ModTime()) {
 		t.Errorf("expected source newer than binary (stale), src=%v bin=%v",
 			srcInfo.ModTime(), binInfo.ModTime())
+	}
+}
+
+// TestCheckForRecompileWarnsOnStale is the regression for issue #24 C5: the
+// recompile staleness guard must actually fire when a packaged binary is older
+// than its source. cmdPublish now runs this guard on BOTH the GI and the
+// Artifactory publish paths (previously the Artifactory branch returned before
+// reaching it). Driven directly here because cmdPublish additionally calls
+// genero.Detect(), which requires a real Genero install.
+func TestCheckForRecompileWarnsOnStale(t *testing.T) {
+	dir := t.TempDir()
+	mustWriteFile(t, filepath.Join(dir, "fglpkg.json"), `{
+  "name": "stale-test",
+  "version": "1.0.0",
+  "description": "test",
+  "author": "me",
+  "license": "UNLICENSED",
+  "dependencies": { "fgl": {} }
+}`)
+	mustWriteFile(t, filepath.Join(dir, "Main.42m"), "pcode")
+	mustWriteFile(t, filepath.Join(dir, "Main.4gl"), "source")
+
+	// Binary older than source → stale.
+	old := time.Now().Add(-2 * time.Hour)
+	newer := time.Now().Add(-1 * time.Hour)
+	if err := os.Chtimes(filepath.Join(dir, "Main.42m"), old, old); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(filepath.Join(dir, "Main.4gl"), newer, newer); err != nil {
+		t.Fatal(err)
+	}
+
+	withWorkdir(t, dir)
+
+	m, err := manifest.Load(".")
+	if err != nil {
+		t.Fatalf("manifest.Load: %v", err)
+	}
+
+	// Feed "y" so the guard's "Continue?" prompt does not os.Exit(1).
+	origReader := reader
+	reader = bufio.NewReader(strings.NewReader("y\n"))
+	t.Cleanup(func() { reader = origReader })
+
+	out, _ := captureDryRun(t, func() error {
+		checkForRecompile(m)
+		return nil
+	})
+	if !strings.Contains(out, "may not have been recompiled") {
+		t.Errorf("expected stale-recompile warning, got:\n%s", out)
 	}
 }
 

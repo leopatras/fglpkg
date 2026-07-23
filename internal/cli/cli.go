@@ -75,11 +75,29 @@ var reader = bufio.NewReader(os.Stdin)
 // privateHint appends a login suggestion to an ErrNotFound when the user has
 // no bearer token. Private packages return 404 indistinguishably from missing
 // packages; we can only hint when auth was never attempted.
-func privateHint(err error, pkg string) error {
+//
+// reg is the registry the package is routed to. When it names a secondary
+// repository (non-empty and not GI), the hint targets that repository's
+// credentials (`fglpkg login --registry <name>`) rather than the GI login,
+// which would be the wrong remedy for an Artifactory-routed package.
+func privateHint(err error, pkg, reg string) error {
 	if !errors.Is(err, registry.ErrNotFound) || registry.Bearer() != "" {
 		return err
 	}
+	if reg != "" && reg != config.GIName {
+		return fmt.Errorf("%w\n  hint: if %q is private, run: fglpkg login --registry %s", err, pkg, reg)
+	}
 	return fmt.Errorf("%w\n  hint: if %q is a private package, run: fglpkg login", err, pkg)
+}
+
+// pinnedRegistry returns the registry a package is pinned to via a manifest
+// `{"version": ..., "registry": ...}` dependency entry, or "" if unpinned (or
+// m is nil). Used to point the not-found hint at the right credentials.
+func pinnedRegistry(m *manifest.Manifest, name string) string {
+	if m == nil {
+		return ""
+	}
+	return collectFGLPins(m)[slugutil.Canonical(name)]
 }
 
 // isValidPackageSlug reports whether a string is a well-formed canonical
@@ -455,7 +473,13 @@ func cmdInstall(args []string) error {
 			info, err = registry.Resolve(name, version, generoMajor)
 		}
 		if err != nil {
-			return fmt.Errorf("failed to resolve %s@%s: %w", name, version, privateHint(err, name))
+			// Prefer the explicit --registry target, else the manifest pin, so
+			// the not-found hint points at the credentials that actually matter.
+			hintReg := flags.registry
+			if hintReg == "" {
+				hintReg = pinnedRegistry(m, name)
+			}
+			return fmt.Errorf("failed to resolve %s@%s: %w", name, version, privateHint(err, name, hintReg))
 		}
 		// Older registry server versions omit `name` from the version-info
 		// response; fall back to the user-supplied name so we never write an
@@ -583,7 +607,18 @@ func resetLocalInstall(projectDir string, inst *installer.Installer) error {
 // parseFlags extracts --local/-l, --global/-g, and --force/-f flags from
 // args, returning the remaining args and the flag values. Commands that
 // do not use --force may simply ignore the returned value.
-func parseFlags(args []string) (remaining []string, local, global, force bool) {
+// parseFlags parses the shared --local/--global/--force flags and returns the
+// non-flag positional args. A token that looks like a flag (leading "-") but is
+// neither a shared flag nor one of extraAllowed is rejected as an unknown flag,
+// so e.g. `remove --registry x` errors instead of silently deleting a package
+// named "x". Callers with their own flags (e.g. env's --gst/--gwa) pass them in
+// extraAllowed; those tokens are recognized here and ignored (the caller reads
+// them separately).
+func parseFlags(args []string, extraAllowed ...string) (remaining []string, local, global, force bool, err error) {
+	allowed := make(map[string]bool, len(extraAllowed))
+	for _, e := range extraAllowed {
+		allowed[e] = true
+	}
 	for _, a := range args {
 		switch a {
 		case "--local", "-l":
@@ -593,6 +628,12 @@ func parseFlags(args []string) (remaining []string, local, global, force bool) {
 		case "--force", "-f":
 			force = true
 		default:
+			if allowed[a] {
+				continue
+			}
+			if strings.HasPrefix(a, "-") {
+				return nil, false, false, false, fmt.Errorf("unknown flag %q", a)
+			}
 			remaining = append(remaining, a)
 		}
 	}
@@ -669,7 +710,10 @@ func parseInstallFlags(args []string) (installFlags, error) {
 // ─── remove ───────────────────────────────────────────────────────────────────
 
 func cmdRemove(args []string) error {
-	pkgArgs, forceLocal, forceGlobal, _ := parseFlags(args)
+	pkgArgs, forceLocal, forceGlobal, _, err := parseFlags(args)
+	if err != nil {
+		return err
+	}
 	if len(pkgArgs) == 0 {
 		return fmt.Errorf("usage: fglpkg remove <package>")
 	}
@@ -762,7 +806,10 @@ func cmdUpdate(args []string) error {
 // ─── list ─────────────────────────────────────────────────────────────────────
 
 func cmdList(args []string) error {
-	_, forceLocal, forceGlobal, _ := parseFlags(args)
+	_, forceLocal, forceGlobal, _, err := parseFlags(args)
+	if err != nil {
+		return err
+	}
 	home, _, err := resolveHome(forceLocal, forceGlobal)
 	if err != nil {
 		return err
@@ -785,7 +832,10 @@ func cmdList(args []string) error {
 // ─── env ──────────────────────────────────────────────────────────────────────
 
 func cmdEnv(args []string) error {
-	_, forceLocal, forceGlobal, _ := parseFlags(args)
+	_, forceLocal, forceGlobal, _, err := parseFlags(args, "--gst", "--gwa")
+	if err != nil {
+		return err
+	}
 	gst := false
 	gwa := false
 	for _, a := range args {
@@ -1488,6 +1538,16 @@ func cmdPublish(args []string) error {
 	// Publishing to a secondary (Artifactory) repository takes a distinct,
 	// direct-PUT path — no GI variant pre-check, no submit/approval step.
 	if pf.registry != "" && pf.registry != config.GIName {
+		// Same recompile staleness guard as the GI path below — it is about the
+		// local build, not the target, so it applies identically here.
+		if !ci {
+			checkForRecompile(m)
+		}
+		// Note: the GI path's `--ci` → FGLPKG_TOKEN requirement intentionally does
+		// NOT apply here. Artifactory auth is per-registry (apikey/bearer/basic,
+		// resolved by credentials.AuthHeaders inside publishToArtifactory), so
+		// there is no single env-token analog to enforce; missing credentials are
+		// already rejected there.
 		projectDir, _ := os.Getwd()
 		if err := runHook(m, manifest.HookPrePublish, projectDir); err != nil {
 			return err

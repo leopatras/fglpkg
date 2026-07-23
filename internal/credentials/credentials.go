@@ -41,6 +41,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/4js-mikefolcher/fglpkg/internal/atomicfile"
 	"github.com/4js-mikefolcher/fglpkg/internal/oauth"
 )
 
@@ -57,11 +58,102 @@ type Entry struct {
 	// scheme is "apikey". bearer/basic reuse Pat (secret) + Username.
 	APIKey  string `json:"apiKey,omitempty"`
 	SavedAt string `json:"savedAt"`
+
+	// extra preserves unknown per-entry JSON keys so data written by a newer
+	// fglpkg (or hand-added) survives a read-modify-write by this build. It is
+	// unexported (ignored by the default codec) and round-tripped by the custom
+	// (Un)MarshalJSON below. See the package doc's forward-compat promise.
+	extra map[string]json.RawMessage
+}
+
+// entryKnownKeys are the JSON keys mapped to typed Entry fields; everything
+// else round-trips through Entry.extra.
+var entryKnownKeys = []string{"oauth", "pat", "token", "username", "githubToken", "apiKey", "savedAt"}
+
+// UnmarshalJSON decodes an Entry, capturing any unknown keys into extra.
+func (e *Entry) UnmarshalJSON(data []byte) error {
+	type entryAlias Entry // sheds the method set to avoid recursion
+	var a entryAlias
+	if err := json.Unmarshal(data, &a); err != nil {
+		return err
+	}
+	var all map[string]json.RawMessage
+	if err := json.Unmarshal(data, &all); err != nil {
+		return err
+	}
+	for _, k := range entryKnownKeys {
+		delete(all, k)
+	}
+	*e = Entry(a)
+	if len(all) > 0 {
+		e.extra = all
+	}
+	return nil
+}
+
+// MarshalJSON emits the known fields, then merges any preserved unknown keys
+// back in (known keys always win).
+func (e Entry) MarshalJSON() ([]byte, error) {
+	type entryAlias Entry
+	return marshalWithExtra(entryAlias(e), e.extra)
 }
 
 // File is the top-level credentials file structure.
 type File struct {
 	Registries map[string]Entry `json:"registries"`
+
+	// extra preserves unknown top-level keys (siblings of "registries"). See
+	// Entry.extra.
+	extra map[string]json.RawMessage
+}
+
+// UnmarshalJSON decodes a File, capturing any unknown top-level keys.
+func (f *File) UnmarshalJSON(data []byte) error {
+	type fileAlias File
+	var a fileAlias
+	if err := json.Unmarshal(data, &a); err != nil {
+		return err
+	}
+	var all map[string]json.RawMessage
+	if err := json.Unmarshal(data, &all); err != nil {
+		return err
+	}
+	delete(all, "registries")
+	*f = File(a)
+	if len(all) > 0 {
+		f.extra = all
+	}
+	return nil
+}
+
+// MarshalJSON emits "registries" (whose entries preserve their own unknown
+// keys) plus any preserved top-level keys.
+func (f File) MarshalJSON() ([]byte, error) {
+	type fileAlias File
+	return marshalWithExtra(fileAlias(f), f.extra)
+}
+
+// marshalWithExtra marshals v (a type whose method set omits MarshalJSON) and
+// merges extra's keys into the result without overwriting keys v produced. The
+// output is a compact object; callers using MarshalIndent get it re-indented.
+func marshalWithExtra(v any, extra map[string]json.RawMessage) ([]byte, error) {
+	known, err := json.Marshal(v)
+	if err != nil {
+		return nil, err
+	}
+	if len(extra) == 0 {
+		return known, nil
+	}
+	var merged map[string]json.RawMessage
+	if err := json.Unmarshal(known, &merged); err != nil {
+		return nil, err
+	}
+	for k, raw := range extra {
+		if _, exists := merged[k]; !exists {
+			merged[k] = raw
+		}
+	}
+	return json.Marshal(merged)
 }
 
 // Load reads the credentials file from the fglpkg home directory.
@@ -104,7 +196,7 @@ func (f *File) Save(home string) error {
 		return err
 	}
 	path := filepath.Join(home, filename)
-	return os.WriteFile(path, append(data, '\n'), 0600)
+	return atomicfile.WriteFile(path, append(data, '\n'), 0600)
 }
 
 // Set stores a PAT for the given registry URL. Existing OAuth tokens on the

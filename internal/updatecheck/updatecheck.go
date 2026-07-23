@@ -18,6 +18,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/4js-mikefolcher/fglpkg/internal/atomicfile"
 )
 
 // StateFilename is the tool-managed cache file under the fglpkg home.
@@ -55,11 +57,7 @@ func SaveState(home string, s State) error {
 		return err
 	}
 	data = append(data, '\n')
-	tmp := statePath(home) + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, statePath(home))
+	return atomicfile.WriteFile(statePath(home), data, 0o600)
 }
 
 // Env captures every input to the throttle decision, so ShouldCheck is a pure

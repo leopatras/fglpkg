@@ -141,6 +141,20 @@ func TestConstraintMatches(t *testing.T) {
 		{"1.x", "1.99.0", true},
 		{"1.x", "2.0.0", false},
 
+		// Bare partial (issue #24 M6a): "1.2" behaves like "1.2.x", "1" like
+		// "1.x"; a full "1.2.3" stays an exact pin, and "=1.2" is the escape
+		// hatch for an exact partial pin.
+		{"1.2", "1.2.0", true},
+		{"1.2", "1.2.99", true},
+		{"1.2", "1.3.0", false},
+		{"1.2", "1.1.9", false},
+		{"1", "1.0.0", true},
+		{"1", "1.99.0", true},
+		{"1", "2.0.0", false},
+		{"1", "0.9.9", false},
+		{"=1.2", "1.2.0", true},
+		{"=1.2", "1.2.1", false},
+
 		// AND (space-separated)
 		{">=1.0.0 <2.0.0", "1.5.0", true},
 		{">=1.0.0 <2.0.0", "2.0.0", false},
@@ -210,5 +224,20 @@ func TestLatestNoMatch(t *testing.T) {
 	c := semver.MustParseConstraint("^2.0.0")
 	if _, err := c.Latest(candidates); err == nil {
 		t.Error("Expected error for unsatisfiable constraint, got nil")
+	}
+}
+
+// TestBarePartialStripsBuildMetadata is the regression for issue #24: the
+// partial-version parser (used for bare constraint tokens) split off the
+// prerelease before stripping "+build" metadata, leaking the build string into
+// the prerelease field. Build metadata is not significant in comparisons, so a
+// bare constraint carrying it must still match the same version without it.
+func TestBarePartialStripsBuildMetadata(t *testing.T) {
+	c, err := semver.ParseConstraint("1.2.3-beta+build")
+	if err != nil {
+		t.Fatalf("ParseConstraint: %v", err)
+	}
+	if !c.Matches(semver.MustParse("1.2.3-beta")) {
+		t.Errorf("constraint %q should match 1.2.3-beta (build metadata must be ignored)", c)
 	}
 }

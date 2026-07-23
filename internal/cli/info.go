@@ -65,7 +65,7 @@ func cmdInfo(args []string) error {
 
 	versions, err := infoVersionList(rs, name)
 	if err != nil {
-		return privateHint(err, name)
+		return privateHint(err, name, pinnedRegistry(m, name))
 	}
 	if len(versions.Versions) == 0 {
 		return fmt.Errorf("package %q has no published versions", name)

@@ -23,6 +23,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/4js-mikefolcher/fglpkg/internal/atomicfile"
 )
 
 // Registry describes one package repository. It carries no secrets.
@@ -166,7 +168,7 @@ func WriteGlobalFile(home string, g GlobalFile) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(home, GlobalFilename), append(data, '\n'), 0644)
+	return atomicfile.WriteFile(filepath.Join(home, GlobalFilename), append(data, '\n'), 0644)
 }
 
 // GlobalDefaultRegistry returns the defaultRegistry declared in the global

@@ -232,6 +232,13 @@ func (d *Dependencies) UnmarshalJSON(data []byte) error {
 			// Plain string form: "^1.0.0".
 			var s string
 			if err := json.Unmarshal(v, &s); err == nil {
+				// Reject null/"" here too: unmarshaling JSON null or "" into a
+				// string succeeds with s == "", which would later parse as
+				// "match any" and silently resolve to the latest version. The
+				// object form guards this the same way below.
+				if strings.TrimSpace(s) == "" {
+					return fmt.Errorf(`invalid "dependencies.fgl.%s": version must not be empty or null`, name)
+				}
 				d.FGL[name] = s
 				continue
 			}
@@ -258,7 +265,13 @@ func (d *Dependencies) UnmarshalJSON(data []byte) error {
 		}
 	}
 	if javaRaw, ok := raw["java"]; ok {
-		if err := json.Unmarshal(javaRaw, &d.Java); err != nil {
+		// Strict like the fgl object form above: reject unknown keys inside a
+		// java entry (e.g. a typo "artifactid") rather than silently dropping
+		// them. DisallowUnknownFields applies to every object decoded here,
+		// including each slice element.
+		dec := json.NewDecoder(bytes.NewReader(javaRaw))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&d.Java); err != nil {
 			return fmt.Errorf(`invalid "dependencies.java": %w`, err)
 		}
 	}

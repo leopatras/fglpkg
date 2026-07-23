@@ -1140,6 +1140,7 @@ func extractZipRouted(zipPath, destDir, webcomponentsDir string, wcNames []strin
 	}
 	defer r.Close()
 
+	budget := int64(maxDecompressedTotal)
 	for _, f := range r.File {
 		clean := filepath.Clean(f.Name)
 		if strings.HasPrefix(clean, "..") {
@@ -1168,7 +1169,7 @@ func extractZipRouted(zipPath, destDir, webcomponentsDir string, wcNames []strin
 		if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
 			return err
 		}
-		if err := writeZipEntry(f, target); err != nil {
+		if err := writeZipEntry(f, target, &budget); err != nil {
 			return err
 		}
 	}
@@ -1183,6 +1184,7 @@ func extractZip(zipPath, destDir string) error {
 	}
 	defer r.Close()
 
+	budget := int64(maxDecompressedTotal)
 	for _, f := range r.File {
 		cleanName := filepath.Clean(f.Name)
 		if strings.HasPrefix(cleanName, "..") {
@@ -1201,7 +1203,7 @@ func extractZip(zipPath, destDir string) error {
 		if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
 			return err
 		}
-		if err := writeZipEntry(f, target); err != nil {
+		if err := writeZipEntry(f, target, &budget); err != nil {
 			return err
 		}
 	}
@@ -1247,6 +1249,7 @@ func extractWebcomponentZip(zipPath, destDir string) error {
 		}
 	}
 
+	budget := int64(maxDecompressedTotal)
 	for _, f := range r.File {
 		clean := filepath.Clean(f.Name)
 		if strings.HasPrefix(clean, "..") {
@@ -1268,14 +1271,33 @@ func extractWebcomponentZip(zipPath, destDir string) error {
 		if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
 			return err
 		}
-		if err := writeZipEntry(f, target); err != nil {
+		if err := writeZipEntry(f, target, &budget); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func writeZipEntry(f *zip.File, target string) error {
+// Decompressed-size caps guard against zip bombs — archives that are tiny
+// compressed but expand to fill the disk. The limits are far above any real
+// fglpkg package (BDL source + docs), so legitimate installs never hit them.
+// They are vars, not consts, only so tests can shrink them.
+var (
+	maxDecompressedPerEntry int64 = 512 << 20 // 512 MiB per file
+	maxDecompressedTotal    int64 = 2 << 30   // 2 GiB per archive
+)
+
+// writeZipEntry writes one zip entry to target, enforcing a per-entry and a
+// per-archive decompressed-size cap. budget points at the archive's remaining
+// byte allowance and is decremented by the bytes written; the caller seeds it
+// with maxDecompressedTotal. Both the declared header size and the actual
+// stream are checked, so a lying or absent header cannot bypass the limit.
+func writeZipEntry(f *zip.File, target string, budget *int64) error {
+	if f.UncompressedSize64 > uint64(maxDecompressedPerEntry) {
+		return fmt.Errorf("zip entry %s is too large: %d bytes decompressed exceeds the %d-byte limit",
+			f.Name, f.UncompressedSize64, maxDecompressedPerEntry)
+	}
+
 	rc, err := f.Open()
 	if err != nil {
 		return err
@@ -1288,6 +1310,19 @@ func writeZipEntry(f *zip.File, target string) error {
 	}
 	defer out.Close()
 
-	_, err = io.Copy(out, rc)
-	return err
+	// Allow up to the smaller of the per-entry cap and the archive's remaining
+	// budget; the extra byte lets io.Copy detect an overflow past the cap.
+	limit := int64(maxDecompressedPerEntry)
+	if *budget < limit {
+		limit = *budget
+	}
+	n, err := io.Copy(out, io.LimitReader(rc, limit+1))
+	if err != nil {
+		return err
+	}
+	if n > limit {
+		return fmt.Errorf("zip entry %s exceeds the decompressed-size limit (archive too large)", f.Name)
+	}
+	*budget -= n
+	return nil
 }
