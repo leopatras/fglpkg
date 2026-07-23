@@ -2,5 +2,5 @@
 .build/
 .registry-state/
 .fglpkg-home/
-D/.fglpkg/
-D/fglpkg.lock
+consumers/D/.fglpkg/
+consumers/D/fglpkg.lock
