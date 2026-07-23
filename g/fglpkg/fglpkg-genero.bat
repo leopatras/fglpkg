@@ -50,7 +50,7 @@ if errorlevel 1 (
   echo fglpkg-genero: could not enter cache directory "%CACHEBASE%" 1>&2
   exit /b 1
 )
-fglcomp --make -o . "%FGLPKGDIR%*.4gl" 1>&2
+fglcomp --make -o . "%FGLPKGDIR%*.4gl" 1>&2 >NUL
 if errorlevel 1 (
   popd
   exit /b 1

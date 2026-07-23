@@ -47,5 +47,5 @@ mkdir -p "$cachebase" || exit 1
 FGLLDPATH="$cachebase${FGLLDPATH:+:$FGLLDPATH}"
 export FGLLDPATH
 
-( cd "$cachebase" && fglcomp --make -o . "$dir"/*.4gl ) >&2 || exit 1
+( cd "$cachebase" && fglcomp --make -o . "$dir"/*.4gl >/dev/null) >&2 || exit 1
 exec fglrun "$cachebase/fglpkg/main.42m" "$@"
