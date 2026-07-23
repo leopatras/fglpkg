@@ -1,21 +1,43 @@
 # fglpkg samples — five BDL packages (A, B, C, v5, v6), one webcomponent
-# package (WC), and two consumers (D, E).
+# package (WC), and two consumers (consumers/D, consumers/E).
 #
-#   sample-a   (A/)   no dependencies
-#   sample-b   (B/)   depends on sample-a and sample-c
-#   sample-c   (C/)   depends on sample-a and sample-b   (B <-> C is a cycle)
-#   sample-v5  (v5/)  requires Genero >= 5.00.03 (base.Channel.getExitStatus)
-#   sample-v6  (v6/)  requires Genero >= 6.00    (prometheus package)
-#   sample-img (WC/)  pure webcomponent package (no BDL content) — an
-#                     image-display widget, COMPONENTTYPE "img"
-#   sample-d   (D/)   app project consuming a/b/c via `fglpkg install`
-#   sample-e   (E/)   app project consuming sample-img via `fglpkg install`
+#   sample-a   (A/)             PACKAGE a, no dependencies
+#   sample-b   (B/)             PACKAGE b, depends on sample-a and sample-c
+#   sample-c   (C/)             PACKAGE c, depends on sample-a and sample-b (B <-> C cycle)
+#   sample-v5  (v5/)            requires Genero >= 5.00.03 (base.Channel.getExitStatus)
+#   sample-v6  (v6/)            requires Genero >= 6.00    (prometheus package)
+#   sample-img (WC/)            pure webcomponent package (no BDL content) — an
+#                               image-display widget, COMPONENTTYPE "img"
+#   sample-d   (consumers/D/)   app project consuming a/b/c via `fglpkg install`
+#   sample-e   (consumers/E/)   app project consuming sample-img via `fglpkg install`
+#
+# A/B/C each declare PACKAGE <name> and store their one module nested
+# under <name>/ (e.g. A/a/Core.4gl, PACKAGE a) -- `buildFGLLDPATH` (see
+# internal/env/env.go, specs/import-root.md) adds each installed
+# package's own directory to FGLLDPATH verbatim, so a package's
+# namespace must sit directly at that root: the on-disk path relative
+# to the project dir (here "a/Core.4gl") is exactly what a consumer's
+# `IMPORT FGL a.Core` expects to find under the installed package dir.
+# The module is deliberately named Core, not "a" -- fglcomp fails to
+# resolve a PUBLIC function from another package when a single-segment
+# PACKAGE and its own module share the identical name (confirmed: only
+# renaming the module made cross-package resolution work), so keep
+# PascalCase module names distinct from the lowercase package path.
 #
 # Targets:
 #   make demo-4gl   end-to-end with the Genero 4GL fglpkg (g/fglpkg)
 #   make demo-go    end-to-end with the Go fglpkg (bin/fglpkg-go)
 #   make modules    only precompile the package modules
 #   make clean
+#
+# Each package (A, B, C, v5, v6, WC, and hello/) also has its own
+# Makefile for real, standalone compile/publish/re-publish (as opposed
+# to the throwaway mock-registry publish the demo targets do above) --
+# `make compile`, `make pack-list`, `make publish`, `make bump-publish`
+# (BUMP=patch|minor|major|prerelease). consumers/D/ and consumers/E/ have
+# their own Makefiles too, for `make install` + `make run`/`make build`
+# (the latter wired through `eval "$(fglpkg env)"`, since `fglpkg install`
+# alone does not put installed packages on FGLLDPATH).
 #
 # Each demo target starts a private mock registry
 # (g/fglpkg/test/mock_registry.py — its package index lives in memory),
@@ -46,11 +68,11 @@ FGLPKG_GO := $(REPO)/bin/fglpkg-go
 all: demo-4gl
 
 # publish A/C/B/v5/v6/WC to a fresh mock registry, then install + build
-# + run D, and install + build E; the registry only lives for the
-# duration of the recipe
+# + run consumers/D, and install + build consumers/E; the registry only
+# lives for the duration of the recipe
 define demo_flow
 	set -e; \
-	rm -rf .registry-state .fglpkg-home D/.fglpkg D/fglpkg.lock D/d.42m E/.fglpkg E/fglpkg.lock E/imgdemo.42m E/imgdemo.42f; \
+	rm -rf .registry-state .fglpkg-home consumers/D/.fglpkg consumers/D/fglpkg.lock consumers/D/d.42m consumers/E/.fglpkg consumers/E/fglpkg.lock consumers/E/imgdemo.42m consumers/E/imgdemo.42f; \
 	lsof -ti tcp:$(REGISTRY_PORT) | xargs kill 2>/dev/null || true; \
 	python3 $(REPO)/g/fglpkg/test/mock_registry.py $(REGISTRY_PORT) .registry-state & REG=$$!; \
 	trap 'kill $$REG 2>/dev/null || true' EXIT; \
@@ -61,14 +83,14 @@ define demo_flow
 	done; \
 	echo "== publish v5 genero5 variant"; \
 	(cd v5 && FGLPKG_GENERO_VERSION=5.00.05 $(1) publish --ci); \
-	echo "== install dependencies in D"; \
-	(cd D && $(1) install); \
-	echo "== compile and run D"; \
-	(cd D && eval "$$($(1) env)" && fglcomp -M d.4gl && fglrun d.42m); \
-	echo "== install dependencies in E"; \
-	(cd E && $(1) install); \
-	echo "== compile E (webcomponent form — not run, see header comment)"; \
-	(cd E && eval "$$($(1) env)" && fglform -M imgdemo.per && fglcomp -M imgdemo.4gl)
+	echo "== install dependencies in consumers/D"; \
+	(cd consumers/D && $(1) install); \
+	echo "== compile and run consumers/D"; \
+	(cd consumers/D && eval "$$($(1) env)" && fglcomp -M d.4gl && fglrun d.42m); \
+	echo "== install dependencies in consumers/E"; \
+	(cd consumers/E && $(1) install); \
+	echo "== compile consumers/E (webcomponent form — not run, see header comment)"; \
+	(cd consumers/E && eval "$$($(1) env)" && fglform -M imgdemo.per && fglcomp -M imgdemo.4gl)
 endef
 
 demo-4gl: modules
@@ -79,14 +101,16 @@ demo-go: modules $(FGLPKG_GO)
 
 # B and C import each other, so neither can be compiled first inside its
 # own directory (fglcomp resolves IMPORT FGL from FGLLDPATH only as
-# compiled .42m). Compile all modules together in a flat staging dir —
-# there fglcomp reads the imported interface straight from the source —
-# and copy the .42m back so the published zips ship them prebuilt.
+# compiled .42m). Compile all three packages together in a staging dir
+# that mirrors their nested a/, b/, c/ package layout, with FGLLDPATH
+# pointing at that dir's root — fglcomp reads each other's interface
+# straight from source across the a/b/c cycle — then copy the .42m back
+# so the published zips ship them prebuilt.
 modules:
-	rm -rf .build && mkdir .build
-	cp A/a.4gl B/b.4gl C/c.4gl .build/
-	cd .build && fglcomp -M a.4gl && fglcomp -M b.4gl && fglcomp -M c.4gl
-	cp .build/a.42m A/ && cp .build/b.42m B/ && cp .build/c.42m C/
+	rm -rf .build && mkdir -p .build/a .build/b .build/c
+	cp A/a/Core.4gl .build/a/ && cp B/b/Core.4gl .build/b/ && cp C/c/Core.4gl .build/c/
+	cd .build && FGLLDPATH=. fglcomp -M a/Core.4gl b/Core.4gl c/Core.4gl
+	cp .build/a/Core.42m A/a/ && cp .build/b/Core.42m B/b/ && cp .build/c/Core.42m C/c/
 	rm -rf .build
 	cd v5 && fglcomp -M v5.4gl
 	cd v6 && fglcomp -M v6.4gl
@@ -97,6 +121,6 @@ $(FGLPKG_GO):
 
 clean:
 	rm -rf .build .registry-state .fglpkg-home
-	rm -f A/*.42m B/*.42m C/*.42m D/*.42m v5/*.42m v6/*.42m E/*.42m E/*.42f
-	rm -rf D/.fglpkg E/.fglpkg
-	rm -f D/fglpkg.lock E/fglpkg.lock
+	rm -f A/a/*.42m B/b/*.42m C/c/*.42m consumers/D/*.42m v5/*.42m v6/*.42m consumers/E/*.42m consumers/E/*.42f
+	rm -rf consumers/D/.fglpkg consumers/E/.fglpkg
+	rm -f consumers/D/fglpkg.lock consumers/E/fglpkg.lock

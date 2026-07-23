@@ -1,20 +1,19 @@
 {
   "name": "sample-b",
-  "version": "1.0.0",
+  "version": "1.0.3",
   "description": "fglpkg sample package B (depends on A and C)",
   "author": "fglpkg samples",
   "license": "MIT",
-  "repository": "https://github.com/4js-mikefolcher/fglpkg",
+  "repository": "https://github.com/leopatras/fglpkg",
   "genero": "*",
-  "root": ".",
-  "files": [
-    "*.4gl",
-    "*.42m"
-  ],
   "dependencies": {
     "fgl": {
       "sample-a": "^1.0.0",
       "sample-c": "^1.0.0"
     }
-  }
+  },
+  "root": ".",
+  "files": [
+    "b/*.4gl"
+  ]
 }

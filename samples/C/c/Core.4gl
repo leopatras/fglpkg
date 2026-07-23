@@ -1,12 +1,13 @@
 #+ sample package C (fglpkg name: sample-c) — depends on A and B
-IMPORT FGL a
-IMPORT FGL b
+PACKAGE c
+IMPORT FGL a.Core AS a
+IMPORT FGL b.Core AS b
 
 --B and C depend on each other; the guard stops the mutual recursion
 --(c.main -> b.main -> c.main -> ...)
 DEFINE m_inCall BOOLEAN
 
-FUNCTION main()
+PUBLIC FUNCTION main()
   IF m_inCall THEN
     RETURN
   END IF
