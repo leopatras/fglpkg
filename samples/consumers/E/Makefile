@@ -22,5 +22,8 @@ install:
 build:
 	eval "$$($(FGLPKG) env)" && fglform -M imgdemo.per && fglcomp -M imgdemo.4gl
 
+run: build
+	eval "$$($(FGLPKG) env)" && fglrun imgdemo
+
 clean:
 	rm -f imgdemo.42m imgdemo.42f

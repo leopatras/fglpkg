@@ -195,8 +195,9 @@ func FetchVersionList(name string) (*VersionList, error) {
 			variants = append(variants, a.Variant)
 		}
 		out.VersionEntries = append(out.VersionEntries, VersionEntry{
-			Version:  v.Version,
-			Variants: variants,
+			Version:          v.Version,
+			Variants:         variants,
+			GeneroConstraint: v.Genero,
 		})
 	}
 	return out, nil

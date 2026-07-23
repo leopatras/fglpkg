@@ -51,6 +51,40 @@ func TestFetchVersionListProjectsVersions(t *testing.T) {
 	}
 }
 
+// TestFetchVersionListProjectsGeneroConstraint covers a bug where
+// FetchVersionList built each VersionEntry from the API's version
+// summary but never copied its "genero" field into
+// VersionEntry.GeneroConstraint, leaving it always "". Since
+// Version.Satisfies("") is unconditionally true, the resolver's
+// filterByGenero check silently never rejected an incompatible
+// package -- resolution fell through entirely to pickArtifact's
+// arts[0] fallback, regardless of the manifest's declared Genero
+// constraint. Caught by a real cross-SDK integration test
+// (TestGeneroVersionSwitch_V5V6Consumers in internal/cli).
+func TestFetchVersionListProjectsGeneroConstraint(t *testing.T) {
+	ts := newPackagesServer(t, map[string]any{
+		"slug": "sample-v6",
+		"versions": []map[string]any{
+			{"version": "1.0.1", "genero": ">=6.00", "artifacts": []map[string]any{
+				{"variant": "genero6", "sha256": "bb", "download_url": "https://r2/g6.zip"},
+			}},
+		},
+	}, nil)
+	defer ts.Close()
+	t.Setenv("FGLPKG_REGISTRY", ts.URL)
+
+	vl, err := registry.FetchVersionList("sample-v6")
+	if err != nil {
+		t.Fatalf("FetchVersionList: %v", err)
+	}
+	if len(vl.VersionEntries) != 1 {
+		t.Fatalf("VersionEntries = %v, want 1 entry", vl.VersionEntries)
+	}
+	if got := vl.VersionEntries[0].GeneroConstraint; got != ">=6.00" {
+		t.Errorf("VersionEntries[0].GeneroConstraint = %q, want \">=6.00\"", got)
+	}
+}
+
 func TestFetchInfoForGeneroPicksMatchingVariant(t *testing.T) {
 	ts := newPackagesServer(t, map[string]any{
 		"slug": "demo-utils",
