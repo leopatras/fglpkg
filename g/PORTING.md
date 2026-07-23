@@ -82,6 +82,14 @@ scanning before touching any module.
   returns several values) — use `CALL f() RETURNING ...` then `RETURN`.
 - `VAR x = expr` needs an explicit type when the initializer type is not
   inferable (e.g. `ORD()`, `util.Integer.toHexString()`).
+- A single-segment `PACKAGE X` whose own module file is *also* named `X`
+  breaks cross-package resolution: `fglcomp` compiles the module fine on
+  its own, but another package's `IMPORT FGL X.X` fails with `-8447
+  function 'main' not found in package 'X'` even though the function is
+  declared `PUBLIC` (confirmed empirically, 2026-07-21 — see
+  `samples/A/a/Core.4gl`). Always give the module a distinct (PascalCase)
+  name from its package path, per the documented naming convention — it
+  isn't just style, it sidesteps a real compiler bug.
 
 **NULL semantics**
 
@@ -167,3 +175,16 @@ When the Go implementation changes:
 5. Help text lives in `commands.4gl` — Go's `commands.go` `Long` strings
    must be copied fully (all 24 `fglpkg <cmd> --help` outputs are
    currently byte-identical; keep it that way).
+
+**Drift found this way (2026-07-21):** the `files` manifest field's
+path-scoped pattern matching (GIS-275 — a `/`-containing pattern like
+`"a/*.4gl"` matches relative to `root`, not just the basename) shipped
+in the Go binary but was never ported to `pack.4gl`'s
+`collectBDLFiles` — every `/`-containing pattern silently matched
+nothing, so a package whose files live under a subdirectory (needed for
+any `PACKAGE`-declared module — see the import-root spec) packed as
+empty. Ported as `pack.filesPatternMatch`, covered by
+`test/testpack.4gl`'s `testFilesPatternMatch`/`testBuildZipPathScopedFiles`.
+`specs/*.md` documents Go-side features like this one *before* they're
+necessarily ported — treat a spec file as a prompt to check the 4GL
+side has caught up, not proof that it has.

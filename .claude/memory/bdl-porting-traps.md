@@ -2,7 +2,7 @@
 name: bdl-porting-traps
 description: Genero BDL language/runtime traps that actually bit during the Go→4GL port — scan before touching g/fglpkg modules
 type: project
-last-updated: 2026-07-13
+last-updated: 2026-07-21
 ---
 
 # BDL traps hit during the port
@@ -127,6 +127,27 @@ this repo. Compressed checklist:
   (same test: 0.52 s). Relevant any time BDL shells out to curl for
   concurrent transfers instead of trying to parallelize inside the
   single-threaded interpreter.
+
+- A single-segment `PACKAGE X` whose own module file is also literally
+  named `X` breaks cross-package `IMPORT FGL` resolution: `fglcomp`
+  compiles it fine standalone, but another package's `IMPORT FGL X.X`
+  fails with `-8447 function 'main' not found in package 'X'` even
+  though the function is `PUBLIC` (confirmed empirically 2026-07-21,
+  `samples/A` et al — see `g/PORTING.md` and `samples/Makefile`
+  header). Fix: give the module a distinct PascalCase name from its
+  package path (e.g. `PACKAGE a` containing `a/Core.4gl`, imported as
+  `IMPORT FGL a.Core`) — the documented naming convention isn't just
+  style, it sidesteps a real compiler bug.
+- The Go binary's `files` manifest pattern matching got a feature
+  (GIS-275: a `/`-containing pattern like `"a/*.4gl"` is path-scoped
+  relative to `root`, not basename-only) that was never ported to
+  `pack.4gl` — every `/`-containing pattern silently matched nothing,
+  so any package shipping files from a subdirectory (required for a
+  `PACKAGE`-declared module, per the import-root spec) packed empty
+  with no error. Fixed 2026-07-21 (`pack.filesPatternMatch`). General
+  lesson: a `specs/*.md` file documents a Go-side feature that may not
+  yet be ported — treat it as a prompt to check, not proof the 4GL
+  side already matches.
 
 **How to apply:** consult the genero-intelligence MCP skills for any API
 you're not 100% sure about; when a compile fails with -6609 look for a
