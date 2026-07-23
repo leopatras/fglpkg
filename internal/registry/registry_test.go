@@ -51,6 +51,44 @@ func TestFetchVersionListProjectsVersions(t *testing.T) {
 	}
 }
 
+// FetchVersionList folds the deprecation flags in from the same package-detail
+// fetch — both version-level (per entry) and package-level (on the list) — so
+// consumers like `outdated` need no second round-trip.
+func TestFetchVersionListFoldsDeprecation(t *testing.T) {
+	ts := newPackagesServer(t, map[string]any{
+		"slug":       "chart-3d",
+		"deprecated": true,
+		"moved_to":   "chart-3d-ng",
+		"versions": []map[string]any{
+			{"version": "1.0.0", "deprecated": true, "moved_to": "chart-3d-ng@2.0.0",
+				"artifacts": []map[string]any{{"variant": "default", "sha256": "aa", "download_url": "https://r2/x.zip"}}},
+			{"version": "2.0.0",
+				"artifacts": []map[string]any{{"variant": "default", "sha256": "bb", "download_url": "https://r2/y.zip"}}},
+		},
+	}, nil)
+	defer ts.Close()
+	t.Setenv("FGLPKG_REGISTRY", ts.URL)
+
+	vl, err := registry.FetchVersionList("chart-3d")
+	if err != nil {
+		t.Fatalf("FetchVersionList: %v", err)
+	}
+	if !vl.Deprecated || vl.MovedTo != "chart-3d-ng" {
+		t.Errorf("package-level: Deprecated=%v MovedTo=%q, want true / chart-3d-ng", vl.Deprecated, vl.MovedTo)
+	}
+	e100 := vl.EntryFor("1.0.0")
+	if e100 == nil || !e100.Deprecated || e100.MovedTo != "chart-3d-ng@2.0.0" {
+		t.Errorf("1.0.0 entry = %+v, want Deprecated=true MovedTo=chart-3d-ng@2.0.0", e100)
+	}
+	e200 := vl.EntryFor("2.0.0")
+	if e200 == nil || e200.Deprecated {
+		t.Errorf("2.0.0 entry = %+v, want version-level Deprecated=false", e200)
+	}
+	if vl.EntryFor("9.9.9") != nil {
+		t.Error("EntryFor on a missing version should return nil")
+	}
+}
+
 func TestFetchInfoForGeneroPicksMatchingVariant(t *testing.T) {
 	ts := newPackagesServer(t, map[string]any{
 		"slug": "demo-utils",

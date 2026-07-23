@@ -181,10 +181,21 @@ func buildOutdatedRow(rs *provider.RepositorySet, name, constraint, currentVer, 
 
 	// Flag an installed version the registry marks deprecated. Best-effort and
 	// GI-only: deprecation is a GI-registry concept (an Artifactory-sourced
-	// package has none), and a fetch failure just leaves the row unflagged so
+	// package has none), and a lookup failure just leaves the row unflagged so
 	// `outdated` never fails because of an advisory lookup.
 	if currentVer != "" && isGISource(sourceReg) {
-		if info, err := registry.FetchInfo(name, currentVer); err == nil && info.Deprecated {
+		if rs == nil {
+			// Single-registry: the version list came from the GI package
+			// detail, which already carries deprecation flags — no second
+			// round-trip. A version is deprecated if its own flag OR the
+			// whole-package flag is set (version successor wins).
+			if e := vl.EntryFor(currentVer); e != nil && (e.Deprecated || vl.Deprecated) {
+				row.Deprecated = true
+				row.MovedTo = firstNonEmpty(e.MovedTo, vl.MovedTo)
+			}
+		} else if info, err := registry.FetchInfo(name, currentVer); err == nil && info.Deprecated {
+			// Multi-provider: the version list came from the provider set (no
+			// deprecation flags), so keep the best-effort GI lookup.
 			row.Deprecated = true
 			row.MovedTo = info.MovedTo
 		}
@@ -318,4 +329,14 @@ func pluralY(n int) string {
 		return "y"
 	}
 	return "ie"
+}
+
+// firstNonEmpty returns the first non-empty string among its arguments, or "".
+func firstNonEmpty(vs ...string) string {
+	for _, v := range vs {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }

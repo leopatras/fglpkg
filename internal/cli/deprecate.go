@@ -98,6 +98,14 @@ func parseDeprecateArgs(args []string) (deprecateArgs, error) {
 		da.slug = pkgSpec
 	}
 
+	// Validate the primary slug locally so an obviously malformed name fails
+	// fast, symmetric with the --moved-to check below. Validate the canonical
+	// form so accepted spellings (Chart_3D → chart-3d) are not rejected; the
+	// registry canonicalizes again before sending.
+	if !slugutil.IsValid(slugutil.Canonical(da.slug)) {
+		return deprecateArgs{}, fmt.Errorf("'%s' is not a valid package name", da.slug)
+	}
+
 	// Rule 3: --undo forbids a message and --moved-to.
 	if da.undo {
 		if posMsg != "" || haveMsgFlag || da.movedTo != "" {
@@ -117,14 +125,30 @@ func parseDeprecateArgs(args []string) (deprecateArgs, error) {
 		da.message = msgFlag
 	}
 
+	// A message the user supplied must not be blank once trimmed — a
+	// whitespace-only message would otherwise slip past the "message required"
+	// check below (an auto-filled message is never blank).
+	if (posMsg != "" || haveMsgFlag) && strings.TrimSpace(da.message) == "" {
+		return deprecateArgs{}, fmt.Errorf("a deprecation message cannot be blank")
+	}
+
 	// Rule 5: --moved-to must be a well-formed slug (strip any @version first).
+	// Reject a self-referential relocation that points a package/version at
+	// itself (same canonical slug and same version target).
 	if da.movedTo != "" {
-		targetSlug := da.movedTo
+		targetSlug, targetVersion := da.movedTo, ""
 		if idx := strings.Index(targetSlug, "@"); idx >= 0 {
+			targetVersion = targetSlug[idx+1:]
 			targetSlug = targetSlug[:idx]
 		}
+		// The successor is sent as-is and shape-checked (like the registry's own
+		// isValidSlug), so validate it strictly — unlike the primary slug, which
+		// is canonicalized before sending.
 		if !slugutil.IsValid(targetSlug) {
 			return deprecateArgs{}, fmt.Errorf("--moved-to: '%s' is not a valid package name", targetSlug)
+		}
+		if slugutil.Canonical(targetSlug) == slugutil.Canonical(da.slug) && targetVersion == da.version {
+			return deprecateArgs{}, fmt.Errorf("--moved-to cannot point %s at itself", da.slug)
 		}
 	}
 
@@ -135,6 +159,14 @@ func parseDeprecateArgs(args []string) (deprecateArgs, error) {
 	}
 	if da.message == "" {
 		da.message = fmt.Sprintf("%s has moved to %s", da.slug, da.movedTo)
+	}
+
+	// Enforce the registry's scalar cap locally so an over-length message fails
+	// fast with the exact spec message, before any network call. Because of
+	// this, a 400 from the deprecate endpoint is never a length violation — the
+	// CLI surfaces the server's real explanation instead (see mapDeprecateError).
+	if len(da.message) > 512 {
+		return deprecateArgs{}, fmt.Errorf("deprecation message exceeds the 512-byte limit")
 	}
 
 	return da, nil
@@ -176,8 +208,18 @@ func mapDeprecateError(err error, da deprecateArgs) error {
 			return fmt.Errorf("%s has no published version %s", da.slug, da.version)
 		}
 		return fmt.Errorf("no such package '%s'", da.slug)
-	case errors.Is(err, registry.ErrMessageTooLong):
-		return fmt.Errorf("deprecation message exceeds the 512-byte limit")
+	case errors.Is(err, registry.ErrBadRequest):
+		// Any 400 the registry returns for a reason we did not catch locally.
+		// Surface the server's own explanation rather than guessing (a genuine
+		// over-cap message is rejected locally in parseDeprecateArgs before we
+		// ever reach the registry). Pull the detail off the typed error so the
+		// message reads cleanly, without the internal op-prefix or a doubled
+		// "rejected by the registry".
+		var bad *registry.BadRequestError
+		if errors.As(err, &bad) && bad.Detail != "" {
+			return fmt.Errorf("deprecation rejected by the registry: %s", bad.Detail)
+		}
+		return fmt.Errorf("deprecation rejected by the registry: %w", err)
 	default:
 		return err
 	}

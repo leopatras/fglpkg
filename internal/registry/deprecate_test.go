@@ -117,7 +117,7 @@ func TestPublishDeprecateStatusErrorMapping(t *testing.T) {
 		{"unauthorized", http.StatusUnauthorized, registry.ErrUnauthorized},
 		{"forbidden", http.StatusForbidden, registry.ErrForbidden},
 		{"notfound", http.StatusNotFound, registry.ErrNotFound},
-		{"toolong", http.StatusBadRequest, registry.ErrMessageTooLong},
+		{"badrequest", http.StatusBadRequest, registry.ErrBadRequest},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -137,10 +137,10 @@ func TestPublishDeprecateStatusErrorMapping(t *testing.T) {
 // even when the version itself carries no version-level flag (the OR-merge).
 func TestFetchInfoMergesPackageLevelDeprecation(t *testing.T) {
 	ts := newPackagesServer(t, map[string]any{
-		"slug":               "chart-3d",
-		"deprecated":         true,
+		"slug":                "chart-3d",
+		"deprecated":          true,
 		"deprecation_message": "whole package retired",
-		"moved_to":           "chart-3d-ng",
+		"moved_to":            "chart-3d-ng",
 		"versions": []map[string]any{
 			{"version": "1.0.0", "artifacts": []map[string]any{
 				{"variant": "default", "sha256": "aa", "download_url": "https://r2/x.zip"},
@@ -168,10 +168,10 @@ func TestFetchInfoMergesPackageLevelDeprecation(t *testing.T) {
 // A version-level message wins over the package-level one when both are set.
 func TestFetchInfoVersionLevelDeprecationWins(t *testing.T) {
 	ts := newPackagesServer(t, map[string]any{
-		"slug":               "chart-3d",
-		"deprecated":         true,
+		"slug":                "chart-3d",
+		"deprecated":          true,
 		"deprecation_message": "package msg",
-		"moved_to":           "pkg-ng",
+		"moved_to":            "pkg-ng",
 		"versions": []map[string]any{
 			{
 				"version":             "1.0.0",

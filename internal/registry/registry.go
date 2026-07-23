@@ -27,16 +27,38 @@ import (
 // with errors.Is(err, registry.ErrNotFound).
 var ErrNotFound = errors.New("package not found in registry")
 
-// ErrUnauthorized / ErrForbidden / ErrMessageTooLong let publisher-side
+// ErrUnauthorized / ErrForbidden / ErrBadRequest let publisher-side
 // callers map a write's HTTP status to an actionable message. They are
 // wrapped (%w) so callers detect them with errors.Is. ErrUnauthorized is a
 // 401 (no/expired credentials), ErrForbidden a 403 (authenticated but not the
-// owning partner), ErrMessageTooLong a 400 from the registry's scalar cap.
+// owning partner), ErrBadRequest a 400 (the registry rejected the request —
+// e.g. a validation failure). The wrapping error carries the server's own
+// explanation so the CLI can surface it verbatim.
 var (
-	ErrUnauthorized   = errors.New("not authorized")
-	ErrForbidden      = errors.New("forbidden")
-	ErrMessageTooLong = errors.New("value exceeds the registry length limit")
+	ErrUnauthorized = errors.New("not authorized")
+	ErrForbidden    = errors.New("forbidden")
+	ErrBadRequest   = errors.New("rejected by the registry")
 )
+
+// BadRequestError carries the registry's own explanation for a 400 alongside
+// the operation that triggered it, so callers can surface Detail verbatim
+// without re-wrapping ErrBadRequest's words. It matches
+// errors.Is(err, ErrBadRequest) and exposes Detail via errors.As.
+type BadRequestError struct {
+	Op     string // the operation, e.g. "deprecate chart-3d@1.2.3"
+	Detail string // the server's response body (may be empty)
+}
+
+func (e *BadRequestError) Error() string {
+	if e.Detail == "" {
+		return fmt.Sprintf("%s: %s", e.Op, ErrBadRequest)
+	}
+	return fmt.Sprintf("%s: %s: %s", e.Op, ErrBadRequest, e.Detail)
+}
+
+// Is reports a match against the ErrBadRequest sentinel so existing
+// errors.Is(err, ErrBadRequest) checks keep working.
+func (e *BadRequestError) Is(target error) bool { return target == ErrBadRequest }
 
 const (
 	defaultRegistryBase = "https://service.generointelligence.ai"
@@ -139,6 +161,11 @@ type VersionEntry struct {
 	Version          string   `json:"version"`
 	GeneroConstraint string   `json:"genero,omitempty"`
 	Variants         []string `json:"variants,omitempty"`
+	// Deprecated/MovedTo carry this version's npm-style deprecation state,
+	// folded in from the same package-detail fetch so consumers (e.g.
+	// `outdated`) need no second round-trip.
+	Deprecated bool   `json:"deprecated,omitempty"`
+	MovedTo    string `json:"movedTo,omitempty"`
 }
 
 // VersionList lists all published versions of a package.
@@ -146,6 +173,20 @@ type VersionList struct {
 	Name           string         `json:"name"`
 	Versions       []string       `json:"versions"`
 	VersionEntries []VersionEntry `json:"versionEntries"`
+	// Deprecated/MovedTo carry package-level (whole-package relocation)
+	// deprecation state, applying to every version.
+	Deprecated bool   `json:"deprecated,omitempty"`
+	MovedTo    string `json:"movedTo,omitempty"`
+}
+
+// EntryFor returns the VersionEntry matching version, or nil if none.
+func (vl *VersionList) EntryFor(version string) *VersionEntry {
+	for i := range vl.VersionEntries {
+		if vl.VersionEntries[i].Version == version {
+			return &vl.VersionEntries[i]
+		}
+	}
+	return nil
 }
 
 // SearchResult is one entry returned by Search.
@@ -187,7 +228,7 @@ func FetchVersionList(name string) (*VersionList, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch version list for %q: %w", name, err)
 	}
-	out := &VersionList{Name: d.Slug}
+	out := &VersionList{Name: d.Slug, Deprecated: d.Deprecated, MovedTo: d.MovedTo}
 	for _, v := range d.Versions {
 		out.Versions = append(out.Versions, v.Version)
 		variants := make([]string, 0, len(v.Artifacts))
@@ -195,8 +236,10 @@ func FetchVersionList(name string) (*VersionList, error) {
 			variants = append(variants, a.Variant)
 		}
 		out.VersionEntries = append(out.VersionEntries, VersionEntry{
-			Version:  v.Version,
-			Variants: variants,
+			Version:    v.Version,
+			Variants:   variants,
+			Deprecated: v.Deprecated,
+			MovedTo:    v.MovedTo,
 		})
 	}
 	return out, nil
@@ -551,7 +594,7 @@ func deprecateResultError(what string, status int, respBody []byte) error {
 	case status == http.StatusNotFound:
 		return fmt.Errorf("%s: %w", what, ErrNotFound)
 	case status == http.StatusBadRequest:
-		return fmt.Errorf("%s: %w: %s", what, ErrMessageTooLong, strings.TrimSpace(string(respBody)))
+		return &BadRequestError{Op: what, Detail: strings.TrimSpace(string(respBody))}
 	default:
 		return fmt.Errorf("%s: HTTP %d: %s", what, status, string(respBody))
 	}

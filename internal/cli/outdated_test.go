@@ -100,6 +100,37 @@ func TestBuildOutdatedRowStatuses(t *testing.T) {
 	}
 }
 
+// On the single-registry path a deprecated installed version is flagged from
+// the version list alone — the deprecation flags are folded into the same
+// package-detail fetch, so no second round-trip is made (item 2).
+func TestBuildOutdatedRowDeprecationSingleFetch(t *testing.T) {
+	var hits int
+	detail := map[string]any{
+		"slug": "demo",
+		"name": "demo",
+		"versions": []map[string]any{
+			{"version": "1.0.0", "deprecated": true, "moved_to": "demo-ng",
+				"artifacts": []map[string]any{{"variant": "default", "sha256": "a", "download_url": "https://example.com/x.zip"}}},
+			{"version": "2.0.0",
+				"artifacts": []map[string]any{{"variant": "default", "sha256": "b", "download_url": "https://example.com/y.zip"}}},
+		},
+	}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		_ = json.NewEncoder(w).Encode(detail)
+	}))
+	t.Cleanup(ts.Close)
+	t.Setenv("FGLPKG_REGISTRY", ts.URL)
+
+	row := buildOutdatedRow(nil, "demo", "^1.0.0", "1.0.0", "")
+	if !row.Deprecated || row.MovedTo != "demo-ng" {
+		t.Errorf("row Deprecated=%v MovedTo=%q, want true / demo-ng", row.Deprecated, row.MovedTo)
+	}
+	if hits != 1 {
+		t.Errorf("made %d registry requests, want exactly 1 (no second fetch)", hits)
+	}
+}
+
 func TestBuildOutdatedRowRegistryError(t *testing.T) {
 	t.Setenv("FGLPKG_REGISTRY", "http://127.0.0.1:1") // unreachable
 	row := buildOutdatedRow(nil, "demo", "^1.0.0", "1.0.0", "")

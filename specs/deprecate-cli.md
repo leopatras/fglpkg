@@ -173,8 +173,12 @@ already used by `privateHint`, [cli.go:65](../internal/cli/cli.go#L65)):
 | Not the owning partner | 403 | `only the owning partner can deprecate chart-3d` |
 | Package unknown | 404 | `no such package 'chart-3d'` (or the login hint if the caller is anonymous) |
 | Version unknown | 404 | `chart-3d has no published version 1.2.3` |
+| Primary slug malformed | (local) | `'!!!' is not a valid package name` |
 | `--moved-to` malformed | (local) | `--moved-to: 'Chart_3D' is not a valid package name` |
-| Message over cap | 400 | `deprecation message exceeds the 512-byte limit` (mirrors the registry scalar cap) |
+| Self-referential `--moved-to` | (local) | `--moved-to cannot point chart-3d at itself` |
+| Blank message | (local) | `a deprecation message cannot be blank` |
+| Message over cap | (local) | `deprecation message exceeds the 512-byte limit` (checked locally against the 512-byte scalar cap, before any request) |
+| Any other rejection | 400 | `deprecation rejected by the registry: <server message>` — the registry's own explanation is surfaced verbatim (a genuine over-cap message is caught locally, so a 400 is never assumed to be "too long") |
 
 ---
 
