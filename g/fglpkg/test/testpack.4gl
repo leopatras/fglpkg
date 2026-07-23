@@ -17,7 +17,9 @@ MAIN
   END IF
   LET _origDir = os.Path.pwd()
   CALL testVariantHelpers()
+  CALL testFilesPatternMatch()
   CALL testBuildZipDefaults()
+  CALL testBuildZipPathScopedFiles()
   CALL testBuildZipIgnoreAndBin()
   CALL testBuildZipWebcomponents()
   CALL testHooks()
@@ -44,6 +46,19 @@ FUNCTION entryNames(res pack.TPackResult) RETURNS STRING
   RETURN fglpkgutils.joinArr(names, ",")
 END FUNCTION
 
+--entryNames' comma-joined string can't reliably test for an EXACT name
+--(a substring like "Core.4gl" also matches inside "a/Core.4gl"), so check
+--res.entries directly instead
+FUNCTION hasExactEntry(res pack.TPackResult, name STRING) RETURNS BOOLEAN
+  DEFINE i INT
+  FOR i = 1 TO res.entries.getLength()
+    IF res.entries[i].name == name THEN
+      RETURN TRUE
+    END IF
+  END FOR
+  RETURN FALSE
+END FUNCTION
+
 FUNCTION testVariantHelpers()
   DEFINE m manifest.TManifest
   LET m = manifest.newManifest("p", "1.0.0", "", "")
@@ -61,6 +76,27 @@ FUNCTION testVariantHelpers()
   TEQ(fname, "poiapi-1.0.0-genero4.zip")
   TEQ(pack.variantDescription("webcomponent"), "webcomponent variant")
   TEQ(pack.variantDescription("genero4"), "Genero 4 variant")
+END FUNCTION
+
+#+GIS-275 parity: bare patterns match the basename at any depth (unchanged);
+#+patterns containing "/" are path-scoped relative to root, "**" spanning
+#+directory levels and "*" confined to a single segment. Mirrors the Go
+#+TestFilesPatternMatch cases (internal/cli/files_pattern_test.go).
+FUNCTION testFilesPatternMatch()
+  --bare patterns -- basename at any depth (historical behaviour)
+  TOK(pack.filesPatternMatch("*.42m", "ModuleA.42m", "ModuleA.42m"))
+  TOK(pack.filesPatternMatch("*.42m", "ModuleA.42m", "tests/ModuleA.42m"))
+  TOK(NOT pack.filesPatternMatch("*.4gl", "ModuleA.42m", "ModuleA.42m"))
+  --path-scoped -- anchored, relative to root, "*" is single-segment
+  TOK(pack.filesPatternMatch("tests/*.4gl", "foo.4gl", "tests/foo.4gl"))
+  TOK(NOT pack.filesPatternMatch("tests/*.4gl", "foo.4gl", "foo.4gl"))
+  TOK(NOT pack.filesPatternMatch("tests/*.4gl", "foo.4gl", "lib/foo.4gl"))
+  TOK(NOT pack.filesPatternMatch("tests/*.4gl", "foo.4gl", "tests/sub/foo.4gl"))
+  TOK(pack.filesPatternMatch("/tests/*.4gl", "foo.4gl", "tests/foo.4gl"))
+  --doublestar spans directory levels
+  TOK(pack.filesPatternMatch("com/**/*.42m", "foo.42m", "com/fourjs/ai/foo.42m"))
+  TOK(pack.filesPatternMatch("com/**/*.42m", "foo.42m", "com/foo.42m"))
+  TOK(NOT pack.filesPatternMatch("com/**/*.42m", "foo.42m", "org/foo.42m"))
 END FUNCTION
 
 FUNCTION testBuildZipDefaults()
@@ -95,6 +131,33 @@ FUNCTION testBuildZipDefaults()
   VAR out = fglpkgutils.getProgramOutput(
       SFMT("unzip -p %1 fglpkg.json", fglpkgutils.quote(res.zipPath)))
   TOK(NOT fglpkgutils.contains(out, "devDependencies"))
+  CALL os.Path.delete(res.zipPath) RETURNING status
+  CALL leaveTempProject(dir)
+END FUNCTION
+
+#+GIS-275 regression: a "/"-containing `files` pattern is path-scoped
+#+relative to root, not basename-only -- this is what a PACKAGE-declared
+#+module nested under a directory matching its own package path (e.g.
+#+samples/A/a/Core.4gl, PACKAGE a) needs to actually ship in the zip.
+FUNCTION testBuildZipPathScopedFiles()
+  DEFINE ok BOOLEAN
+  DEFINE res pack.TPackResult
+  DEFINE err STRING
+  VAR dir = enterTempProject()
+  VAR m = manifest.newManifest("p", "1.0.0", "d", "a")
+  LET m.files[1] = "a/*.4gl"
+  LET m.files[2] = "a/*.42m"
+  CALL fglpkgutils.mkdirp("a")
+  CALL fglpkgutils.writeStringToFile("a/Core.4gl", "PACKAGE a")
+  CALL fglpkgutils.writeStringToFile("a/Core.42m", "m")
+  --a same-named file one level up must NOT match the path-scoped pattern
+  CALL fglpkgutils.writeStringToFile("Core.4gl", "stray")
+  CALL pack.buildPackageZip(m) RETURNING ok, res, err
+  TOK(ok)
+  VAR names = entryNames(res)
+  TOK(fglpkgutils.contains(names, "a/Core.4gl"))
+  TOK(fglpkgutils.contains(names, "a/Core.42m"))
+  TOK(NOT hasExactEntry(res, "Core.4gl"))
   CALL os.Path.delete(res.zipPath) RETURNING status
   CALL leaveTempProject(dir)
 END FUNCTION

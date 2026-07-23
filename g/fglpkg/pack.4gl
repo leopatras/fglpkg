@@ -136,6 +136,26 @@ PRIVATE FUNCTION listStagedEntries(staging STRING)
   RETURN entries
 END FUNCTION
 
+#+matches a manifest `files` pattern against a source file during the pack
+#+walk (port of filesPatternMatch in internal/cli/cli.go, GIS-275):
+#+ - a pattern WITHOUT "/" (e.g. "*.42m") matches the file's basename at any
+#+   depth under root -- the historical behaviour
+#+ - a pattern CONTAINING "/" (e.g. "a/*.4gl", "com/**/*.42m") is path-scoped:
+#+   it matches relToRoot, with "**" spanning directory levels and "*"
+#+   confined to one segment; a leading "/" is accepted and ignored
+FUNCTION filesPatternMatch(
+    pattern STRING, base STRING, relToRoot STRING) RETURNS BOOLEAN
+  VAR slashPattern = fglpkgutils.backslash2slash(pattern)
+  IF NOT fglpkgutils.contains(slashPattern, "/") THEN
+    RETURN glob.pathMatch(pattern, base)
+  END IF
+  VAR anchored = slashPattern
+  IF fglpkgutils.startsWith(anchored, "/") THEN
+    LET anchored = anchored.subString(2, anchored.getLength())
+  END IF
+  RETURN glob.matchGlob(anchored, relToRoot)
+END FUNCTION
+
 #+walks the BDL source tree applying the manifest's `files` patterns
 #+(default *.42m/*.42f/*.sch, matched against basenames) and includes
 #+declared bin scripts (which override .fglpkgignore)
@@ -163,8 +183,9 @@ PRIVATE FUNCTION collectBDLFiles(
   FOR i = 1 TO walked.getLength()
     VAR relPath = IIF(root == ".", walked[i], SFMT("%1/%2", root, walked[i]))
     VAR base = os.Path.baseName(relPath)
+    --walked[i] is already relative to root (walkTree's own recursion base)
     FOR j = 1 TO patterns.getLength()
-      IF glob.pathMatch(patterns[j], base) THEN
+      IF filesPatternMatch(patterns[j], base, walked[i]) THEN
         IF added.contains(relPath) THEN
           CONTINUE FOR
         END IF
