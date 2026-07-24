@@ -1,0 +1,14 @@
+{
+  "name": "sample-shadow-v5-consumer",
+  "version": "1.0.0",
+  "description": "fglpkg sample consumer installing both sample-v5 and sample-shadow-v5, which both ship a module named v5 -- demonstrates the FGLLDPATH module-shadowing gap in GIS-346",
+  "author": "fglpkg samples",
+  "license": "MIT",
+  "genero": "*",
+  "dependencies": {
+    "fgl": {
+      "sample-v5": "^1.0.0",
+      "sample-shadow-v5": "^1.0.0"
+    }
+  }
+}

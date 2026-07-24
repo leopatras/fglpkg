@@ -13,3 +13,4 @@ Project-local knowledge base for fglpkg (Go package manager for Genero BDL + its
 ## Registry, publishing, and CLI (applies to either implementation)
 
 - [Registry publishing and variant resolution](memory/registry-publishing-and-variants.md) — live test registry usage, `unpublish` documented-but-not-implemented, `pickArtifact`'s exact-match/`default`/`arts[0]`-fallback algorithm (no version-aware fallback exists), the `bin`/`fglpkg run` Windows one-path-per-command limitation, and the `fglwebrun` example package (source-only self-compiling design)
+- [FGL module resolution and shadowing](memory/fgl-module-resolution-and-shadowing.md) — FGLLDPATH search order, how to diagnose which `.42m` wins (`fglcomp --verbose`, `fglrun -r`'s `buildSource=`), the module-shadowing gap (GIS-346/GIS-376) reproduced via `samples/shadow-v5`, and why "Module overriding" is a documented *intentional* use of the same mechanism

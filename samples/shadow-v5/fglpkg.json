@@ -1,0 +1,15 @@
+{
+  "name": "sample-shadow-v5",
+  "version": "1.0.0",
+  "description": "fglpkg sample package that deliberately ships a module named v5.4gl/v5.42m, clashing with sample-v5's own module -- demonstrates the FGLLDPATH module-shadowing gap described in GIS-346 (installing both packages together silently makes one module unreachable, with no warning today)",
+  "author": "fglpkg samples",
+  "license": "MIT",
+  "repository": "https://github.com/leopatras/fglpkg",
+  "genero": "*",
+  "dependencies": {},
+  "root": ".",
+  "files": [
+    "*.4gl",
+    "*.42m"
+  ]
+}

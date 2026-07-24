@@ -16,3 +16,5 @@ consumers/v5-42m-consumer/.fglpkg/
 consumers/v5-42m-consumer/fglpkg.lock
 consumers/v6-42m-consumer/.fglpkg/
 consumers/v6-42m-consumer/fglpkg.lock
+consumers/shadow-v5-consumer/.fglpkg/
+consumers/shadow-v5-consumer/fglpkg.lock
